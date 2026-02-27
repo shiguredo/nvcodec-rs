@@ -22,9 +22,29 @@ pub struct DecoderCaps {
     pub min_height: u32,
 }
 
+/// デコーダー用コーデック識別子
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DecoderCodec {
+    /// H.264
+    H264,
+    /// HEVC
+    Hevc,
+    /// AV1
+    Av1,
+    /// VP8
+    Vp8,
+    /// VP9
+    Vp9,
+    /// JPEG
+    Jpeg,
+}
+
 /// デコーダーの設定
 #[derive(Debug, Clone)]
 pub struct DecoderConfig {
+    /// コーデック識別子
+    pub codec: DecoderCodec,
+
     /// 使用する GPU デバイスの ID (デフォルト: 0)
     pub device_id: i32,
 
@@ -38,6 +58,7 @@ pub struct DecoderConfig {
 impl Default for DecoderConfig {
     fn default() -> Self {
         Self {
+            codec: DecoderCodec::H264,
             device_id: 0,
             max_num_decode_surfaces: 20,
             max_display_delay: 0,
@@ -56,64 +77,30 @@ pub struct Decoder {
 }
 
 impl Decoder {
-    /// H.264 用のデコーダーインスタンスを生成する
-    pub fn new_h264(config: DecoderConfig) -> Result<Self, Error> {
-        Self::new_with_codec(sys::cudaVideoCodec_enum_cudaVideoCodec_H264, config)
+    /// 指定されたコーデック設定でデコーダーインスタンスを生成する
+    pub fn new(config: DecoderConfig) -> Result<Self, Error> {
+        let codec_type = match config.codec {
+            DecoderCodec::H264 => sys::cudaVideoCodec_enum_cudaVideoCodec_H264,
+            DecoderCodec::Hevc => sys::cudaVideoCodec_enum_cudaVideoCodec_HEVC,
+            DecoderCodec::Av1 => sys::cudaVideoCodec_enum_cudaVideoCodec_AV1,
+            DecoderCodec::Vp8 => sys::cudaVideoCodec_enum_cudaVideoCodec_VP8,
+            DecoderCodec::Vp9 => sys::cudaVideoCodec_enum_cudaVideoCodec_VP9,
+            DecoderCodec::Jpeg => sys::cudaVideoCodec_enum_cudaVideoCodec_JPEG,
+        };
+        Self::new_with_codec(codec_type, config)
     }
 
-    /// H.265 用のデコーダーインスタンスを生成する
-    pub fn new_h265(config: DecoderConfig) -> Result<Self, Error> {
-        Self::new_with_codec(sys::cudaVideoCodec_enum_cudaVideoCodec_HEVC, config)
-    }
-
-    /// AV1 用のデコーダーインスタンスを生成する
-    pub fn new_av1(config: DecoderConfig) -> Result<Self, Error> {
-        Self::new_with_codec(sys::cudaVideoCodec_enum_cudaVideoCodec_AV1, config)
-    }
-
-    /// VP8 用のデコーダーインスタンスを生成する
-    pub fn new_vp8(config: DecoderConfig) -> Result<Self, Error> {
-        Self::new_with_codec(sys::cudaVideoCodec_enum_cudaVideoCodec_VP8, config)
-    }
-
-    /// VP9 用のデコーダーインスタンスを生成する
-    pub fn new_vp9(config: DecoderConfig) -> Result<Self, Error> {
-        Self::new_with_codec(sys::cudaVideoCodec_enum_cudaVideoCodec_VP9, config)
-    }
-
-    /// JPEG 用のデコーダーインスタンスを生成する
-    pub fn new_jpeg(config: DecoderConfig) -> Result<Self, Error> {
-        Self::new_with_codec(sys::cudaVideoCodec_enum_cudaVideoCodec_JPEG, config)
-    }
-
-    /// H.264 デコーダの能力をクエリする
-    pub fn query_caps_h264(device_id: i32) -> Result<DecoderCaps, Error> {
-        Self::query_caps_with_codec(device_id, sys::cudaVideoCodec_enum_cudaVideoCodec_H264)
-    }
-
-    /// H.265 デコーダの能力をクエリする
-    pub fn query_caps_h265(device_id: i32) -> Result<DecoderCaps, Error> {
-        Self::query_caps_with_codec(device_id, sys::cudaVideoCodec_enum_cudaVideoCodec_HEVC)
-    }
-
-    /// AV1 デコーダの能力をクエリする
-    pub fn query_caps_av1(device_id: i32) -> Result<DecoderCaps, Error> {
-        Self::query_caps_with_codec(device_id, sys::cudaVideoCodec_enum_cudaVideoCodec_AV1)
-    }
-
-    /// VP8 デコーダの能力をクエリする
-    pub fn query_caps_vp8(device_id: i32) -> Result<DecoderCaps, Error> {
-        Self::query_caps_with_codec(device_id, sys::cudaVideoCodec_enum_cudaVideoCodec_VP8)
-    }
-
-    /// VP9 デコーダの能力をクエリする
-    pub fn query_caps_vp9(device_id: i32) -> Result<DecoderCaps, Error> {
-        Self::query_caps_with_codec(device_id, sys::cudaVideoCodec_enum_cudaVideoCodec_VP9)
-    }
-
-    /// JPEG デコーダの能力をクエリする
-    pub fn query_caps_jpeg(device_id: i32) -> Result<DecoderCaps, Error> {
-        Self::query_caps_with_codec(device_id, sys::cudaVideoCodec_enum_cudaVideoCodec_JPEG)
+    /// 指定コーデックのデコーダ能力をクエリする
+    pub fn query_caps(codec: DecoderCodec, device_id: i32) -> Result<DecoderCaps, Error> {
+        let codec_type = match codec {
+            DecoderCodec::H264 => sys::cudaVideoCodec_enum_cudaVideoCodec_H264,
+            DecoderCodec::Hevc => sys::cudaVideoCodec_enum_cudaVideoCodec_HEVC,
+            DecoderCodec::Av1 => sys::cudaVideoCodec_enum_cudaVideoCodec_AV1,
+            DecoderCodec::Vp8 => sys::cudaVideoCodec_enum_cudaVideoCodec_VP8,
+            DecoderCodec::Vp9 => sys::cudaVideoCodec_enum_cudaVideoCodec_VP9,
+            DecoderCodec::Jpeg => sys::cudaVideoCodec_enum_cudaVideoCodec_JPEG,
+        };
+        Self::query_caps_with_codec(device_id, codec_type)
     }
 
     /// 指定コーデックのデコーダ能力をクエリする
@@ -602,53 +589,72 @@ mod tests {
     use super::*;
 
     #[test]
-    fn init_h265_decoder() {
-        let _decoder =
-            Decoder::new_h265(DecoderConfig::default()).expect("Failed to initialize h265 decoder");
-        println!("h265 decoder initialized successfully");
-    }
-
-    #[test]
     fn init_h264_decoder() {
-        let _decoder =
-            Decoder::new_h264(DecoderConfig::default()).expect("Failed to initialize h264 decoder");
+        let config = DecoderConfig {
+            codec: DecoderCodec::H264,
+            ..DecoderConfig::default()
+        };
+        let _decoder = Decoder::new(config).expect("Failed to initialize h264 decoder");
         println!("h264 decoder initialized successfully");
     }
 
     #[test]
+    fn init_h265_decoder() {
+        let config = DecoderConfig {
+            codec: DecoderCodec::Hevc,
+            ..DecoderConfig::default()
+        };
+        let _decoder = Decoder::new(config).expect("Failed to initialize h265 decoder");
+        println!("h265 decoder initialized successfully");
+    }
+
+    #[test]
     fn init_av1_decoder() {
-        let _decoder =
-            Decoder::new_av1(DecoderConfig::default()).expect("Failed to initialize av1 decoder");
+        let config = DecoderConfig {
+            codec: DecoderCodec::Av1,
+            ..DecoderConfig::default()
+        };
+        let _decoder = Decoder::new(config).expect("Failed to initialize av1 decoder");
         println!("av1 decoder initialized successfully");
     }
 
     #[test]
     fn init_vp8_decoder() {
-        let _decoder =
-            Decoder::new_vp8(DecoderConfig::default()).expect("Failed to initialize vp8 decoder");
+        let config = DecoderConfig {
+            codec: DecoderCodec::Vp8,
+            ..DecoderConfig::default()
+        };
+        let _decoder = Decoder::new(config).expect("Failed to initialize vp8 decoder");
         println!("vp8 decoder initialized successfully");
     }
 
     #[test]
     fn init_vp9_decoder() {
-        let _decoder =
-            Decoder::new_vp9(DecoderConfig::default()).expect("Failed to initialize vp9 decoder");
+        let config = DecoderConfig {
+            codec: DecoderCodec::Vp9,
+            ..DecoderConfig::default()
+        };
+        let _decoder = Decoder::new(config).expect("Failed to initialize vp9 decoder");
         println!("vp9 decoder initialized successfully");
     }
 
     #[test]
     fn test_multiple_decoders() {
-        // CUDA初期化が1回だけ実行されることを確認するため、複数のデコーダーを作成
-        let _decoder1 = Decoder::new_h265(DecoderConfig::default())
-            .expect("Failed to initialize first h265 decoder");
-        let _decoder2 = Decoder::new_h265(DecoderConfig::default())
-            .expect("Failed to initialize second h265 decoder");
+        let config = DecoderConfig {
+            codec: DecoderCodec::Hevc,
+            ..DecoderConfig::default()
+        };
+        // CUDA 初期化が 1 回だけ実行されることを確認するため、複数のデコーダーを作成
+        let _decoder1 =
+            Decoder::new(config.clone()).expect("Failed to initialize first h265 decoder");
+        let _decoder2 = Decoder::new(config).expect("Failed to initialize second h265 decoder");
         println!("Multiple h265 decoders initialized successfully");
     }
 
     #[test]
     fn test_decode_h265_black_frame() {
-        // H.265の黒フレームデータ (Annex B format with start codes)
+        // H.265 の黒フレームデータ (Annex B format with start codes)
+        // VPS, SPS, PPS, Frame data を Annex B 形式で結合
         let vps = vec![
             64, 1, 12, 1, 255, 255, 1, 96, 0, 0, 3, 0, 144, 0, 0, 3, 0, 0, 3, 0, 90, 149, 152, 9,
         ];
@@ -665,7 +671,7 @@ mod tests {
             0, 104, 192, 0, 0, 3, 0, 0, 3, 0, 0, 3, 1, 223, 0, 0, 3, 0, 9, 248,
         ];
 
-        // NALユニットを結合（Annex B形式: start code 0x00000001 を使用）
+        // NAL ユニットを結合（Annex B 形式: start code 0x00000001 を使用）
         let mut h265_data = Vec::new();
         let start_code = [0u8, 0, 0, 1];
 
@@ -685,8 +691,11 @@ mod tests {
         h265_data.extend_from_slice(&start_code);
         h265_data.extend_from_slice(&frame_data);
 
-        let mut decoder =
-            Decoder::new_h265(DecoderConfig::default()).expect("Failed to create h265 decoder");
+        let config = DecoderConfig {
+            codec: DecoderCodec::Hevc,
+            ..DecoderConfig::default()
+        };
+        let mut decoder = Decoder::new(config).expect("Failed to create h265 decoder");
 
         // デコードを実行
         decoder
@@ -705,23 +714,22 @@ mod tests {
         assert_eq!(frame.width(), 640);
         assert_eq!(frame.height(), 480);
 
-        // Y平面とUV平面のデータサイズを確認
-        // Note: The actual data size uses pitch (stride), not width, due to GPU alignment
+        // Y 平面と UV 平面のデータサイズを確認
         assert_eq!(frame.y_plane().len(), frame.y_stride() * frame.height());
         assert_eq!(
             frame.uv_plane().len(),
             frame.uv_stride() * frame.height() / 2
         );
 
-        // ストライドが幅以上であることを確認（GPUアラインメントのため）
+        // ストライドが幅以上であることを確認（GPU アラインメントのため）
         assert!(frame.y_stride() >= frame.width());
         assert!(frame.uv_stride() >= frame.width());
 
-        // 黒画面なので、Y成分は16付近、UV成分は128付近の値になることを確認
+        // 黒画面なので、Y 成分は 16 付近、UV 成分は 128 付近の値になることを確認
         let y_data = frame.y_plane();
         let uv_data = frame.uv_plane();
 
-        // Y成分の平均値をチェック（完全な黒は16）
+        // Y 成分の平均値をチェック（完全な黒は 16）
         let y_avg = y_data.iter().map(|&x| x as u32).sum::<u32>() / y_data.len() as u32;
         assert!(
             y_avg >= 10 && y_avg <= 30,
@@ -729,8 +737,7 @@ mod tests {
             y_avg
         );
 
-        // UV成分の平均値をチェック
-        // Note: The actual encoded frame may not have perfectly neutral chroma
+        // UV 成分の平均値をチェック
         let uv_avg = uv_data.iter().map(|&x| x as u32).sum::<u32>() / uv_data.len() as u32;
         assert!(
             uv_avg >= 70 && uv_avg <= 140,
@@ -749,7 +756,7 @@ mod tests {
 
     #[test]
     fn test_decode_h264_black_frame() {
-        // H.264の黒フレームデータ (NAL units with size prefix)
+        // H.264 の黒フレームデータ (NAL units with size prefix)
         let sps = vec![
             103, 100, 0, 30, 172, 217, 64, 160, 61, 176, 17, 0, 0, 3, 0, 1, 0, 0, 3, 0, 50, 15, 22,
             45, 150,
@@ -763,7 +770,7 @@ mod tests {
             0, 3, 0, 0, 3, 0, 0, 3, 0, 0, 3, 0, 0, 3, 0, 37, 225,
         ];
 
-        // NALユニットを結合（Annex B形式: start code 0x00000001 を使用）
+        // NAL ユニットを結合（Annex B 形式: start code 0x00000001 を使用）
         let mut h264_data = Vec::new();
         let start_code = [0u8, 0, 0, 1];
 
@@ -779,8 +786,11 @@ mod tests {
         h264_data.extend_from_slice(&start_code);
         h264_data.extend_from_slice(&frame_data);
 
-        let mut decoder =
-            Decoder::new_h264(DecoderConfig::default()).expect("Failed to create h264 decoder");
+        let config = DecoderConfig {
+            codec: DecoderCodec::H264,
+            ..DecoderConfig::default()
+        };
+        let mut decoder = Decoder::new(config).expect("Failed to create h264 decoder");
 
         // デコードを実行
         decoder
@@ -799,22 +809,22 @@ mod tests {
         assert_eq!(frame.width(), 640);
         assert_eq!(frame.height(), 480);
 
-        // Y平面とUV平面のデータサイズを確認
+        // Y 平面と UV 平面のデータサイズを確認
         assert_eq!(frame.y_plane().len(), frame.y_stride() * frame.height());
         assert_eq!(
             frame.uv_plane().len(),
             frame.uv_stride() * frame.height() / 2
         );
 
-        // ストライドが幅以上であることを確認（GPUアラインメントのため）
+        // ストライドが幅以上であることを確認（GPU アラインメントのため）
         assert!(frame.y_stride() >= frame.width());
         assert!(frame.uv_stride() >= frame.width());
 
-        // 黒画面なので、Y成分は16付近、UV成分は128付近の値になることを確認
+        // 黒画面なので、Y 成分は 16 付近、UV 成分は 128 付近の値になることを確認
         let y_data = frame.y_plane();
         let uv_data = frame.uv_plane();
 
-        // Y成分の平均値をチェック（完全な黒は16）
+        // Y 成分の平均値をチェック（完全な黒は 16）
         let y_avg = y_data.iter().map(|&x| x as u32).sum::<u32>() / y_data.len() as u32;
         assert!(
             y_avg >= 10 && y_avg <= 30,
@@ -822,7 +832,7 @@ mod tests {
             y_avg
         );
 
-        // UV成分の平均値をチェック
+        // UV 成分の平均値をチェック
         let uv_avg = uv_data.iter().map(|&x| x as u32).sum::<u32>() / uv_data.len() as u32;
         assert!(
             uv_avg >= 70 && uv_avg <= 140,
@@ -841,7 +851,7 @@ mod tests {
 
     #[test]
     fn test_decode_av1_black_frame() {
-        // AV1の黒フレームデータ (OBU format)
+        // AV1 の黒フレームデータ (OBU format)
         // OBU_TYPE=1 (sequence header) と OBU_TYPE=6 (frame) を含む
         let av1_data = vec![
             // TYPE=1 (Sequence Header OBU)
@@ -850,8 +860,11 @@ mod tests {
             76, 173, 116, 93, 183, 31, 101, 221, 87, 90, 233, 219, 28, 199, 243, 128,
         ];
 
-        let mut decoder =
-            Decoder::new_av1(DecoderConfig::default()).expect("Failed to create av1 decoder");
+        let config = DecoderConfig {
+            codec: DecoderCodec::Av1,
+            ..DecoderConfig::default()
+        };
+        let mut decoder = Decoder::new(config).expect("Failed to create av1 decoder");
 
         // デコードを実行
         decoder
@@ -870,22 +883,22 @@ mod tests {
         assert_eq!(frame.width(), 640);
         assert_eq!(frame.height(), 480);
 
-        // Y平面とUV平面のデータサイズを確認
+        // Y 平面と UV 平面のデータサイズを確認
         assert_eq!(frame.y_plane().len(), frame.y_stride() * frame.height());
         assert_eq!(
             frame.uv_plane().len(),
             frame.uv_stride() * frame.height() / 2
         );
 
-        // ストライドが幅以上であることを確認（GPUアラインメントのため）
+        // ストライドが幅以上であることを確認（GPU アラインメントのため）
         assert!(frame.y_stride() >= frame.width());
         assert!(frame.uv_stride() >= frame.width());
 
-        // 黒画面なので、Y成分は16付近、UV成分は128付近の値になることを確認
+        // 黒画面なので、Y 成分は 16 付近、UV 成分は 128 付近の値になることを確認
         let y_data = frame.y_plane();
         let uv_data = frame.uv_plane();
 
-        // Y成分の平均値をチェック（完全な黒は16）
+        // Y 成分の平均値をチェック（完全な黒は 16）
         let y_avg = y_data.iter().map(|&x| x as u32).sum::<u32>() / y_data.len() as u32;
         assert!(
             y_avg >= 10 && y_avg <= 30,
@@ -893,7 +906,7 @@ mod tests {
             y_avg
         );
 
-        // UV成分の平均値をチェック
+        // UV 成分の平均値をチェック
         let uv_avg = uv_data.iter().map(|&x| x as u32).sum::<u32>() / uv_data.len() as u32;
         assert!(
             uv_avg >= 70 && uv_avg <= 140,
@@ -912,7 +925,7 @@ mod tests {
 
     #[test]
     fn test_decode_vp8_black_frame() {
-        // VP8の黒フレームデータ
+        // VP8 の黒フレームデータ
         let vp8_data = vec![
             80, 66, 0, 157, 1, 42, 128, 2, 224, 1, 2, 199, 8, 133, 133, 136, 153, 132, 136, 15, 2,
             0, 6, 22, 4, 247, 6, 129, 100, 159, 107, 219, 155, 39, 56, 123, 39, 56, 123, 39, 56,
@@ -944,8 +957,11 @@ mod tests {
             250, 215, 128,
         ];
 
-        let mut decoder =
-            Decoder::new_vp8(DecoderConfig::default()).expect("Failed to create vp8 decoder");
+        let config = DecoderConfig {
+            codec: DecoderCodec::Vp8,
+            ..DecoderConfig::default()
+        };
+        let mut decoder = Decoder::new(config).expect("Failed to create vp8 decoder");
 
         // デコードを実行
         decoder
@@ -964,22 +980,22 @@ mod tests {
         assert_eq!(frame.width(), 640);
         assert_eq!(frame.height(), 480);
 
-        // Y平面とUV平面のデータサイズを確認
+        // Y 平面と UV 平面のデータサイズを確認
         assert_eq!(frame.y_plane().len(), frame.y_stride() * frame.height());
         assert_eq!(
             frame.uv_plane().len(),
             frame.uv_stride() * frame.height() / 2
         );
 
-        // ストライドが幅以上であることを確認（GPUアラインメントのため）
+        // ストライドが幅以上であることを確認（GPU アラインメントのため）
         assert!(frame.y_stride() >= frame.width());
         assert!(frame.uv_stride() >= frame.width());
 
-        // 黒画面なので、Y成分は16付近、UV成分は128付近の値になることを確認
+        // 黒画面なので、Y 成分は 16 付近、UV 成分は 128 付近の値になることを確認
         let y_data = frame.y_plane();
         let uv_data = frame.uv_plane();
 
-        // Y成分の平均値をチェック（完全な黒は16）
+        // Y 成分の平均値をチェック（完全な黒は 16）
         let y_avg = y_data.iter().map(|&x| x as u32).sum::<u32>() / y_data.len() as u32;
         assert!(
             y_avg >= 10 && y_avg <= 30,
@@ -987,7 +1003,7 @@ mod tests {
             y_avg
         );
 
-        // UV成分の平均値をチェック
+        // UV 成分の平均値をチェック
         let uv_avg = uv_data.iter().map(|&x| x as u32).sum::<u32>() / uv_data.len() as u32;
         assert!(
             uv_avg >= 70 && uv_avg <= 140,
@@ -1006,7 +1022,7 @@ mod tests {
 
     #[test]
     fn test_decode_vp9_black_frame() {
-        // VP9の黒フレームデータ
+        // VP9 の黒フレームデータ
         let vp9_data = vec![
             130, 73, 131, 66, 0, 39, 240, 29, 246, 0, 56, 36, 28, 24, 74, 16, 0, 80, 97, 246, 58,
             246, 128, 92, 209, 238, 0, 0, 0, 0, 0, 20, 103, 26, 154, 224, 98, 35, 126, 68, 120,
@@ -1014,8 +1030,11 @@ mod tests {
             120, 240, 227, 199, 143, 30, 28, 238, 113, 218, 24, 0,
         ];
 
-        let mut decoder =
-            Decoder::new_vp9(DecoderConfig::default()).expect("Failed to create vp9 decoder");
+        let config = DecoderConfig {
+            codec: DecoderCodec::Vp9,
+            ..DecoderConfig::default()
+        };
+        let mut decoder = Decoder::new(config).expect("Failed to create vp9 decoder");
 
         // デコードを実行
         decoder
@@ -1034,22 +1053,22 @@ mod tests {
         assert_eq!(frame.width(), 640);
         assert_eq!(frame.height(), 480);
 
-        // Y平面とUV平面のデータサイズを確認
+        // Y 平面と UV 平面のデータサイズを確認
         assert_eq!(frame.y_plane().len(), frame.y_stride() * frame.height());
         assert_eq!(
             frame.uv_plane().len(),
             frame.uv_stride() * frame.height() / 2
         );
 
-        // ストライドが幅以上であることを確認（GPUアラインメントのため）
+        // ストライドが幅以上であることを確認（GPU アラインメントのため）
         assert!(frame.y_stride() >= frame.width());
         assert!(frame.uv_stride() >= frame.width());
 
-        // 黒画面なので、Y成分は16付近、UV成分は128付近の値になることを確認
+        // 黒画面なので、Y 成分は 16 付近、UV 成分は 128 付近の値になることを確認
         let y_data = frame.y_plane();
         let uv_data = frame.uv_plane();
 
-        // Y成分の平均値をチェック（完全な黒は16）
+        // Y 成分の平均値をチェック（完全な黒は 16）
         let y_avg = y_data.iter().map(|&x| x as u32).sum::<u32>() / y_data.len() as u32;
         assert!(
             y_avg >= 10 && y_avg <= 30,
@@ -1057,7 +1076,7 @@ mod tests {
             y_avg
         );
 
-        // UV成分の平均値をチェック
+        // UV 成分の平均値をチェック
         let uv_avg = uv_data.iter().map(|&x| x as u32).sum::<u32>() / uv_data.len() as u32;
         assert!(
             uv_avg >= 70 && uv_avg <= 140,

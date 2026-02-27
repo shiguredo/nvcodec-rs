@@ -50,3 +50,30 @@ let encoder = Encoder::new(EncoderConfig {
 ## 低レイヤー / 高レイヤーの分離
 
 この設計を低レイヤー API とし、使いやすい高レイヤー API をその上に提供する。
+
+## 完了内容
+
+以下の変更を実施した:
+
+### エンコーダー
+
+- `H264Profile`, `HevcProfile`, `Av1Profile` enum を追加（NVENC SDK 準拠）
+- `H264EncoderConfig`, `HevcEncoderConfig`, `Av1EncoderConfig` 構造体を追加
+- `CodecConfig` enum を追加（コーデック名とコーデック固有設定を一体化）
+- `EncoderCodec` enum を追加（`query_caps` 用コーデック識別子）
+- `EncoderConfig` から `profile` と `idr_period` を削除し、`codec: CodecConfig` を追加
+- `Encoder::new(config)` に統一し、`new_h264` / `new_h265` / `new_av1` を削除
+- `Encoder::query_caps(codec, device_id)` に統一し、`query_caps_h264` / `query_caps_h265` / `query_caps_av1` を削除
+- `Profile` 構造体を削除
+
+### デコーダー
+
+- `DecoderCodec` enum を追加（デコーダー用コーデック識別子）
+- `DecoderConfig` に `codec: DecoderCodec` フィールドを追加
+- `Decoder::new(config)` に統一し、`new_h264` / `new_h265` / `new_av1` / `new_vp8` / `new_vp9` / `new_jpeg` を削除
+- `Decoder::query_caps(codec, device_id)` に統一し、`query_caps_h264` / `query_caps_h265` / `query_caps_av1` / `query_caps_vp8` / `query_caps_vp9` / `query_caps_jpeg` を削除
+
+### その他
+
+- 全テストを新 API に書き換え
+- `lib.rs` の pub use を更新
