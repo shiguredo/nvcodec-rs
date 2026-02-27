@@ -39,6 +39,38 @@ pub enum DecoderCodec {
     Jpeg,
 }
 
+/// デコーダー出力サーフェスフォーマット (NVDEC: cudaVideoSurfaceFormat)
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SurfaceFormat {
+    /// Semi-Planar YUV 4:2:0 8bit [Y plane + interleaved UV plane]
+    Nv12,
+    /// Semi-Planar YUV 4:2:0 16bit [Y plane + interleaved UV plane]
+    P016,
+    /// Planar YUV 4:4:4 8bit [Y plane + U plane + V plane]
+    Yuv444,
+    /// Planar YUV 4:4:4 16bit [Y plane + U plane + V plane]
+    Yuv444_16bit,
+    /// Semi-Planar YUV 4:2:2 8bit [Y plane + interleaved UV plane]
+    Nv16,
+    /// Semi-Planar YUV 4:2:2 16bit [Y plane + interleaved UV plane]
+    P216,
+}
+
+impl SurfaceFormat {
+    fn to_sys(self) -> u32 {
+        match self {
+            SurfaceFormat::Nv12 => sys::cudaVideoSurfaceFormat_enum_cudaVideoSurfaceFormat_NV12,
+            SurfaceFormat::P016 => sys::cudaVideoSurfaceFormat_enum_cudaVideoSurfaceFormat_P016,
+            SurfaceFormat::Yuv444 => sys::cudaVideoSurfaceFormat_enum_cudaVideoSurfaceFormat_YUV444,
+            SurfaceFormat::Yuv444_16bit => {
+                sys::cudaVideoSurfaceFormat_enum_cudaVideoSurfaceFormat_YUV444_16Bit
+            }
+            SurfaceFormat::Nv16 => sys::cudaVideoSurfaceFormat_enum_cudaVideoSurfaceFormat_NV16,
+            SurfaceFormat::P216 => sys::cudaVideoSurfaceFormat_enum_cudaVideoSurfaceFormat_P216,
+        }
+    }
+}
+
 /// デコーダーの設定
 #[derive(Debug, Clone)]
 pub struct DecoderConfig {
@@ -53,6 +85,9 @@ pub struct DecoderConfig {
 
     /// 表示遅延 (0 = 低遅延)
     pub max_display_delay: u32,
+
+    /// 出力サーフェスフォーマット (NVDEC: OutputFormat)
+    pub surface_format: SurfaceFormat,
 }
 
 /// デコーダー
@@ -172,6 +207,7 @@ impl Decoder {
                 height: 0,
                 surface_width: 0,
                 surface_height: 0,
+                surface_format: config.surface_format.to_sys(),
                 frame_tx,
                 ctx,
                 ctx_lock,
@@ -309,6 +345,7 @@ struct DecoderState {
     height: u32,
     surface_width: u32,
     surface_height: u32,
+    surface_format: u32,
     frame_tx: Sender<Result<DecodedFrame, Error>>,
     ctx: sys::CUcontext,
     ctx_lock: sys::CUvideoctxlock,
@@ -353,7 +390,7 @@ fn handle_video_sequence_inner(
     let mut create_info: sys::CUVIDDECODECREATEINFO = unsafe { std::mem::zeroed() };
     create_info.CodecType = format.codec;
     create_info.ChromaFormat = format.chroma_format;
-    create_info.OutputFormat = sys::cudaVideoSurfaceFormat_enum_cudaVideoSurfaceFormat_NV12;
+    create_info.OutputFormat = state.surface_format;
     create_info.bitDepthMinus8 = format.bit_depth_luma_minus8 as u64;
     create_info.DeinterlaceMode = if format.progressive_sequence != 0 {
         sys::cudaVideoDeinterlaceMode_enum_cudaVideoDeinterlaceMode_Weave
@@ -584,6 +621,7 @@ mod tests {
             device_id: 0,
             max_num_decode_surfaces: 20,
             max_display_delay: 0,
+            surface_format: SurfaceFormat::Nv12,
         }
     }
 

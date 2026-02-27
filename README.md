@@ -114,13 +114,14 @@ while let Some(encoded) = encoder.next_frame() {
 ### デコード
 
 ```rust
-use shiguredo_nvcodec::{Decoder, DecoderCodec, DecoderConfig};
+use shiguredo_nvcodec::{Decoder, DecoderCodec, DecoderConfig, SurfaceFormat};
 
 let config = DecoderConfig {
     codec: DecoderCodec::H264,
     device_id: 0,
     max_num_decode_surfaces: 20,
     max_display_delay: 0,
+    surface_format: SurfaceFormat::Nv12,
 };
 let mut decoder = Decoder::new(config)?;
 

@@ -13,7 +13,7 @@ mod encode;
 mod error;
 mod sys;
 
-pub use decode::{DecodedFrame, Decoder, DecoderCaps, DecoderCodec, DecoderConfig};
+pub use decode::{DecodedFrame, Decoder, DecoderCaps, DecoderCodec, DecoderConfig, SurfaceFormat};
 pub use encode::{
     Av1EncoderConfig, Av1Profile, BufferFormat, CodecConfig, EncodeOptions, EncodedFrame, Encoder,
     EncoderCaps, EncoderCodec, EncoderConfig, H264EncoderConfig, H264Profile, HevcEncoderConfig,

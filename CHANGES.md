@@ -39,6 +39,9 @@
 - [CHANGE] `EncoderConfig` に `buffer_format: BufferFormat` フィールドを追加する
   - NV12 ハードコードを廃止し、NVENC SDK がサポートする入力バッファフォーマットを選択可能にする
   - @voluntas
+- [CHANGE] `DecoderConfig` に `surface_format: SurfaceFormat` フィールドを追加する
+  - NV12 ハードコードを廃止し、NVDEC SDK がサポートする出力サーフェスフォーマットを選択可能にする
+  - @voluntas
 - [ADD] エンコーダのケーパビリティクエリ機能を追加する
   - `EncoderCaps` 構造体と `Encoder::query_caps` メソッドを追加
   - @voluntas
