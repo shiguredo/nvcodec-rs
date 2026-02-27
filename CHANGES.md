@@ -11,6 +11,9 @@
 
 ## develop
 
+- [FIX] デコーダーがストリーム中の解像度変更に対応できない問題を修正する
+  - `handle_video_sequence_inner` で既存デコーダーを破棄して再作成するようにする
+  - @voluntas
 - [CHANGE] `hisui/crates/shiguredo_nvcodec/` から `shiguredo/nvcodec-rs` に変更する
   - crates.io はそのまま
   - @voluntas
