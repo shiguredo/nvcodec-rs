@@ -142,30 +142,36 @@ impl Av1Profile {
     }
 }
 
-/// H.264 エンコーダー固有設定
+/// H.264 エンコーダー固有設定 (NVENC: NV_ENC_CONFIG_H264)
 #[derive(Debug, Clone, Default)]
 pub struct H264EncoderConfig {
-    /// プロファイル（None の場合は Main）
+    /// プロファイル (NVENC: profileGUID)
+    /// None の場合は Main
     pub profile: Option<H264Profile>,
-    /// IDR フレーム間隔（None の場合は gop_length と同じ）
+    /// IDR フレーム間隔 (NVENC: idrPeriod)
+    /// None の場合は gop_length と同じ
     pub idr_period: Option<u32>,
 }
 
-/// HEVC エンコーダー固有設定
+/// HEVC エンコーダー固有設定 (NVENC: NV_ENC_CONFIG_HEVC)
 #[derive(Debug, Clone, Default)]
 pub struct HevcEncoderConfig {
-    /// プロファイル（None の場合は Main）
+    /// プロファイル (NVENC: profileGUID)
+    /// None の場合は Main
     pub profile: Option<HevcProfile>,
-    /// IDR フレーム間隔（None の場合は gop_length と同じ）
+    /// IDR フレーム間隔 (NVENC: idrPeriod)
+    /// None の場合は gop_length と同じ
     pub idr_period: Option<u32>,
 }
 
-/// AV1 エンコーダー固有設定
+/// AV1 エンコーダー固有設定 (NVENC: NV_ENC_CONFIG_AV1)
 #[derive(Debug, Clone, Default)]
 pub struct Av1EncoderConfig {
-    /// プロファイル（None の場合は Main）
+    /// プロファイル (NVENC: profileGUID)
+    /// None の場合は Main
     pub profile: Option<Av1Profile>,
-    /// IDR フレーム間隔（None の場合は gop_length と同じ）
+    /// IDR フレーム間隔 (NVENC: idrPeriod)
+    /// None の場合は gop_length と同じ
     pub idr_period: Option<u32>,
 }
 
@@ -194,50 +200,50 @@ pub enum EncoderCodec {
 /// エンコーダーに指定する設定
 #[derive(Debug, Clone)]
 pub struct EncoderConfig {
-    /// コーデックとコーデック固有設定
+    /// コーデックとコーデック固有設定 (NVENC: encodeGUID + NV_ENC_CODEC_CONFIG)
     pub codec: CodecConfig,
 
-    /// 入出力画像の幅
+    /// エンコード幅 (NVENC: encodeWidth)
     pub width: u32,
 
-    /// 入出力画像の高さ
+    /// エンコード高さ (NVENC: encodeHeight)
     pub height: u32,
 
-    /// 最大エンコード幅（動的解像度変更用）
+    /// 最大エンコード幅 (NVENC: maxEncodeWidth)
     /// None の場合は width と同じ値が使用される
     pub max_encode_width: Option<u32>,
 
-    /// 最大エンコード高さ（動的解像度変更用）
+    /// 最大エンコード高さ (NVENC: maxEncodeHeight)
     /// None の場合は height と同じ値が使用される
     pub max_encode_height: Option<u32>,
 
-    /// FPS の分子
-    pub fps_numerator: u32,
+    /// フレームレートの分子 (NVENC: frameRateNum)
+    pub framerate_num: u32,
 
-    /// FPS の分母
-    pub fps_denominator: u32,
+    /// フレームレートの分母 (NVENC: frameRateDen)
+    pub framerate_den: u32,
 
-    /// ビットレート (bps 単位)
+    /// 平均ビットレート (bps 単位, NVENC: averageBitRate)
     /// None の場合はレート制御モードが ConstQp である必要がある
-    pub target_bitrate: Option<u32>,
+    pub average_bitrate: Option<u32>,
 
-    /// プリセット GUID (品質と速度のバランス)
+    /// プリセット (NVENC: presetGUID)
     pub preset: Preset,
 
-    /// チューニング情報
+    /// チューニング情報 (NVENC: tuningInfo)
     pub tuning_info: TuningInfo,
 
-    /// レート制御モード
+    /// レート制御モード (NVENC: rateControlMode)
     pub rate_control_mode: RateControlMode,
 
-    /// GOP長
-    /// None の場合は無限GOP (NVENC_INFINITE_GOPLENGTH) が使用される
+    /// GOP 長 (NVENC: gopLength)
+    /// None の場合は無限 GOP (NVENC_INFINITE_GOPLENGTH) が使用される
     pub gop_length: Option<u32>,
 
-    /// Pフレーム間隔
+    /// P フレーム間隔 (NVENC: frameIntervalP)
     pub frame_interval_p: u32,
 
-    /// デバイスID (使用するGPU)
+    /// デバイス ID (使用する GPU)
     pub device_id: i32,
 }
 
@@ -262,10 +268,10 @@ impl Default for EncoderConfig {
             height: 480,
             max_encode_width: None,
             max_encode_height: None,
-            fps_numerator: 30,
-            fps_denominator: 1,
-            target_bitrate: Some(5_000_000), // 5 Mbps
-            preset: Preset::P4,              // バランスの良いプリセット
+            framerate_num: 30,
+            framerate_den: 1,
+            average_bitrate: Some(5_000_000), // 5 Mbps
+            preset: Preset::P4,               // バランスの良いプリセット
             tuning_info: TuningInfo::LOW_LATENCY,
             rate_control_mode: RateControlMode::Vbr,
             gop_length: None, // 無限 GOP
@@ -307,13 +313,13 @@ pub struct EncoderCaps {
 /// エンコーダ再構成パラメータ
 #[derive(Debug, Clone, Default)]
 pub struct ReconfigureParams {
-    /// FPS の分子
-    pub fps_numerator: Option<u32>,
-    /// FPS の分母
-    pub fps_denominator: Option<u32>,
-    /// ターゲットビットレート (bps)
-    pub target_bitrate: Option<u32>,
-    /// 最大ビットレート (bps)
+    /// フレームレートの分子 (NVENC: frameRateNum)
+    pub framerate_num: Option<u32>,
+    /// フレームレートの分母 (NVENC: frameRateDen)
+    pub framerate_den: Option<u32>,
+    /// 平均ビットレート (bps, NVENC: averageBitRate)
+    pub average_bitrate: Option<u32>,
+    /// 最大ビットレート (bps, NVENC: maxBitRate)
     pub max_bitrate: Option<u32>,
 }
 
@@ -327,7 +333,7 @@ pub struct Encoder {
     height: u32,
     buffer_format: sys::NV_ENC_BUFFER_FORMAT,
     encoded_frames: VecDeque<EncodedFrame>,
-    fps_denominator: u64,
+    framerate_den: u64,
     frame_count: u64,
     init_params: sys::NV_ENC_INITIALIZE_PARAMS,
     encode_config: sys::NV_ENC_CONFIG,
@@ -388,7 +394,7 @@ impl Encoder {
                 height: config.height,
                 buffer_format: sys::_NV_ENC_BUFFER_FORMAT_NV_ENC_BUFFER_FORMAT_NV12,
                 encoded_frames: VecDeque::new(),
-                fps_denominator: config.fps_denominator as u64,
+                framerate_den: config.framerate_den as u64,
                 frame_count: 0,
                 init_params: std::mem::zeroed(),
                 encode_config: std::mem::zeroed(),
@@ -524,13 +530,13 @@ impl Encoder {
             reconfig_params.reInitEncodeParams.encodeConfig = &mut new_config;
 
             // 変更パラメータを上書き
-            if let Some(fps_num) = params.fps_numerator {
+            if let Some(fps_num) = params.framerate_num {
                 reconfig_params.reInitEncodeParams.frameRateNum = fps_num;
             }
-            if let Some(fps_den) = params.fps_denominator {
+            if let Some(fps_den) = params.framerate_den {
                 reconfig_params.reInitEncodeParams.frameRateDen = fps_den;
             }
-            if let Some(bitrate) = params.target_bitrate {
+            if let Some(bitrate) = params.average_bitrate {
                 new_config.rcParams.averageBitRate = bitrate;
             }
             if let Some(max_br) = params.max_bitrate {
@@ -549,8 +555,8 @@ impl Encoder {
             self.init_params = reconfig_params.reInitEncodeParams;
             self.init_params.encodeConfig = &mut self.encode_config;
 
-            if let Some(fps_den) = params.fps_denominator {
-                self.fps_denominator = fps_den as u64;
+            if let Some(fps_den) = params.framerate_den {
+                self.framerate_den = fps_den as u64;
             }
 
             Ok(())
@@ -615,8 +621,8 @@ impl Encoder {
             init_params.encodeHeight = config.height;
             init_params.darWidth = config.width;
             init_params.darHeight = config.height;
-            init_params.frameRateNum = config.fps_numerator;
-            init_params.frameRateDen = config.fps_denominator;
+            init_params.frameRateNum = config.framerate_num;
+            init_params.frameRateDen = config.framerate_den;
             init_params.enablePTD = 1;
 
             init_params.encodeConfig = &mut encode_config;
@@ -634,10 +640,10 @@ impl Encoder {
 
                 // ビットレート設定
                 if config.rate_control_mode != RateControlMode::ConstQp {
-                    let bitrate = config.target_bitrate.ok_or_else(|| {
+                    let bitrate = config.average_bitrate.ok_or_else(|| {
                         Error::new_custom(
                             "initialize_encoder",
-                            "target_bitrate must be specified when not using ConstQp mode",
+                            "average_bitrate must be specified when not using ConstQp mode",
                         )
                     })?;
                     encode_config.rcParams.averageBitRate = bitrate;
@@ -879,7 +885,7 @@ impl Encoder {
             pic_params.outputBitstream = output_buffer;
             pic_params.bufferFmt = self.buffer_format;
             pic_params.pictureStruct = sys::_NV_ENC_PIC_STRUCT_NV_ENC_PIC_STRUCT_FRAME;
-            pic_params.inputTimeStamp = self.frame_count * self.fps_denominator;
+            pic_params.inputTimeStamp = self.frame_count * self.framerate_den;
 
             self.frame_count += 1;
 
