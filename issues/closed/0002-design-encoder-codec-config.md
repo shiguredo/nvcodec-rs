@@ -2,15 +2,60 @@
 
 ## 概要
 
-現在の `Encoder::new_h264(EncoderConfig)` / `Encoder::new_h265(EncoderConfig)` は
-コーデック名がメソッド名に埋め込まれており、`EncoderConfig` は全コーデック共通の
-抽象化になっている。これは SDK の設計（コーデック別の `NV_ENC_CONFIG_H264` /
+`Encoder::new_h264(EncoderConfig)` / `Encoder::new_h265(EncoderConfig)` / `Encoder::new_av1(EncoderConfig)` は
+コーデック名がメソッド名に埋め込まれており、`EncoderConfig` の `profile` と `idr_period` は全コーデック共通の
+抽象化になっていた。これは NVENC SDK の設計（コーデック別の `NV_ENC_CONFIG_H264` /
 `NV_ENC_CONFIG_HEVC` / `NV_ENC_CONFIG_AV1`）と乖離している。
+
+デコーダー側も同様に `Decoder::new_h264` / `Decoder::new_h265` 等のコーデック別コンストラクタが存在していた。
 
 ## 方針
 
 `EncoderConfig` の `codec` フィールドに `CodecConfig` enum を持たせる。
-enum のバリアントがコーデック名とコーデック固有 config を同時に表現する。
+enum のバリアントがコーデック名とコーデック固有設定を同時に表現する。
+コンストラクタは `Encoder::new(config)` に統一し、旧 API は全て削除する。
+
+デコーダー側は `DecoderCodec` 識別子 enum を導入し、`Decoder::new(config)` に統一する。
+
+## エンコーダー API
+
+### コーデック固有プロファイル enum
+
+```rust
+pub enum H264Profile {
+    AutoSelect, Baseline, Main, High, High10,
+    High422, High444, Stereo, ProgressiveHigh, ConstrainedHigh,
+}
+
+pub enum HevcProfile {
+    AutoSelect, Main, Main10, Frext,
+}
+
+pub enum Av1Profile {
+    AutoSelect, Main,
+}
+```
+
+### コーデック固有設定構造体
+
+```rust
+pub struct H264EncoderConfig {
+    pub profile: Option<H264Profile>,   // None → Main
+    pub idr_period: Option<u32>,        // None → gop_length と同じ
+}
+
+pub struct HevcEncoderConfig {
+    pub profile: Option<HevcProfile>,
+    pub idr_period: Option<u32>,
+}
+
+pub struct Av1EncoderConfig {
+    pub profile: Option<Av1Profile>,
+    pub idr_period: Option<u32>,
+}
+```
+
+### CodecConfig enum
 
 ```rust
 pub enum CodecConfig {
@@ -18,38 +63,117 @@ pub enum CodecConfig {
     Hevc(HevcEncoderConfig),
     Av1(Av1EncoderConfig),
 }
+```
 
-pub struct EncoderConfig {
-    pub width: u32,
-    pub height: u32,
-    pub bitrate: Option<u64>,
-    // ...共通フィールド
-    pub codec: CodecConfig,
+### EncoderCodec enum（query_caps 用）
+
+```rust
+pub enum EncoderCodec {
+    H264,
+    Hevc,
+    Av1,
 }
 ```
 
-コンストラクタは `Encoder::new(config)` に統一される。
+### EncoderConfig
 
 ```rust
-let encoder = Encoder::new(EncoderConfig {
-    width: 640,
-    height: 480,
-    codec: CodecConfig::H264(H264EncoderConfig {
-        profile: H264Profile::Main,
-        idr_period: 30,
+pub struct EncoderConfig {
+    pub codec: CodecConfig,
+    pub width: u32,
+    pub height: u32,
+    pub max_encode_width: Option<u32>,
+    pub max_encode_height: Option<u32>,
+    pub fps_numerator: u32,
+    pub fps_denominator: u32,
+    pub target_bitrate: Option<u32>,
+    pub preset: Preset,
+    pub tuning_info: TuningInfo,
+    pub rate_control_mode: RateControlMode,
+    pub gop_length: Option<u32>,
+    pub frame_interval_p: u32,
+    pub device_id: i32,
+}
+```
+
+`Default`: `codec = CodecConfig::H264(Default)`, `640x480`, `30fps`, `5Mbps VBR`, `P4`, `LOW_LATENCY`
+
+### Encoder
+
+```rust
+impl Encoder {
+    pub fn new(config: EncoderConfig) -> Result<Self, Error>;
+    pub fn query_caps(codec: EncoderCodec, device_id: i32) -> Result<EncoderCaps, Error>;
+    pub fn encode(&mut self, nv12_data: &[u8]) -> Result<(), Error>;
+    pub fn finish(&mut self) -> Result<(), Error>;
+    pub fn next_frame(&mut self) -> Option<EncodedFrame>;
+    pub fn get_sequence_params(&mut self) -> Result<Vec<u8>, Error>;
+    pub fn reconfigure(&mut self, params: ReconfigureParams) -> Result<(), Error>;
+}
+```
+
+### 使用例
+
+```rust
+let config = EncoderConfig {
+    codec: CodecConfig::Hevc(HevcEncoderConfig {
+        profile: Some(HevcProfile::Main),
+        ..Default::default()
     }),
-    // ...
-})?;
+    width: 1920,
+    height: 1080,
+    ..Default::default()
+};
+let mut encoder = Encoder::new(config)?;
+```
+
+## デコーダー API
+
+### DecoderCodec enum
+
+```rust
+pub enum DecoderCodec {
+    H264, Hevc, Av1, Vp8, Vp9, Jpeg,
+}
+```
+
+### DecoderConfig
+
+```rust
+pub struct DecoderConfig {
+    pub codec: DecoderCodec,
+    pub device_id: i32,                    // デフォルト: 0
+    pub max_num_decode_surfaces: u32,      // デフォルト: 20
+    pub max_display_delay: u32,            // デフォルト: 0（低遅延）
+}
+```
+
+### Decoder
+
+```rust
+impl Decoder {
+    pub fn new(config: DecoderConfig) -> Result<Self, Error>;
+    pub fn query_caps(codec: DecoderCodec, device_id: i32) -> Result<DecoderCaps, Error>;
+    pub fn decode(&mut self, data: &[u8]) -> Result<(), Error>;
+    pub fn finish(&mut self) -> Result<(), Error>;
+    pub fn next_frame(&mut self) -> Result<Option<DecodedFrame>, Error>;
+}
+```
+
+### 使用例
+
+```rust
+let config = DecoderConfig {
+    codec: DecoderCodec::Av1,
+    ..Default::default()
+};
+let mut decoder = Decoder::new(config)?;
 ```
 
 ## 参考
 
 - WebCodecs API: `codec` 識別子 + コーデック固有 config を分離するパターン
 - NVENC SDK: `NV_ENC_CODEC_CONFIG` union に `h264Config` / `hevcConfig` / `av1Config`
-
-## 低レイヤー / 高レイヤーの分離
-
-この設計を低レイヤー API とし、使いやすい高レイヤー API をその上に提供する。
 
 ## 完了内容
 
