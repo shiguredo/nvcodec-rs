@@ -143,7 +143,7 @@ impl Av1Profile {
 }
 
 /// H.264 エンコーダー固有設定 (NVENC: NV_ENC_CONFIG_H264)
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
 pub struct H264EncoderConfig {
     /// プロファイル (NVENC: profileGUID)
     /// None の場合は Main
@@ -154,7 +154,7 @@ pub struct H264EncoderConfig {
 }
 
 /// HEVC エンコーダー固有設定 (NVENC: NV_ENC_CONFIG_HEVC)
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
 pub struct HevcEncoderConfig {
     /// プロファイル (NVENC: profileGUID)
     /// None の場合は Main
@@ -165,7 +165,7 @@ pub struct HevcEncoderConfig {
 }
 
 /// AV1 エンコーダー固有設定 (NVENC: NV_ENC_CONFIG_AV1)
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
 pub struct Av1EncoderConfig {
     /// プロファイル (NVENC: profileGUID)
     /// None の場合は Main
@@ -260,27 +260,6 @@ pub enum RateControlMode {
     Cbr,
 }
 
-impl Default for EncoderConfig {
-    fn default() -> Self {
-        Self {
-            codec: CodecConfig::H264(H264EncoderConfig::default()),
-            width: 640,
-            height: 480,
-            max_encode_width: None,
-            max_encode_height: None,
-            framerate_num: 30,
-            framerate_den: 1,
-            average_bitrate: Some(5_000_000), // 5 Mbps
-            preset: Preset::P4,               // バランスの良いプリセット
-            tuning_info: TuningInfo::LOW_LATENCY,
-            rate_control_mode: RateControlMode::Vbr,
-            gop_length: None, // 無限 GOP
-            frame_interval_p: 1,
-            device_id: 0, // プライマリ GPU
-        }
-    }
-}
-
 impl RateControlMode {
     fn to_sys(self) -> sys::NV_ENC_PARAMS_RC_MODE {
         match self {
@@ -321,6 +300,36 @@ pub struct ReconfigureParams {
     pub average_bitrate: Option<u32>,
     /// 最大ビットレート (bps, NVENC: maxBitRate)
     pub max_bitrate: Option<u32>,
+}
+
+/// フレーム単位のエンコードオプション (NVENC: NV_ENC_PIC_FLAGS)
+#[derive(Debug, Clone)]
+pub struct EncodeOptions {
+    /// I フレームとして強制エンコードする (NVENC: NV_ENC_PIC_FLAG_FORCEINTRA)
+    pub force_intra: bool,
+    /// IDR フレームとして強制エンコードする (NVENC: NV_ENC_PIC_FLAG_FORCEIDR)
+    /// AV1 の場合は Key Frame として扱われる
+    pub force_idr: bool,
+    /// SPS/PPS/VPS をビットストリームに出力する (NVENC: NV_ENC_PIC_FLAG_OUTPUT_SPSPPS)
+    /// AV1 の場合は Sequence Header OBU が出力される
+    pub output_spspps: bool,
+}
+
+impl EncodeOptions {
+    /// encodePicFlags のビットフラグに変換する
+    fn to_pic_flags(&self) -> u32 {
+        let mut flags = 0u32;
+        if self.force_intra {
+            flags |= sys::NV_ENC_PIC_FLAG_FORCEINTRA;
+        }
+        if self.force_idr {
+            flags |= sys::NV_ENC_PIC_FLAG_FORCEIDR;
+        }
+        if self.output_spspps {
+            flags |= sys::NV_ENC_PIC_FLAG_OUTPUT_SPSPPS;
+        }
+        flags
+    }
 }
 
 /// エンコーダー
@@ -719,7 +728,7 @@ impl Encoder {
     }
 
     /// NV12 形式のフレームをエンコードする
-    pub fn encode(&mut self, nv12_data: &[u8]) -> Result<(), Error> {
+    pub fn encode(&mut self, nv12_data: &[u8], options: &EncodeOptions) -> Result<(), Error> {
         let expected_size = (self.width * self.height * 3 / 2) as usize;
 
         if nv12_data.len() != expected_size {
@@ -728,10 +737,10 @@ impl Encoder {
 
         self.lib
             .clone()
-            .with_context(self.ctx, || self.encode_inner(nv12_data))
+            .with_context(self.ctx, || self.encode_inner(nv12_data, options))
     }
 
-    fn encode_inner(&mut self, nv12_data: &[u8]) -> Result<(), Error> {
+    fn encode_inner(&mut self, nv12_data: &[u8], options: &EncodeOptions) -> Result<(), Error> {
         // 入力データをデバイスにコピー
         let (device_input, _device_guard) = self.copy_input_data_to_device(nv12_data)?;
 
@@ -746,7 +755,7 @@ impl Encoder {
         let (output_buffer, _bitstream_guard) = self.create_output_bitstream_buffer()?;
 
         // ピクチャをエンコード
-        self.encode_picture(mapped_resource, output_buffer)?;
+        self.encode_picture(mapped_resource, output_buffer, options)?;
 
         // ビットストリームをロックしてエンコード済みデータをコピー
         let encoded_frame = self.lock_and_copy_bitstream(output_buffer)?;
@@ -874,6 +883,7 @@ impl Encoder {
         &mut self,
         mapped_resource: sys::NV_ENC_INPUT_PTR,
         output_buffer: sys::NV_ENC_OUTPUT_PTR,
+        options: &EncodeOptions,
     ) -> Result<(), Error> {
         unsafe {
             let mut pic_params: sys::NV_ENC_PIC_PARAMS = std::mem::zeroed();
@@ -886,6 +896,7 @@ impl Encoder {
             pic_params.bufferFmt = self.buffer_format;
             pic_params.pictureStruct = sys::_NV_ENC_PIC_STRUCT_NV_ENC_PIC_STRUCT_FRAME;
             pic_params.inputTimeStamp = self.frame_count * self.framerate_den;
+            pic_params.encodePicFlags = options.to_pic_flags();
 
             self.frame_count += 1;
 
@@ -1073,42 +1084,62 @@ impl EncodedFrame {
 mod tests {
     use super::*;
 
+    /// テスト用のエンコーダー設定を生成する
+    fn test_encoder_config(codec: CodecConfig) -> EncoderConfig {
+        EncoderConfig {
+            codec,
+            width: 640,
+            height: 480,
+            max_encode_width: None,
+            max_encode_height: None,
+            framerate_num: 30,
+            framerate_den: 1,
+            average_bitrate: Some(5_000_000),
+            preset: Preset::P4,
+            tuning_info: TuningInfo::LOW_LATENCY,
+            rate_control_mode: RateControlMode::Vbr,
+            gop_length: None,
+            frame_interval_p: 1,
+            device_id: 0,
+        }
+    }
+
     #[test]
     fn init_h264_encoder() {
-        let config = EncoderConfig {
-            codec: CodecConfig::H264(H264EncoderConfig::default()),
-            ..EncoderConfig::default()
-        };
+        let config = test_encoder_config(CodecConfig::H264(H264EncoderConfig {
+            profile: None,
+            idr_period: None,
+        }));
         let _encoder = Encoder::new(config).expect("failed to initialize h264 encoder");
         println!("h264 encoder initialized successfully");
     }
 
     #[test]
     fn init_h265_encoder() {
-        let config = EncoderConfig {
-            codec: CodecConfig::Hevc(HevcEncoderConfig::default()),
-            ..EncoderConfig::default()
-        };
+        let config = test_encoder_config(CodecConfig::Hevc(HevcEncoderConfig {
+            profile: None,
+            idr_period: None,
+        }));
         let _encoder = Encoder::new(config).expect("failed to initialize h265 encoder");
         println!("h265 encoder initialized successfully");
     }
 
     #[test]
     fn init_av1_encoder() {
-        let config = EncoderConfig {
-            codec: CodecConfig::Av1(Av1EncoderConfig::default()),
-            ..EncoderConfig::default()
-        };
+        let config = test_encoder_config(CodecConfig::Av1(Av1EncoderConfig {
+            profile: None,
+            idr_period: None,
+        }));
         let _encoder = Encoder::new(config).expect("failed to initialize av1 encoder");
         println!("av1 encoder initialized successfully");
     }
 
     #[test]
     fn test_get_sequence_params_h264() {
-        let config = EncoderConfig {
-            codec: CodecConfig::H264(H264EncoderConfig::default()),
-            ..EncoderConfig::default()
-        };
+        let config = test_encoder_config(CodecConfig::H264(H264EncoderConfig {
+            profile: None,
+            idr_period: None,
+        }));
         let mut encoder = Encoder::new(config).expect("failed to create h264 encoder");
 
         // SPS/PPS を取得
@@ -1127,10 +1158,10 @@ mod tests {
 
     #[test]
     fn test_get_sequence_params_h265() {
-        let config = EncoderConfig {
-            codec: CodecConfig::Hevc(HevcEncoderConfig::default()),
-            ..EncoderConfig::default()
-        };
+        let config = test_encoder_config(CodecConfig::Hevc(HevcEncoderConfig {
+            profile: None,
+            idr_period: None,
+        }));
         let mut encoder = Encoder::new(config).expect("failed to create h265 encoder");
 
         // VPS/SPS/PPS を取得
@@ -1149,10 +1180,10 @@ mod tests {
 
     #[test]
     fn test_get_sequence_params_av1() {
-        let config = EncoderConfig {
-            codec: CodecConfig::Av1(Av1EncoderConfig::default()),
-            ..EncoderConfig::default()
-        };
+        let config = test_encoder_config(CodecConfig::Av1(Av1EncoderConfig {
+            profile: None,
+            idr_period: None,
+        }));
         let mut encoder = Encoder::new(config).expect("failed to create av1 encoder");
 
         // Sequence Header OBU を取得
@@ -1171,10 +1202,10 @@ mod tests {
 
     #[test]
     fn test_encode_h264_black_frame() {
-        let config = EncoderConfig {
-            codec: CodecConfig::H264(H264EncoderConfig::default()),
-            ..EncoderConfig::default()
-        };
+        let config = test_encoder_config(CodecConfig::H264(H264EncoderConfig {
+            profile: None,
+            idr_period: None,
+        }));
         let width = config.width;
         let height = config.height;
 
@@ -1190,7 +1221,14 @@ mod tests {
 
         // エンコードを実行
         encoder
-            .encode(&frame_data)
+            .encode(
+                &frame_data,
+                &EncodeOptions {
+                    force_intra: false,
+                    force_idr: false,
+                    output_spspps: false,
+                },
+            )
             .expect("failed to encode black frame");
 
         // エンコーダーを終了して残りのフレームをフラッシュ
@@ -1225,10 +1263,10 @@ mod tests {
 
     #[test]
     fn test_encode_h265_black_frame() {
-        let config = EncoderConfig {
-            codec: CodecConfig::Hevc(HevcEncoderConfig::default()),
-            ..EncoderConfig::default()
-        };
+        let config = test_encoder_config(CodecConfig::Hevc(HevcEncoderConfig {
+            profile: None,
+            idr_period: None,
+        }));
         let width = config.width;
         let height = config.height;
 
@@ -1244,7 +1282,14 @@ mod tests {
 
         // エンコードを実行
         encoder
-            .encode(&frame_data)
+            .encode(
+                &frame_data,
+                &EncodeOptions {
+                    force_intra: false,
+                    force_idr: false,
+                    output_spspps: false,
+                },
+            )
             .expect("failed to encode black frame");
 
         // エンコーダーを終了して残りのフレームをフラッシュ
@@ -1279,10 +1324,10 @@ mod tests {
 
     #[test]
     fn test_encode_av1_black_frame() {
-        let config = EncoderConfig {
-            codec: CodecConfig::Av1(Av1EncoderConfig::default()),
-            ..EncoderConfig::default()
-        };
+        let config = test_encoder_config(CodecConfig::Av1(Av1EncoderConfig {
+            profile: None,
+            idr_period: None,
+        }));
         let width = config.width;
         let height = config.height;
 
@@ -1298,7 +1343,14 @@ mod tests {
 
         // エンコードを実行
         encoder
-            .encode(&frame_data)
+            .encode(
+                &frame_data,
+                &EncodeOptions {
+                    force_intra: false,
+                    force_idr: false,
+                    output_spspps: false,
+                },
+            )
             .expect("failed to encode black frame");
 
         // エンコーダーを終了して残りのフレームをフラッシュ

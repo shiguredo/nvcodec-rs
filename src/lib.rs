@@ -15,9 +15,9 @@ mod sys;
 
 pub use decode::{DecodedFrame, Decoder, DecoderCaps, DecoderCodec, DecoderConfig};
 pub use encode::{
-    Av1EncoderConfig, Av1Profile, CodecConfig, EncodedFrame, Encoder, EncoderCaps, EncoderCodec,
-    EncoderConfig, H264EncoderConfig, H264Profile, HevcEncoderConfig, HevcProfile, PictureType,
-    Preset, RateControlMode, ReconfigureParams, TuningInfo,
+    Av1EncoderConfig, Av1Profile, CodecConfig, EncodeOptions, EncodedFrame, Encoder, EncoderCaps,
+    EncoderCodec, EncoderConfig, H264EncoderConfig, H264Profile, HevcEncoderConfig, HevcProfile,
+    PictureType, Preset, RateControlMode, ReconfigureParams, TuningInfo,
 };
 pub use error::Error;
 

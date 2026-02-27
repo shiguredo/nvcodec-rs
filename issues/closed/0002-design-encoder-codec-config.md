@@ -96,7 +96,7 @@ pub struct EncoderConfig {
 }
 ```
 
-`Default`: `codec = CodecConfig::H264(Default)`, `640x480`, `30fps`, `5Mbps VBR`, `P4`, `LOW_LATENCY`
+`Default` は実装しない。全フィールドを明示的に指定する。
 
 ### Encoder
 
@@ -118,11 +118,21 @@ impl Encoder {
 let config = EncoderConfig {
     codec: CodecConfig::Hevc(HevcEncoderConfig {
         profile: Some(HevcProfile::Main),
-        ..Default::default()
+        idr_period: None,
     }),
     width: 1920,
     height: 1080,
-    ..Default::default()
+    max_encode_width: None,
+    max_encode_height: None,
+    framerate_num: 30,
+    framerate_den: 1,
+    average_bitrate: Some(5_000_000),
+    preset: Preset::P4,
+    tuning_info: TuningInfo::LOW_LATENCY,
+    rate_control_mode: RateControlMode::Vbr,
+    gop_length: None,
+    frame_interval_p: 1,
+    device_id: 0,
 };
 let mut encoder = Encoder::new(config)?;
 ```
@@ -142,9 +152,9 @@ pub enum DecoderCodec {
 ```rust
 pub struct DecoderConfig {
     pub codec: DecoderCodec,
-    pub device_id: i32,                    // デフォルト: 0
-    pub max_num_decode_surfaces: u32,      // デフォルト: 20
-    pub max_display_delay: u32,            // デフォルト: 0（低遅延）
+    pub device_id: i32,
+    pub max_num_decode_surfaces: u32,
+    pub max_display_delay: u32,
 }
 ```
 
@@ -165,7 +175,9 @@ impl Decoder {
 ```rust
 let config = DecoderConfig {
     codec: DecoderCodec::Av1,
-    ..Default::default()
+    device_id: 0,
+    max_num_decode_surfaces: 20,
+    max_display_delay: 0,
 };
 let mut decoder = Decoder::new(config)?;
 ```

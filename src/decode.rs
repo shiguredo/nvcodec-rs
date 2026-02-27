@@ -45,25 +45,14 @@ pub struct DecoderConfig {
     /// コーデック識別子
     pub codec: DecoderCodec,
 
-    /// 使用する GPU デバイスの ID (デフォルト: 0)
+    /// 使用する GPU デバイスの ID
     pub device_id: i32,
 
-    /// デコード用サーフェスの最大数 (デフォルト: 20)
+    /// デコード用サーフェスの最大数
     pub max_num_decode_surfaces: u32,
 
-    /// 表示遅延 (デフォルト: 0 = 低遅延)
+    /// 表示遅延 (0 = 低遅延)
     pub max_display_delay: u32,
-}
-
-impl Default for DecoderConfig {
-    fn default() -> Self {
-        Self {
-            codec: DecoderCodec::H264,
-            device_id: 0,
-            max_num_decode_surfaces: 20,
-            max_display_delay: 0,
-        }
-    }
 }
 
 /// デコーダー
@@ -588,62 +577,54 @@ impl DecodedFrame {
 mod tests {
     use super::*;
 
+    /// テスト用のデコーダー設定を生成する
+    fn test_decoder_config(codec: DecoderCodec) -> DecoderConfig {
+        DecoderConfig {
+            codec,
+            device_id: 0,
+            max_num_decode_surfaces: 20,
+            max_display_delay: 0,
+        }
+    }
+
     #[test]
     fn init_h264_decoder() {
-        let config = DecoderConfig {
-            codec: DecoderCodec::H264,
-            ..DecoderConfig::default()
-        };
+        let config = test_decoder_config(DecoderCodec::H264);
         let _decoder = Decoder::new(config).expect("Failed to initialize h264 decoder");
         println!("h264 decoder initialized successfully");
     }
 
     #[test]
     fn init_h265_decoder() {
-        let config = DecoderConfig {
-            codec: DecoderCodec::Hevc,
-            ..DecoderConfig::default()
-        };
+        let config = test_decoder_config(DecoderCodec::Hevc);
         let _decoder = Decoder::new(config).expect("Failed to initialize h265 decoder");
         println!("h265 decoder initialized successfully");
     }
 
     #[test]
     fn init_av1_decoder() {
-        let config = DecoderConfig {
-            codec: DecoderCodec::Av1,
-            ..DecoderConfig::default()
-        };
+        let config = test_decoder_config(DecoderCodec::Av1);
         let _decoder = Decoder::new(config).expect("Failed to initialize av1 decoder");
         println!("av1 decoder initialized successfully");
     }
 
     #[test]
     fn init_vp8_decoder() {
-        let config = DecoderConfig {
-            codec: DecoderCodec::Vp8,
-            ..DecoderConfig::default()
-        };
+        let config = test_decoder_config(DecoderCodec::Vp8);
         let _decoder = Decoder::new(config).expect("Failed to initialize vp8 decoder");
         println!("vp8 decoder initialized successfully");
     }
 
     #[test]
     fn init_vp9_decoder() {
-        let config = DecoderConfig {
-            codec: DecoderCodec::Vp9,
-            ..DecoderConfig::default()
-        };
+        let config = test_decoder_config(DecoderCodec::Vp9);
         let _decoder = Decoder::new(config).expect("Failed to initialize vp9 decoder");
         println!("vp9 decoder initialized successfully");
     }
 
     #[test]
     fn test_multiple_decoders() {
-        let config = DecoderConfig {
-            codec: DecoderCodec::Hevc,
-            ..DecoderConfig::default()
-        };
+        let config = test_decoder_config(DecoderCodec::Hevc);
         // CUDA 初期化が 1 回だけ実行されることを確認するため、複数のデコーダーを作成
         let _decoder1 =
             Decoder::new(config.clone()).expect("Failed to initialize first h265 decoder");
@@ -691,10 +672,7 @@ mod tests {
         h265_data.extend_from_slice(&start_code);
         h265_data.extend_from_slice(&frame_data);
 
-        let config = DecoderConfig {
-            codec: DecoderCodec::Hevc,
-            ..DecoderConfig::default()
-        };
+        let config = test_decoder_config(DecoderCodec::Hevc);
         let mut decoder = Decoder::new(config).expect("Failed to create h265 decoder");
 
         // デコードを実行
@@ -786,10 +764,7 @@ mod tests {
         h264_data.extend_from_slice(&start_code);
         h264_data.extend_from_slice(&frame_data);
 
-        let config = DecoderConfig {
-            codec: DecoderCodec::H264,
-            ..DecoderConfig::default()
-        };
+        let config = test_decoder_config(DecoderCodec::H264);
         let mut decoder = Decoder::new(config).expect("Failed to create h264 decoder");
 
         // デコードを実行
@@ -860,10 +835,7 @@ mod tests {
             76, 173, 116, 93, 183, 31, 101, 221, 87, 90, 233, 219, 28, 199, 243, 128,
         ];
 
-        let config = DecoderConfig {
-            codec: DecoderCodec::Av1,
-            ..DecoderConfig::default()
-        };
+        let config = test_decoder_config(DecoderCodec::Av1);
         let mut decoder = Decoder::new(config).expect("Failed to create av1 decoder");
 
         // デコードを実行
@@ -957,10 +929,7 @@ mod tests {
             250, 215, 128,
         ];
 
-        let config = DecoderConfig {
-            codec: DecoderCodec::Vp8,
-            ..DecoderConfig::default()
-        };
+        let config = test_decoder_config(DecoderCodec::Vp8);
         let mut decoder = Decoder::new(config).expect("Failed to create vp8 decoder");
 
         // デコードを実行
@@ -1030,10 +999,7 @@ mod tests {
             120, 240, 227, 199, 143, 30, 28, 238, 113, 218, 24, 0,
         ];
 
-        let config = DecoderConfig {
-            codec: DecoderCodec::Vp9,
-            ..DecoderConfig::default()
-        };
+        let config = test_decoder_config(DecoderCodec::Vp9);
         let mut decoder = Decoder::new(config).expect("Failed to create vp9 decoder");
 
         // デコードを実行
