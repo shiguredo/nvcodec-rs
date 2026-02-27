@@ -120,9 +120,9 @@ impl Decoder {
 
                 Ok(DecoderCaps {
                     is_supported: decode_caps.bIsSupported != 0,
-                    max_width: decode_caps.nMaxWidth as u32,
-                    max_height: decode_caps.nMaxHeight as u32,
-                    max_mb_count: decode_caps.nMaxMBCount as u32,
+                    max_width: decode_caps.nMaxWidth,
+                    max_height: decode_caps.nMaxHeight,
+                    max_mb_count: decode_caps.nMaxMBCount,
                     min_width: decode_caps.nMinWidth as u32,
                     min_height: decode_caps.nMinHeight as u32,
                 })

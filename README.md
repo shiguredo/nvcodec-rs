@@ -62,8 +62,8 @@ DOCS_RS=1 cargo doc --no-deps
 
 ```rust
 use shiguredo_nvcodec::{
-    CodecConfig, EncodeOptions, Encoder, EncoderConfig, H264EncoderConfig,
-    Preset, TuningInfo, RateControlMode,
+    BufferFormat, CodecConfig, EncodeOptions, Encoder, EncoderConfig,
+    H264EncoderConfig, Preset, TuningInfo, RateControlMode,
 };
 
 let config = EncoderConfig {
@@ -83,6 +83,7 @@ let config = EncoderConfig {
     rate_control_mode: RateControlMode::Cbr,
     gop_length: None,
     frame_interval_p: 1,
+    buffer_format: BufferFormat::Nv12,
     device_id: 0,
 };
 
@@ -96,8 +97,16 @@ let options = EncodeOptions {
 };
 encoder.encode(&nv12_data, &options)?;
 
+// IDR フレームを強制してエンコード
+let force_idr_options = EncodeOptions {
+    force_intra: false,
+    force_idr: true,
+    output_spspps: false,
+};
+encoder.encode(&nv12_data, &force_idr_options)?;
+
 // エンコード済みフレームを取得
-if let Some(encoded) = encoder.next_frame() {
+while let Some(encoded) = encoder.next_frame() {
     println!("encoded bytes: {}", encoded.data().len());
 }
 ```
