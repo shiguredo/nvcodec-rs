@@ -11,13 +11,6 @@
 
 ## develop
 
-- [ADD] エンコーダーの動的解像度変更に対応する
-  - `ReconfigureParams` に `width` / `height` フィールドを追加する
-  - `maxEncodeWidth` / `maxEncodeHeight` を超える場合はエラーを返す
-  - @voluntas
-- [FIX] デコーダーがストリーム中の解像度変更に対応できない問題を修正する
-  - `handle_video_sequence_inner` で既存デコーダーを破棄して再作成するようにする
-  - @voluntas
 - [CHANGE] `hisui/crates/shiguredo_nvcodec/` から `shiguredo/nvcodec-rs` に変更する
   - crates.io はそのまま
   - @voluntas
@@ -49,6 +42,10 @@
 - [CHANGE] `DecoderConfig` に `surface_format: SurfaceFormat` フィールドを追加する
   - NV12 ハードコードを廃止し、NVDEC SDK がサポートする出力サーフェスフォーマットを選択可能にする
   - @voluntas
+- [ADD] エンコーダーの動的解像度変更に対応する
+  - `ReconfigureParams` に `width` / `height` フィールドを追加する
+  - `maxEncodeWidth` / `maxEncodeHeight` を超える場合はエラーを返す
+  - @voluntas
 - [ADD] エンコーダのケーパビリティクエリ機能を追加する
   - `EncoderCaps` 構造体と `Encoder::query_caps` メソッドを追加
   - @voluntas
@@ -69,6 +66,9 @@
   - @voluntas
 - [ADD] 2D メモリコピー機能を追加する
   - `memcpy_2d()` および `mem_alloc_pitch()` 関数を追加
+  - @voluntas
+- [FIX] デコーダーがストリーム中の解像度変更に対応できない問題を修正する
+  - `handle_video_sequence_inner` で既存デコーダーを破棄して再作成するようにする
   - @voluntas
 - [UPDATE] CUDA インクルードパスの解決をフォールバック付きの 3 段階方式に改善する
   - 環境変数 → デフォルトパス → スタブヘッダの順で探索する
