@@ -11,6 +11,13 @@
 
 ## develop
 
+- [ADD] エンコーダーの動的解像度変更に対応する
+  - `ReconfigureParams` に `width` / `height` フィールドを追加する
+  - `maxEncodeWidth` / `maxEncodeHeight` を超える場合はエラーを返す
+  - @voluntas
+- [FIX] デコーダーがストリーム中の解像度変更に対応できない問題を修正する
+  - `handle_video_sequence_inner` で既存デコーダーを破棄して再作成するようにする
+  - @voluntas
 - [CHANGE] `hisui/crates/shiguredo_nvcodec/` から `shiguredo/nvcodec-rs` に変更する
   - crates.io はそのまま
   - @voluntas

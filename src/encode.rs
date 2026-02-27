@@ -360,6 +360,12 @@ pub struct EncoderCaps {
 /// エンコーダ再構成パラメータ
 #[derive(Debug, Clone, Default)]
 pub struct ReconfigureParams {
+    /// エンコード幅 (NVENC: encodeWidth)
+    /// maxEncodeWidth を超えてはならない
+    pub width: Option<u32>,
+    /// エンコード高さ (NVENC: encodeHeight)
+    /// maxEncodeHeight を超えてはならない
+    pub height: Option<u32>,
     /// フレームレートの分子 (NVENC: frameRateNum)
     pub framerate_num: Option<u32>,
     /// フレームレートの分母 (NVENC: frameRateDen)
@@ -409,6 +415,7 @@ pub struct Encoder {
     width: u32,
     height: u32,
     buffer_format: sys::NV_ENC_BUFFER_FORMAT,
+    buffer_format_enum: BufferFormat,
     expected_frame_size: usize,
     encoded_frames: VecDeque<EncodedFrame>,
     framerate_den: u64,
@@ -471,6 +478,7 @@ impl Encoder {
                 width: config.width,
                 height: config.height,
                 buffer_format: config.buffer_format.to_sys(),
+                buffer_format_enum: config.buffer_format,
                 expected_frame_size: config.buffer_format.frame_size(config.width, config.height),
                 encoded_frames: VecDeque::new(),
                 framerate_den: config.framerate_den as u64,
@@ -599,6 +607,24 @@ impl Encoder {
 
     fn reconfigure_inner(&mut self, params: ReconfigureParams) -> Result<(), Error> {
         unsafe {
+            // 解像度が maxEncodeWidth / maxEncodeHeight を超えないか検証する
+            if let Some(width) = params.width
+                && width > self.init_params.maxEncodeWidth
+            {
+                return Err(Error::new_custom(
+                    "reconfigure",
+                    "width exceeds maxEncodeWidth",
+                ));
+            }
+            if let Some(height) = params.height
+                && height > self.init_params.maxEncodeHeight
+            {
+                return Err(Error::new_custom(
+                    "reconfigure",
+                    "height exceeds maxEncodeHeight",
+                ));
+            }
+
             let mut reconfig_params: sys::NV_ENC_RECONFIGURE_PARAMS = std::mem::zeroed();
             reconfig_params.version = sys::NV_ENC_RECONFIGURE_PARAMS_VER;
 
@@ -609,6 +635,14 @@ impl Encoder {
             reconfig_params.reInitEncodeParams.encodeConfig = &mut new_config;
 
             // 変更パラメータを上書き
+            if let Some(width) = params.width {
+                reconfig_params.reInitEncodeParams.encodeWidth = width;
+                reconfig_params.reInitEncodeParams.darWidth = width;
+            }
+            if let Some(height) = params.height {
+                reconfig_params.reInitEncodeParams.encodeHeight = height;
+                reconfig_params.reInitEncodeParams.darHeight = height;
+            }
             if let Some(fps_num) = params.framerate_num {
                 reconfig_params.reInitEncodeParams.frameRateNum = fps_num;
             }
@@ -634,6 +668,16 @@ impl Encoder {
             self.init_params = reconfig_params.reInitEncodeParams;
             self.init_params.encodeConfig = &mut self.encode_config;
 
+            if let Some(width) = params.width {
+                self.width = width;
+            }
+            if let Some(height) = params.height {
+                self.height = height;
+            }
+            if params.width.is_some() || params.height.is_some() {
+                self.expected_frame_size =
+                    self.buffer_format_enum.frame_size(self.width, self.height);
+            }
             if let Some(fps_den) = params.framerate_den {
                 self.framerate_den = fps_den as u64;
             }

@@ -381,9 +381,13 @@ fn handle_video_sequence_inner(
     state: &mut DecoderState,
     format: &sys::CUVIDEOFORMAT,
 ) -> Result<i32, Error> {
-    // デコーダーが既に作成されている場合はスキップ
+    // デコーダーが既に作成されている場合は破棄して再作成する
+    // ストリーム中の解像度変更に対応するため
     if !state.decoder.is_null() {
-        return Ok(format.min_num_decode_surfaces as i32);
+        state
+            .lib
+            .with_context(state.ctx, || state.lib.cuvid_destroy_decoder(state.decoder))?;
+        state.decoder = ptr::null_mut();
     }
 
     // デコーダーの作成情報を設定
