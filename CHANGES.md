@@ -27,8 +27,14 @@
 - [CHANGE] `EncoderConfig` から `profile` と `idr_period` フィールドを削除する
   - コーデック固有設定構造体 (`H264EncoderConfig` / `HevcEncoderConfig` / `Av1EncoderConfig`) に移動する
   - @voluntas
+- [CHANGE] `EncoderConfig` / `H264EncoderConfig` / `HevcEncoderConfig` / `Av1EncoderConfig` / `DecoderConfig` から `Default` 実装を削除する
+  - NVENC / NVDEC SDK にデフォルト値の概念がないため、全フィールドを明示的に指定する設計にする
+  - @voluntas
 - [CHANGE] `Decoder::new_h264` / `Decoder::new_h265` / `Decoder::new_av1` を廃止し `Decoder::new` に統合する
   - `DecoderConfig` に `codec: DecoderCodec` フィールドを追加する
+  - @voluntas
+- [CHANGE] `Encoder::encode()` に `EncodeOptions` 引数を追加する
+  - `force_intra` / `force_idr` / `output_spspps` フラグでフレーム単位のエンコード制御が可能になる
   - @voluntas
 - [ADD] エンコーダのケーパビリティクエリ機能を追加する
   - `EncoderCaps` 構造体と `Encoder::query_caps` メソッドを追加
