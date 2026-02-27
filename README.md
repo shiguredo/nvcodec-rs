@@ -60,9 +60,13 @@ DOCS_RS=1 cargo doc --no-deps
 ### エンコード
 
 ```rust
-use shiguredo_nvcodec::{Encoder, EncoderConfig, Preset, TuningInfo, RateControlMode};
+use shiguredo_nvcodec::{
+    CodecConfig, Encoder, EncoderConfig, H264EncoderConfig,
+    Preset, TuningInfo, RateControlMode,
+};
 
 let config = EncoderConfig {
+    codec: CodecConfig::H264(H264EncoderConfig::default()),
     width: 1920,
     height: 1080,
     fps_numerator: 30,
@@ -74,7 +78,7 @@ let config = EncoderConfig {
     ..Default::default()
 };
 
-let mut encoder = Encoder::new_h264(config)?;
+let mut encoder = Encoder::new(config)?;
 // NV12 フレームデータをエンコード
 encoder.encode(&nv12_data)?;
 
@@ -87,10 +91,13 @@ if let Some(encoded) = encoder.next_frame() {
 ### デコード
 
 ```rust
-use shiguredo_nvcodec::{Decoder, DecoderConfig};
+use shiguredo_nvcodec::{Decoder, DecoderCodec, DecoderConfig};
 
-let config = DecoderConfig::default();
-let mut decoder = Decoder::new_h264(config)?;
+let config = DecoderConfig {
+    codec: DecoderCodec::H264,
+    ..Default::default()
+};
+let mut decoder = Decoder::new(config)?;
 
 // エンコード済みデータをデコード
 decoder.decode(&encoded_data)?;
@@ -108,9 +115,9 @@ while let Some(frame) = decoder.next_frame()? {
 ### エンコーダー能力クエリ
 
 ```rust
-use shiguredo_nvcodec::Encoder;
+use shiguredo_nvcodec::{Encoder, EncoderCodec};
 
-let caps = Encoder::query_caps_h264(0)?;
+let caps = Encoder::query_caps(EncoderCodec::H264, 0)?;
 println!("max width: {}", caps.width_max);
 println!("max height: {}", caps.height_max);
 println!("10-bit encode: {}", caps.support_10bit_encode);
@@ -119,9 +126,9 @@ println!("10-bit encode: {}", caps.support_10bit_encode);
 ### デコーダー能力クエリ
 
 ```rust
-use shiguredo_nvcodec::Decoder;
+use shiguredo_nvcodec::{Decoder, DecoderCodec};
 
-let caps = Decoder::query_caps_h264(0)?;
+let caps = Decoder::query_caps(DecoderCodec::H264, 0)?;
 println!("supported: {}", caps.is_supported);
 println!("max: {}x{}", caps.max_width, caps.max_height);
 ```
@@ -142,22 +149,22 @@ for i in 0..count {
 
 ### エンコード
 
-| コーデック | コンストラクタ |
+| コーデック | `CodecConfig` |
 |-----------|--------------|
-| H.264     | `Encoder::new_h264()` |
-| H.265     | `Encoder::new_h265()` |
-| AV1       | `Encoder::new_av1()` |
+| H.264     | `CodecConfig::H264(H264EncoderConfig)` |
+| H.265     | `CodecConfig::Hevc(HevcEncoderConfig)` |
+| AV1       | `CodecConfig::Av1(Av1EncoderConfig)` |
 
 ### デコード
 
-| コーデック | コンストラクタ |
+| コーデック | `DecoderCodec` |
 |-----------|--------------|
-| H.264     | `Decoder::new_h264()` |
-| H.265     | `Decoder::new_h265()` |
-| AV1       | `Decoder::new_av1()` |
-| VP8       | `Decoder::new_vp8()` |
-| VP9       | `Decoder::new_vp9()` |
-| JPEG      | `Decoder::new_jpeg()` |
+| H.264     | `DecoderCodec::H264` |
+| H.265     | `DecoderCodec::Hevc` |
+| AV1       | `DecoderCodec::Av1` |
+| VP8       | `DecoderCodec::Vp8` |
+| VP9       | `DecoderCodec::Vp9` |
+| JPEG      | `DecoderCodec::Jpeg` |
 
 ## ライセンス
 
