@@ -291,7 +291,7 @@ impl RateControlMode {
     }
 }
 
-/// エンコーダの能力情報
+/// エンコーダのケーパビリティ情報
 #[derive(Debug, Clone)]
 pub struct EncoderCaps {
     /// サポートされているレート制御モードのビットマスク
@@ -407,7 +407,7 @@ impl Encoder {
         }
     }
 
-    /// 指定コーデックのエンコーダ能力をクエリする
+    /// 指定コーデックのエンコーダのケーパビリティをクエリする
     pub fn query_caps(codec: EncoderCodec, device_id: i32) -> Result<EncoderCaps, Error> {
         let codec_guid = match codec {
             EncoderCodec::H264 => sys::NV_ENC_CODEC_H264_GUID,
@@ -417,7 +417,7 @@ impl Encoder {
         Self::query_caps_with_codec(device_id, codec_guid)
     }
 
-    /// 指定コーデックのエンコーダ能力をクエリする
+    /// 指定コーデックのエンコーダのケーパビリティをクエリする
     fn query_caps_with_codec(device_id: i32, codec_guid: sys::GUID) -> Result<EncoderCaps, Error> {
         unsafe {
             let lib = CudaLibrary::load()?;
@@ -460,7 +460,7 @@ impl Encoder {
                     }
                 });
 
-                // 各能力値をクエリするヘルパー
+                // 各ケーパビリティ値をクエリするヘルパー
                 let query_cap = |caps_type: u32| -> Result<i32, Error> {
                     let mut caps_param: sys::NV_ENC_CAPS_PARAM = std::mem::zeroed();
                     caps_param.version = sys::NV_ENC_CAPS_PARAM_VER;

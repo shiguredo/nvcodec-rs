@@ -5,7 +5,7 @@ use std::sync::mpsc::{self, Receiver, Sender};
 
 use crate::{CudaLibrary, Error, sys};
 
-/// デコーダの能力情報
+/// デコーダのケーパビリティ情報
 #[derive(Debug, Clone)]
 pub struct DecoderCaps {
     /// コーデックがサポートされているか
@@ -90,7 +90,7 @@ impl Decoder {
         Self::new_with_codec(codec_type, config)
     }
 
-    /// 指定コーデックのデコーダ能力をクエリする
+    /// 指定コーデックのデコーダのケーパビリティをクエリする
     pub fn query_caps(codec: DecoderCodec, device_id: i32) -> Result<DecoderCaps, Error> {
         let codec_type = match codec {
             DecoderCodec::H264 => sys::cudaVideoCodec_enum_cudaVideoCodec_H264,
@@ -103,7 +103,7 @@ impl Decoder {
         Self::query_caps_with_codec(device_id, codec_type)
     }
 
-    /// 指定コーデックのデコーダ能力をクエリする
+    /// 指定コーデックのデコーダのケーパビリティをクエリする
     fn query_caps_with_codec(
         device_id: i32,
         codec_type: sys::cudaVideoCodec,
