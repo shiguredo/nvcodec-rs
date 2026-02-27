@@ -62,8 +62,8 @@ DOCS_RS=1 cargo doc --no-deps
 
 ```rust
 use shiguredo_nvcodec::{
-    CodecConfig, EncodeOptions, Encoder, EncoderConfig, H264EncoderConfig,
-    Preset, TuningInfo, RateControlMode,
+    BufferFormat, CodecConfig, EncodeOptions, Encoder, EncoderConfig,
+    H264EncoderConfig, Preset, TuningInfo, RateControlMode,
 };
 
 let config = EncoderConfig {
@@ -83,6 +83,7 @@ let config = EncoderConfig {
     rate_control_mode: RateControlMode::Cbr,
     gop_length: None,
     frame_interval_p: 1,
+    buffer_format: BufferFormat::Nv12,
     device_id: 0,
 };
 
@@ -96,8 +97,16 @@ let options = EncodeOptions {
 };
 encoder.encode(&nv12_data, &options)?;
 
+// IDR フレームを強制してエンコード
+let force_idr_options = EncodeOptions {
+    force_intra: false,
+    force_idr: true,
+    output_spspps: false,
+};
+encoder.encode(&nv12_data, &force_idr_options)?;
+
 // エンコード済みフレームを取得
-if let Some(encoded) = encoder.next_frame() {
+while let Some(encoded) = encoder.next_frame() {
     println!("encoded bytes: {}", encoded.data().len());
 }
 ```
@@ -105,13 +114,14 @@ if let Some(encoded) = encoder.next_frame() {
 ### デコード
 
 ```rust
-use shiguredo_nvcodec::{Decoder, DecoderCodec, DecoderConfig};
+use shiguredo_nvcodec::{Decoder, DecoderCodec, DecoderConfig, SurfaceFormat};
 
 let config = DecoderConfig {
     codec: DecoderCodec::H264,
     device_id: 0,
     max_num_decode_surfaces: 20,
     max_display_delay: 0,
+    surface_format: SurfaceFormat::Nv12,
 };
 let mut decoder = Decoder::new(config)?;
 
@@ -181,6 +191,34 @@ for i in 0..count {
 | VP8       | `DecoderCodec::Vp8` |
 | VP9       | `DecoderCodec::Vp9` |
 | JPEG      | `DecoderCodec::Jpeg` |
+
+## サポートフォーマット
+
+### エンコード入力バッファフォーマット (`BufferFormat`)
+
+| フォーマット | `BufferFormat` | 説明 |
+|---|---|---|
+| NV12 | `BufferFormat::Nv12` | Semi-Planar YUV 4:2:0 8bit |
+| YV12 | `BufferFormat::Yv12` | Planar YUV 4:2:0 8bit (Y+V+U) |
+| IYUV (I420) | `BufferFormat::Iyuv` | Planar YUV 4:2:0 8bit (Y+U+V) |
+| YUV444 | `BufferFormat::Yuv444` | Planar YUV 4:4:4 8bit |
+| YUV420 10bit | `BufferFormat::Yuv420_10bit` | Semi-Planar YUV 4:2:0 10bit |
+| YUV444 10bit | `BufferFormat::Yuv444_10bit` | Planar YUV 4:4:4 10bit |
+| ARGB | `BufferFormat::Argb` | Packed A8R8G8B8 |
+| ABGR | `BufferFormat::Abgr` | Packed A8B8G8R8 |
+| ARGB 10bit | `BufferFormat::Argb10` | Packed A2R10G10B10 |
+| ABGR 10bit | `BufferFormat::Abgr10` | Packed A2B10G10R10 |
+
+### デコード出力サーフェスフォーマット (`SurfaceFormat`)
+
+| フォーマット | `SurfaceFormat` | 説明 |
+|---|---|---|
+| NV12 | `SurfaceFormat::Nv12` | Semi-Planar YUV 4:2:0 8bit |
+| P016 | `SurfaceFormat::P016` | Semi-Planar YUV 4:2:0 16bit |
+| YUV444 | `SurfaceFormat::Yuv444` | Planar YUV 4:4:4 8bit |
+| YUV444 16bit | `SurfaceFormat::Yuv444_16bit` | Planar YUV 4:4:4 16bit |
+| NV16 | `SurfaceFormat::Nv16` | Semi-Planar YUV 4:2:2 8bit |
+| P216 | `SurfaceFormat::P216` | Semi-Planar YUV 4:2:2 16bit |
 
 ## ライセンス
 

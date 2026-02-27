@@ -36,6 +36,12 @@
 - [CHANGE] `Encoder::encode()` に `EncodeOptions` 引数を追加する
   - `force_intra` / `force_idr` / `output_spspps` フラグでフレーム単位のエンコード制御が可能になる
   - @voluntas
+- [CHANGE] `EncoderConfig` に `buffer_format: BufferFormat` フィールドを追加する
+  - NV12 ハードコードを廃止し、NVENC SDK がサポートする入力バッファフォーマットを選択可能にする
+  - @voluntas
+- [CHANGE] `DecoderConfig` に `surface_format: SurfaceFormat` フィールドを追加する
+  - NV12 ハードコードを廃止し、NVDEC SDK がサポートする出力サーフェスフォーマットを選択可能にする
+  - @voluntas
 - [ADD] エンコーダのケーパビリティクエリ機能を追加する
   - `EncoderCaps` 構造体と `Encoder::query_caps` メソッドを追加
   - @voluntas

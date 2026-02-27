@@ -243,6 +243,9 @@ pub struct EncoderConfig {
     /// P フレーム間隔 (NVENC: frameIntervalP)
     pub frame_interval_p: u32,
 
+    /// 入力バッファフォーマット (NVENC: bufferFormat)
+    pub buffer_format: BufferFormat,
+
     /// デバイス ID (使用する GPU)
     pub device_id: i32,
 }
@@ -258,6 +261,71 @@ pub enum RateControlMode {
 
     /// Constant bitrate mode
     Cbr,
+}
+
+/// 入力バッファフォーマット (NVENC: NV_ENC_BUFFER_FORMAT)
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BufferFormat {
+    /// Semi-Planar YUV 4:2:0 [Y plane + interleaved UV plane]
+    Nv12,
+    /// Planar YUV 4:2:0 [Y plane + V plane + U plane]
+    Yv12,
+    /// Planar YUV 4:2:0 [Y plane + U plane + V plane] (I420)
+    Iyuv,
+    /// Planar YUV 4:4:4 [Y plane + U plane + V plane]
+    Yuv444,
+    /// 10bit Semi-Planar YUV 4:2:0 [Y plane + interleaved UV plane]
+    Yuv420_10bit,
+    /// 10bit Planar YUV 4:4:4 [Y plane + U plane + V plane]
+    Yuv444_10bit,
+    /// 8bit Packed A8R8G8B8
+    Argb,
+    /// 8bit Packed A8B8G8R8
+    Abgr,
+    /// 10bit Packed A2R10G10B10
+    Argb10,
+    /// 10bit Packed A2B10G10R10
+    Abgr10,
+}
+
+impl BufferFormat {
+    fn to_sys(self) -> sys::NV_ENC_BUFFER_FORMAT {
+        match self {
+            BufferFormat::Nv12 => sys::_NV_ENC_BUFFER_FORMAT_NV_ENC_BUFFER_FORMAT_NV12,
+            BufferFormat::Yv12 => sys::_NV_ENC_BUFFER_FORMAT_NV_ENC_BUFFER_FORMAT_YV12,
+            BufferFormat::Iyuv => sys::_NV_ENC_BUFFER_FORMAT_NV_ENC_BUFFER_FORMAT_IYUV,
+            BufferFormat::Yuv444 => sys::_NV_ENC_BUFFER_FORMAT_NV_ENC_BUFFER_FORMAT_YUV444,
+            BufferFormat::Yuv420_10bit => {
+                sys::_NV_ENC_BUFFER_FORMAT_NV_ENC_BUFFER_FORMAT_YUV420_10BIT
+            }
+            BufferFormat::Yuv444_10bit => {
+                sys::_NV_ENC_BUFFER_FORMAT_NV_ENC_BUFFER_FORMAT_YUV444_10BIT
+            }
+            BufferFormat::Argb => sys::_NV_ENC_BUFFER_FORMAT_NV_ENC_BUFFER_FORMAT_ARGB,
+            BufferFormat::Abgr => sys::_NV_ENC_BUFFER_FORMAT_NV_ENC_BUFFER_FORMAT_ABGR,
+            BufferFormat::Argb10 => sys::_NV_ENC_BUFFER_FORMAT_NV_ENC_BUFFER_FORMAT_ARGB10,
+            BufferFormat::Abgr10 => sys::_NV_ENC_BUFFER_FORMAT_NV_ENC_BUFFER_FORMAT_ABGR10,
+        }
+    }
+
+    /// 指定された幅と高さに対するフレームデータのバイトサイズを計算する
+    fn frame_size(self, width: u32, height: u32) -> usize {
+        let pixels = (width * height) as usize;
+        match self {
+            // YUV 4:2:0 (8bit): width * height * 3 / 2
+            BufferFormat::Nv12 | BufferFormat::Yv12 | BufferFormat::Iyuv => pixels * 3 / 2,
+            // YUV 4:4:4 (8bit): width * height * 3
+            BufferFormat::Yuv444 => pixels * 3,
+            // YUV 4:2:0 (10bit, 2 bytes/pixel): width * height * 3
+            BufferFormat::Yuv420_10bit => pixels * 3,
+            // YUV 4:4:4 (10bit, 2 bytes/pixel): width * height * 6
+            BufferFormat::Yuv444_10bit => pixels * 6,
+            // Packed (8bit, 4 bytes/pixel): width * height * 4
+            BufferFormat::Argb | BufferFormat::Abgr => pixels * 4,
+            // Packed (10bit, 4 bytes/pixel): width * height * 4
+            BufferFormat::Argb10 | BufferFormat::Abgr10 => pixels * 4,
+        }
+    }
 }
 
 impl RateControlMode {
@@ -341,6 +409,7 @@ pub struct Encoder {
     width: u32,
     height: u32,
     buffer_format: sys::NV_ENC_BUFFER_FORMAT,
+    expected_frame_size: usize,
     encoded_frames: VecDeque<EncodedFrame>,
     framerate_den: u64,
     frame_count: u64,
@@ -401,7 +470,8 @@ impl Encoder {
                 h_encoder,
                 width: config.width,
                 height: config.height,
-                buffer_format: sys::_NV_ENC_BUFFER_FORMAT_NV_ENC_BUFFER_FORMAT_NV12,
+                buffer_format: config.buffer_format.to_sys(),
+                expected_frame_size: config.buffer_format.frame_size(config.width, config.height),
                 encoded_frames: VecDeque::new(),
                 framerate_den: config.framerate_den as u64,
                 frame_count: 0,
@@ -727,22 +797,22 @@ impl Encoder {
         }
     }
 
-    /// NV12 形式のフレームをエンコードする
-    pub fn encode(&mut self, nv12_data: &[u8], options: &EncodeOptions) -> Result<(), Error> {
-        let expected_size = (self.width * self.height * 3 / 2) as usize;
+    /// フレームデータをエンコードする
+    pub fn encode(&mut self, frame_data: &[u8], options: &EncodeOptions) -> Result<(), Error> {
+        let expected_size = self.expected_frame_size;
 
-        if nv12_data.len() != expected_size {
-            return Err(Error::new_custom("encode", "invalid NV12 data size"));
+        if frame_data.len() != expected_size {
+            return Err(Error::new_custom("encode", "invalid frame data size"));
         }
 
         self.lib
             .clone()
-            .with_context(self.ctx, || self.encode_inner(nv12_data, options))
+            .with_context(self.ctx, || self.encode_inner(frame_data, options))
     }
 
-    fn encode_inner(&mut self, nv12_data: &[u8], options: &EncodeOptions) -> Result<(), Error> {
+    fn encode_inner(&mut self, frame_data: &[u8], options: &EncodeOptions) -> Result<(), Error> {
         // 入力データをデバイスにコピー
-        let (device_input, _device_guard) = self.copy_input_data_to_device(nv12_data)?;
+        let (device_input, _device_guard) = self.copy_input_data_to_device(frame_data)?;
 
         // CUDA デバイスメモリを入力リソースとして登録
         let (registered_resource, _registered_guard) =
@@ -768,10 +838,10 @@ impl Encoder {
 
     fn copy_input_data_to_device(
         &mut self,
-        nv12_data: &[u8],
+        frame_data: &[u8],
     ) -> Result<(sys::CUdeviceptr, ReleaseGuard<impl FnOnce() + use<>>), Error> {
         let mut device_input: sys::CUdeviceptr = 0;
-        self.lib.cu_mem_alloc(&mut device_input, nv12_data.len())?;
+        self.lib.cu_mem_alloc(&mut device_input, frame_data.len())?;
 
         let lib = self.lib.clone();
         let device_guard = ReleaseGuard::new(move || {
@@ -779,7 +849,7 @@ impl Encoder {
         });
 
         self.lib
-            .cu_memcpy_h_to_d(device_input, nv12_data.as_ptr().cast(), nv12_data.len())?;
+            .cu_memcpy_h_to_d(device_input, frame_data.as_ptr().cast(), frame_data.len())?;
 
         Ok((device_input, device_guard))
     }
@@ -1100,6 +1170,7 @@ mod tests {
             rate_control_mode: RateControlMode::Vbr,
             gop_length: None,
             frame_interval_p: 1,
+            buffer_format: BufferFormat::Nv12,
             device_id: 0,
         }
     }
