@@ -195,3 +195,13 @@ encoder.encode(&yuv420_10bit_data, &options)?;
 - `build.rs`: スタブ定義にバッファフォーマット定数を追加
 - `README.md`: コード例を更新
 - `CHANGES.md`: 変更履歴を追加
+
+## 完了内容
+
+- `BufferFormat` enum を追加（NV12, YV12, IYUV, YUV444, YUV420_10bit, YUV444_10bit, ARGB, ABGR, ARGB10, ABGR10）
+- `EncoderConfig` に `buffer_format: BufferFormat` フィールドを追加
+- `encode()` の引数名を `nv12_data` から `frame_data` に変更
+- `BufferFormat::frame_size()` メソッドでフォーマットごとのフレームサイズを計算
+- `Encoder` 構造体に `expected_frame_size` フィールドを追加し、サイズ検証をフォーマット対応に変更
+- `build.rs` にバッファフォーマット定数のスタブ定義を追加
+- テストを新 API に更新

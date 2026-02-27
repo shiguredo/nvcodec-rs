@@ -110,3 +110,13 @@ let mut decoder = Decoder::new(config)?;
 - `build.rs`: スタブ定義にサーフェスフォーマット定数を追加
 - `README.md`: デコードセクションのコード例を更新
 - `CHANGES.md`: 変更履歴を追加
+
+## 完了内容
+
+- `SurfaceFormat` enum を追加（Nv12, P016, Yuv444, Yuv444_16bit, Nv16, P216）
+- `DecoderConfig` に `surface_format: SurfaceFormat` フィールドを追加
+- `DecoderState` に `surface_format: u32` フィールドを追加し、`handle_video_sequence_inner` で使用
+- `cudaVideoSurfaceFormat_NV12` のハードコードを廃止
+- `build.rs` にサーフェスフォーマット定数のスタブ定義を追加
+- テストを新 API に更新
+- clippy 警告（不要な `as u32` キャスト）を修正
