@@ -1105,10 +1105,12 @@ mod tests {
         };
         let mut encoder = Encoder::new(config).expect("failed to create h264 encoder");
 
+        // SPS/PPS を取得
         let seq_params = encoder
             .get_sequence_params()
             .expect("failed to get sequence parameters");
 
+        // シーケンスパラメータが空でないことを確認
         assert!(
             !seq_params.is_empty(),
             "Sequence parameters should not be empty"
@@ -1125,10 +1127,12 @@ mod tests {
         };
         let mut encoder = Encoder::new(config).expect("failed to create h265 encoder");
 
+        // VPS/SPS/PPS を取得
         let seq_params = encoder
             .get_sequence_params()
             .expect("failed to get sequence parameters");
 
+        // シーケンスパラメータが空でないことを確認
         assert!(
             !seq_params.is_empty(),
             "Sequence parameters should not be empty"
@@ -1145,10 +1149,12 @@ mod tests {
         };
         let mut encoder = Encoder::new(config).expect("failed to create av1 encoder");
 
+        // Sequence Header OBU を取得
         let seq_params = encoder
             .get_sequence_params()
             .expect("failed to get sequence parameters");
 
+        // シーケンスパラメータが空でないことを確認
         assert!(
             !seq_params.is_empty(),
             "Sequence parameters should not be empty"
@@ -1169,24 +1175,31 @@ mod tests {
         let mut encoder = Encoder::new(config).expect("failed to create h264 encoder");
 
         // NV12 形式の黒フレームを準備
+        // Y 成分は 16（黒）、UV 成分は 128（ニュートラル）
         let y_size = (width * height) as usize;
         let uv_size = (width * height / 2) as usize;
 
         let mut frame_data = vec![16u8; y_size + uv_size];
         frame_data[y_size..].fill(128);
 
+        // エンコードを実行
         encoder
             .encode(&frame_data)
             .expect("failed to encode black frame");
+
+        // エンコーダーを終了して残りのフレームをフラッシュ
         encoder.finish().expect("failed to finish encoder");
 
+        // エンコード済みフレームを取得
         let mut frames = Vec::new();
         while let Some(frame) = encoder.next_frame() {
             frames.push(frame);
         }
 
+        // 少なくとも 1 フレームはエンコードされるはず
         assert!(!frames.is_empty(), "No encoded frames received");
 
+        // 最初のフレームはキーフレーム（I or IDR）であることを確認
         let first_frame = &frames[0];
         assert!(
             matches!(first_frame.picture_type, PictureType::I | PictureType::Idr),
@@ -1216,24 +1229,31 @@ mod tests {
         let mut encoder = Encoder::new(config).expect("failed to create h265 encoder");
 
         // NV12 形式の黒フレームを準備
+        // Y 成分は 16（黒）、UV 成分は 128（ニュートラル）
         let y_size = (width * height) as usize;
         let uv_size = (width * height / 2) as usize;
 
         let mut frame_data = vec![16u8; y_size + uv_size];
         frame_data[y_size..].fill(128);
 
+        // エンコードを実行
         encoder
             .encode(&frame_data)
             .expect("failed to encode black frame");
+
+        // エンコーダーを終了して残りのフレームをフラッシュ
         encoder.finish().expect("failed to finish encoder");
 
+        // エンコード済みフレームを取得
         let mut frames = Vec::new();
         while let Some(frame) = encoder.next_frame() {
             frames.push(frame);
         }
 
+        // 少なくとも 1 フレームはエンコードされるはず
         assert!(!frames.is_empty(), "No encoded frames received");
 
+        // 最初のフレームはキーフレーム（I or IDR）であることを確認
         let first_frame = &frames[0];
         assert!(
             matches!(first_frame.picture_type, PictureType::I | PictureType::Idr),
@@ -1263,24 +1283,31 @@ mod tests {
         let mut encoder = Encoder::new(config).expect("failed to create av1 encoder");
 
         // NV12 形式の黒フレームを準備
+        // Y 成分は 16（黒）、UV 成分は 128（ニュートラル）
         let y_size = (width * height) as usize;
         let uv_size = (width * height / 2) as usize;
 
         let mut frame_data = vec![16u8; y_size + uv_size];
         frame_data[y_size..].fill(128);
 
+        // エンコードを実行
         encoder
             .encode(&frame_data)
             .expect("failed to encode black frame");
+
+        // エンコーダーを終了して残りのフレームをフラッシュ
         encoder.finish().expect("failed to finish encoder");
 
+        // エンコード済みフレームを取得
         let mut frames = Vec::new();
         while let Some(frame) = encoder.next_frame() {
             frames.push(frame);
         }
 
+        // 少なくとも 1 フレームはエンコードされるはず
         assert!(!frames.is_empty(), "No encoded frames received");
 
+        // 最初のフレームはキーフレーム（I or IDR）であることを確認
         let first_frame = &frames[0];
         assert!(
             matches!(first_frame.picture_type, PictureType::I | PictureType::Idr),
