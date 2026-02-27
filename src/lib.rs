@@ -13,10 +13,11 @@ mod encode;
 mod error;
 mod sys;
 
-pub use decode::{DecodedFrame, Decoder, DecoderCaps, DecoderConfig};
+pub use decode::{DecodedFrame, Decoder, DecoderCaps, DecoderCodec, DecoderConfig};
 pub use encode::{
-    EncodedFrame, Encoder, EncoderCaps, EncoderConfig, PictureType, Preset, Profile,
-    RateControlMode, ReconfigureParams, TuningInfo,
+    Av1EncoderConfig, Av1Profile, CodecConfig, EncodeOptions, EncodedFrame, Encoder, EncoderCaps,
+    EncoderCodec, EncoderConfig, H264EncoderConfig, H264Profile, HevcEncoderConfig, HevcProfile,
+    PictureType, Preset, RateControlMode, ReconfigureParams, TuningInfo,
 };
 pub use error::Error;
 
@@ -183,7 +184,7 @@ impl CudaLibrary {
                         Error::new_custom("CudaLibrary::load", "cuStreamDestroy_v2 not found")
                     })?;
 
-                // デコーダ能力クエリ関連
+                // デコーダケーパビリティクエリ関連
                 let _: unsafe extern "C" fn(*mut sys::CUVIDDECODECAPS) -> u32 =
                     nvcuvid_lib.get(b"cuvidGetDecoderCaps").map_err(|_| {
                         Error::new_custom("CudaLibrary::load", "cuvidGetDecoderCaps not found")
@@ -758,7 +759,7 @@ impl CudaLibrary {
         }
     }
 
-    /// デコーダの能力をクエリする
+    /// デコーダのケーパビリティをクエリする
     fn cuvid_get_decoder_caps(&self, caps: *mut sys::CUVIDDECODECAPS) -> Result<(), Error> {
         unsafe {
             let f: unsafe extern "C" fn(*mut sys::CUVIDDECODECAPS) -> u32 = self

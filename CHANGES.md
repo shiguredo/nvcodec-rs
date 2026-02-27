@@ -18,17 +18,35 @@
   - @voluntas
 - [CHANGE] ビルド依存の `toml` クレートを `shiguredo_toml` に置き換える
   - @voluntas
+- [CHANGE] `Encoder::new_h264` / `Encoder::new_h265` / `Encoder::new_av1` を廃止し `Encoder::new` に統合する
+  - `EncoderConfig` に `codec: CodecConfig` フィールドを追加し、コーデック種別とコーデック固有設定を一体化する
+  - @voluntas
+- [CHANGE] `Profile` 構造体を廃止し、コーデック固有のプロファイル enum に置き換える
+  - `H264Profile` / `HevcProfile` / `Av1Profile` を追加する
+  - @voluntas
+- [CHANGE] `EncoderConfig` から `profile` と `idr_period` フィールドを削除する
+  - コーデック固有設定構造体 (`H264EncoderConfig` / `HevcEncoderConfig` / `Av1EncoderConfig`) に移動する
+  - @voluntas
+- [CHANGE] `EncoderConfig` / `H264EncoderConfig` / `HevcEncoderConfig` / `Av1EncoderConfig` / `DecoderConfig` から `Default` 実装を削除する
+  - NVENC / NVDEC SDK にデフォルト値の概念がないため、全フィールドを明示的に指定する設計にする
+  - @voluntas
+- [CHANGE] `Decoder::new_h264` / `Decoder::new_h265` / `Decoder::new_av1` を廃止し `Decoder::new` に統合する
+  - `DecoderConfig` に `codec: DecoderCodec` フィールドを追加する
+  - @voluntas
+- [CHANGE] `Encoder::encode()` に `EncodeOptions` 引数を追加する
+  - `force_intra` / `force_idr` / `output_spspps` フラグでフレーム単位のエンコード制御が可能になる
+  - @voluntas
 - [ADD] エンコーダのケーパビリティクエリ機能を追加する
-  - `EncoderCaps` 構造体と `query_caps_h264` / `query_caps_h265` / `query_caps_av1` メソッドを追加
+  - `EncoderCaps` 構造体と `Encoder::query_caps` メソッドを追加
   - @voluntas
 - [ADD] デコーダのケーパビリティクエリ機能を追加する
-  - `DecoderCaps` 構造体と `query_caps_h264` / `query_caps_h265` / `query_caps_av1` / `query_caps_vp8` / `query_caps_vp9` / `query_caps_jpeg` メソッドを追加
+  - `DecoderCaps` 構造体と `Decoder::query_caps` メソッドを追加
   - @voluntas
 - [ADD] エンコーダの動的再設定機能を追加する
   - `ReconfigureParams` 構造体と `reconfigure` メソッドを追加
   - @voluntas
-- [ADD] JPEG デコーダを追加する
-  - `Decoder::new_jpeg` メソッドを追加
+- [ADD] VP8 / VP9 / JPEG デコーダを追加する
+  - `DecoderCodec::Vp8` / `DecoderCodec::Vp9` / `DecoderCodec::Jpeg` を追加
   - @voluntas
 - [ADD] CUDA デバイス列挙関数を追加する
   - `device_count()` および `device_name()` 関数を追加
