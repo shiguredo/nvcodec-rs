@@ -16,7 +16,7 @@ Please read <https://github.com/shiguredo/oss> before use.
 
 利用前に <https://github.com/shiguredo/oss> をお読みください。
 
-## shiguredo_nvcodec について
+## 概要
 
 [NVIDIA Video Codec SDK](https://developer.nvidia.com/video-codec-sdk) を利用したハードウェアビデオエンコーダーおよびデコーダーの Rust バインディングです。
 
