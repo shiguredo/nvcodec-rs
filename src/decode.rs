@@ -536,7 +536,7 @@ fn handle_picture_display_inner(
         // 注意: NVDEC は高さを 2 でアライメントする
         let aligned_height = (state.surface_height + 1) & !1;
         let y_size = pitch as usize * state.height as usize;
-        let uv_size = pitch as usize * (state.height as usize / 2);
+        let uv_size = pitch as usize * (state.height as usize).div_ceil(2);
         let frame_size = y_size + uv_size;
 
         // フレーム用のホストメモリを割り当て
@@ -589,7 +589,7 @@ impl DecodedFrame {
     /// フレームの UV 成分のデータを返す（NV12はインターリーブ形式）
     pub fn uv_plane(&self) -> &[u8] {
         let y_size = self.pitch * self.height as usize;
-        let uv_size = self.pitch * (self.height as usize / 2);
+        let uv_size = self.pitch * (self.height as usize).div_ceil(2);
         &self.data[y_size..y_size + uv_size]
     }
 
@@ -738,7 +738,7 @@ mod tests {
         assert_eq!(frame.y_plane().len(), frame.y_stride() * frame.height());
         assert_eq!(
             frame.uv_plane().len(),
-            frame.uv_stride() * frame.height() / 2
+            frame.uv_stride() * frame.height().div_ceil(2)
         );
 
         // ストライドが幅以上であることを確認（GPU アラインメントのため）
@@ -830,7 +830,7 @@ mod tests {
         assert_eq!(frame.y_plane().len(), frame.y_stride() * frame.height());
         assert_eq!(
             frame.uv_plane().len(),
-            frame.uv_stride() * frame.height() / 2
+            frame.uv_stride() * frame.height().div_ceil(2)
         );
 
         // ストライドが幅以上であることを確認（GPU アラインメントのため）
@@ -901,7 +901,7 @@ mod tests {
         assert_eq!(frame.y_plane().len(), frame.y_stride() * frame.height());
         assert_eq!(
             frame.uv_plane().len(),
-            frame.uv_stride() * frame.height() / 2
+            frame.uv_stride() * frame.height().div_ceil(2)
         );
 
         // ストライドが幅以上であることを確認（GPU アラインメントのため）
@@ -995,7 +995,7 @@ mod tests {
         assert_eq!(frame.y_plane().len(), frame.y_stride() * frame.height());
         assert_eq!(
             frame.uv_plane().len(),
-            frame.uv_stride() * frame.height() / 2
+            frame.uv_stride() * frame.height().div_ceil(2)
         );
 
         // ストライドが幅以上であることを確認（GPU アラインメントのため）
@@ -1065,7 +1065,7 @@ mod tests {
         assert_eq!(frame.y_plane().len(), frame.y_stride() * frame.height());
         assert_eq!(
             frame.uv_plane().len(),
-            frame.uv_stride() * frame.height() / 2
+            frame.uv_stride() * frame.height().div_ceil(2)
         );
 
         // ストライドが幅以上であることを確認（GPU アラインメントのため）

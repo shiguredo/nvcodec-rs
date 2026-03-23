@@ -70,6 +70,9 @@
 - [FIX] デコーダーがストリーム中の解像度変更に対応できない問題を修正する
   - `handle_video_sequence_inner` で既存デコーダーを破棄して再作成するようにする
   - @voluntas
+- [FIX] `DecodedFrame::uv_plane()` が奇数高さの場合に UV プレーンのサイズを 1 行分少なく返す問題を修正する
+  - `height / 2` を `height.div_ceil(2)` に変更し、奇数高さでも正しい行数の UV データを返すようにする
+  - @sile
 - [UPDATE] CUDA インクルードパスの解決をフォールバック付きの 3 段階方式に改善する
   - 環境変数 → デフォルトパス → スタブヘッダの順で探索する
   - @voluntas
