@@ -76,6 +76,11 @@
 - [UPDATE] CUDA インクルードパスの解決をフォールバック付きの 3 段階方式に改善する
   - 環境変数 → デフォルトパス → スタブヘッダの順で探索する
   - @voluntas
+- [UPDATE] `EncoderCaps` に `support_yuv422_encode` / `width_min` / `height_min` / `num_max_bframes` / `support_lookahead` / `support_temporal_aq` フィールドを追加する
+  - @voluntas
+- [ADD] `supported_codecs()` 関数を追加する
+  - 指定 GPU デバイスで利用可能なコーデックのエンコード/デコード対応状況を一括で取得する
+  - @voluntas
 - [UPDATE] docs.rs 向けスタブ生成を包括的な型定義に書き直す
   - @voluntas
 
