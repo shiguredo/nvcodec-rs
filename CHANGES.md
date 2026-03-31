@@ -11,6 +11,10 @@
 
 ## develop
 
+## 2026.1.0
+
+**リリース日**: 2026-03-31
+
 - [CHANGE] `hisui/crates/shiguredo_nvcodec/` から `shiguredo/nvcodec-rs` に変更する
   - crates.io はそのまま
   - @voluntas
