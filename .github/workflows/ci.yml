@@ -1,0 +1,90 @@
+name: CI
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - "develop"
+      - "feature/**"
+    paths-ignore:
+      - "**.md"
+
+env:
+  RUST_BACKTRACE: 1
+  CUDA_VERSION: "13.1.1"
+
+jobs:
+  # CUDA ヘッダを使ったビルド確認 (GPU 不要)
+  ci-cuda:
+    name: CI (CUDA)
+    strategy:
+      matrix:
+        os:
+          - ubuntu-24.04
+          - ubuntu-22.04
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v6
+      - run: rustup update stable
+      - uses: shiguredo/github-actions/.github/actions/setup-cuda-toolkit@main
+        with:
+          cuda_version: ${{ env.CUDA_VERSION }}
+          platform: ${{ matrix.os }}
+      - uses: shiguredo/github-actions/.github/actions/rust-cache@main
+        with:
+          os: ${{ matrix.os }}
+          toolchain: stable
+      - run: cargo fmt --all --check
+      - run: cargo clippy --workspace -- -D warnings
+
+  # GPU 実機でのテスト (セルフホストランナー)
+  test-nvidia-video-codec:
+    name: Test (NVIDIA GPU)
+    runs-on:
+      group: Self
+      labels: [self-hosted, linux, x64, NVIDIA-Video-Codec-SDK]
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v6
+      - name: Install Rust
+        run: |
+          curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
+      - name: Update PATH
+        run: echo "$HOME/.cargo/bin" >> $GITHUB_PATH
+      - run: cargo check --workspace
+      - run: cargo clippy --workspace -- -D warnings
+      - run: cargo test --workspace -- --test-threads=1
+
+  # docs.rs 向けビルド確認
+  docs-rs:
+    name: docs.rs
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    env:
+      DOCS_RS: 1
+    steps:
+      - uses: actions/checkout@v6
+      - run: rustup update stable
+      - run: cargo doc --no-deps
+
+  slack_notify:
+    needs:
+      - ci-cuda
+      - test-nvidia-video-codec
+      - docs-rs
+    runs-on: ubuntu-slim
+    if: always()
+    timeout-minutes: 20
+    permissions:
+      actions: read
+    steps:
+      - name: Slack Notification
+        uses: shiguredo/github-actions/.github/actions/slack-notify@main
+        with:
+          status: ${{ job.status }}
+          slack_webhook: ${{ secrets.SLACK_WEBHOOK }}
+          slack_channel: rust-oss
+          notify_mode: failure_and_fixed
+        env:
+          GH_TOKEN: ${{ github.token }}
