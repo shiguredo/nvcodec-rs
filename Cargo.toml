@@ -1,6 +1,6 @@
 [package]
 name = "shiguredo_nvcodec"
-version = "2026.1.0-canary.2"
+version = "2026.1.0"
 edition = "2024"
 rust-version = "1.88"
 authors = ["Shiguredo Inc."]
@@ -9,8 +9,8 @@ description = "Rust bindings for NVIDIA Video Codec SDK"
 homepage = "https://github.com/shiguredo/nvcodec-rs"
 repository = "https://github.com/shiguredo/nvcodec-rs"
 readme = "README.md"
-include = ["/src/**", "/build.rs", "/third_party/**", "LICENSE", "README.md"]
 build = "build.rs"
+include = ["/src/**", "/build.rs", "/third_party/**", "LICENSE", "README.md"]
 
 [dependencies]
 

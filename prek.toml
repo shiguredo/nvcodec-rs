@@ -27,8 +27,8 @@ hooks = [
   },
   {
     id = "cargo-clippy",
-    name = "cargo clippy",
-    entry = "cargo clippy --workspace --all-targets -- -D warnings",
+    name = "cargo clippy (Windows/Linux only)",
+    entry = "sh -c 'case \"$(uname -s)\" in Darwin) echo \"Skipped on macOS\"; exit 0;; *) cargo clippy --workspace --all-targets -- -D warnings;; esac'",
     language = "system",
     types = ["rust"],
     pass_filenames = false,
@@ -36,8 +36,8 @@ hooks = [
   },
   {
     id = "cargo-test",
-    name = "cargo test",
-    entry = "cargo test --workspace",
+    name = "cargo test (Windows/Linux only)",
+    entry = "sh -c 'case \"$(uname -s)\" in Darwin) echo \"Skipped on macOS\"; exit 0;; *) cargo test --workspace;; esac'",
     language = "system",
     types = ["rust"],
     pass_filenames = false,
