@@ -280,6 +280,15 @@ impl Decoder {
 
 impl Drop for Decoder {
     fn drop(&mut self) {
+        // 非同期デコード処理が完了するまで待機する
+        // finish() が呼ばれていない場合でも、進行中のコールバックが
+        // state や CUDA コンテキストに触れている可能性があるため同期が必要
+        if !self.ctx.is_null() {
+            let _ = self
+                .lib
+                .with_context(self.ctx, || self.lib.cu_ctx_synchronize());
+        }
+
         if !self.parser.is_null() {
             let _ = self.lib.cuvid_destroy_video_parser(self.parser);
         }
@@ -807,7 +816,7 @@ mod tests {
         // Y 成分の平均値をチェック（完全な黒は 16）
         let y_avg = y_data.iter().map(|&x| x as u32).sum::<u32>() / y_data.len() as u32;
         assert!(
-            y_avg >= 10 && y_avg <= 30,
+            (10..=30).contains(&y_avg),
             "Y average should be around 16 for black, got {}",
             y_avg
         );
@@ -815,7 +824,7 @@ mod tests {
         // UV 成分の平均値をチェック
         let uv_avg = uv_data.iter().map(|&x| x as u32).sum::<u32>() / uv_data.len() as u32;
         assert!(
-            uv_avg >= 70 && uv_avg <= 140,
+            (70..=140).contains(&uv_avg),
             "UV average should be in reasonable range for the encoded frame, got {}",
             uv_avg
         );
@@ -899,7 +908,7 @@ mod tests {
         // Y 成分の平均値をチェック（完全な黒は 16）
         let y_avg = y_data.iter().map(|&x| x as u32).sum::<u32>() / y_data.len() as u32;
         assert!(
-            y_avg >= 10 && y_avg <= 30,
+            (10..=30).contains(&y_avg),
             "Y average should be around 16 for black, got {}",
             y_avg
         );
@@ -907,7 +916,7 @@ mod tests {
         // UV 成分の平均値をチェック
         let uv_avg = uv_data.iter().map(|&x| x as u32).sum::<u32>() / uv_data.len() as u32;
         assert!(
-            uv_avg >= 70 && uv_avg <= 140,
+            (70..=140).contains(&uv_avg),
             "UV average should be in reasonable range for the encoded frame, got {}",
             uv_avg
         );
@@ -970,7 +979,7 @@ mod tests {
         // Y 成分の平均値をチェック（完全な黒は 16）
         let y_avg = y_data.iter().map(|&x| x as u32).sum::<u32>() / y_data.len() as u32;
         assert!(
-            y_avg >= 10 && y_avg <= 30,
+            (10..=30).contains(&y_avg),
             "Y average should be around 16 for black, got {}",
             y_avg
         );
@@ -978,7 +987,7 @@ mod tests {
         // UV 成分の平均値をチェック
         let uv_avg = uv_data.iter().map(|&x| x as u32).sum::<u32>() / uv_data.len() as u32;
         assert!(
-            uv_avg >= 70 && uv_avg <= 140,
+            (70..=140).contains(&uv_avg),
             "UV average should be in reasonable range for the encoded frame, got {}",
             uv_avg
         );
@@ -1064,7 +1073,7 @@ mod tests {
         // Y 成分の平均値をチェック（完全な黒は 16）
         let y_avg = y_data.iter().map(|&x| x as u32).sum::<u32>() / y_data.len() as u32;
         assert!(
-            y_avg >= 10 && y_avg <= 30,
+            (10..=30).contains(&y_avg),
             "Y average should be around 16 for black, got {}",
             y_avg
         );
@@ -1072,7 +1081,7 @@ mod tests {
         // UV 成分の平均値をチェック
         let uv_avg = uv_data.iter().map(|&x| x as u32).sum::<u32>() / uv_data.len() as u32;
         assert!(
-            uv_avg >= 70 && uv_avg <= 140,
+            (70..=140).contains(&uv_avg),
             "UV average should be in reasonable range for the encoded frame, got {}",
             uv_avg
         );
@@ -1134,7 +1143,7 @@ mod tests {
         // Y 成分の平均値をチェック（完全な黒は 16）
         let y_avg = y_data.iter().map(|&x| x as u32).sum::<u32>() / y_data.len() as u32;
         assert!(
-            y_avg >= 10 && y_avg <= 30,
+            (10..=30).contains(&y_avg),
             "Y average should be around 16 for black, got {}",
             y_avg
         );
@@ -1142,7 +1151,7 @@ mod tests {
         // UV 成分の平均値をチェック
         let uv_avg = uv_data.iter().map(|&x| x as u32).sum::<u32>() / uv_data.len() as u32;
         assert!(
-            uv_avg >= 70 && uv_avg <= 140,
+            (70..=140).contains(&uv_avg),
             "UV average should be in reasonable range for the encoded frame, got {}",
             uv_avg
         );
