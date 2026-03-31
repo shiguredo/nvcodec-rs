@@ -361,16 +361,28 @@ pub struct EncoderCaps {
     pub supported_ratecontrol_modes: i32,
     /// YUV444 エンコードのサポート
     pub support_yuv444_encode: bool,
+    /// YUV422 エンコードのサポート
+    pub support_yuv422_encode: bool,
     /// ME-only モードのサポート
     pub support_meonly_mode: bool,
     /// 最大エンコード幅
     pub width_max: i32,
     /// 最大エンコード高さ
     pub height_max: i32,
+    /// 最小エンコード幅
+    pub width_min: i32,
+    /// 最小エンコード高さ
+    pub height_min: i32,
+    /// B フレームの最大数
+    pub num_max_bframes: i32,
     /// 10bit エンコードのサポート
     pub support_10bit_encode: bool,
     /// ロスレスエンコードのサポート
     pub support_lossless_encode: bool,
+    /// 先読みエンコードのサポート
+    pub support_lookahead: bool,
+    /// Temporal AQ のサポート
+    pub support_temporal_aq: bool,
 }
 
 /// エンコーダ再構成パラメータ
@@ -585,16 +597,27 @@ impl Encoder {
                     support_yuv444_encode: query_cap(
                         sys::_NV_ENC_CAPS_NV_ENC_CAPS_SUPPORT_YUV444_ENCODE,
                     )? != 0,
+                    support_yuv422_encode: query_cap(
+                        sys::_NV_ENC_CAPS_NV_ENC_CAPS_SUPPORT_YUV422_ENCODE,
+                    )? != 0,
                     support_meonly_mode: query_cap(
                         sys::_NV_ENC_CAPS_NV_ENC_CAPS_SUPPORT_MEONLY_MODE,
                     )? != 0,
                     width_max: query_cap(sys::_NV_ENC_CAPS_NV_ENC_CAPS_WIDTH_MAX)?,
                     height_max: query_cap(sys::_NV_ENC_CAPS_NV_ENC_CAPS_HEIGHT_MAX)?,
+                    width_min: query_cap(sys::_NV_ENC_CAPS_NV_ENC_CAPS_WIDTH_MIN)?,
+                    height_min: query_cap(sys::_NV_ENC_CAPS_NV_ENC_CAPS_HEIGHT_MIN)?,
+                    num_max_bframes: query_cap(sys::_NV_ENC_CAPS_NV_ENC_CAPS_NUM_MAX_BFRAMES)?,
                     support_10bit_encode: query_cap(
                         sys::_NV_ENC_CAPS_NV_ENC_CAPS_SUPPORT_10BIT_ENCODE,
                     )? != 0,
                     support_lossless_encode: query_cap(
                         sys::_NV_ENC_CAPS_NV_ENC_CAPS_SUPPORT_LOSSLESS_ENCODE,
+                    )? != 0,
+                    support_lookahead: query_cap(sys::_NV_ENC_CAPS_NV_ENC_CAPS_SUPPORT_LOOKAHEAD)?
+                        != 0,
+                    support_temporal_aq: query_cap(
+                        sys::_NV_ENC_CAPS_NV_ENC_CAPS_SUPPORT_TEMPORAL_AQ,
                     )? != 0,
                 };
 

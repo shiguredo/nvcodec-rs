@@ -7,12 +7,14 @@ use std::ffi::{c_char, c_int, c_uint, c_void};
 use std::path::Path;
 use std::sync::{Arc, LazyLock};
 
+mod codec_info;
 mod decode;
 mod dl;
 mod encode;
 mod error;
 mod sys;
 
+pub use codec_info::*;
 pub use decode::{DecodedFrame, Decoder, DecoderCaps, DecoderCodec, DecoderConfig, SurfaceFormat};
 pub use encode::{
     Av1EncoderConfig, Av1Profile, BufferFormat, CodecConfig, EncodeOptions, EncodedFrame, Encoder,
