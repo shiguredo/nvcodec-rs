@@ -423,8 +423,25 @@ fn handle_video_sequence_inner(
             .lib
             .cuvid_create_decoder(&mut state.decoder, &mut create_info)
     })?;
-    state.width = (format.display_area.right - format.display_area.left) as u32;
-    state.height = (format.display_area.bottom - format.display_area.top) as u32;
+    // display_area は signed 整数のため、壊れたストリームで負値になる可能性がある
+    let left = format.display_area.left;
+    let right = format.display_area.right;
+    let top = format.display_area.top;
+    let bottom = format.display_area.bottom;
+    if left < 0
+        || top < 0
+        || right <= left
+        || bottom <= top
+        || right as u32 > format.coded_width
+        || bottom as u32 > format.coded_height
+    {
+        return Err(Error::new_custom(
+            "handle_video_sequence",
+            "invalid display_area in video format",
+        ));
+    }
+    state.width = (right - left) as u32;
+    state.height = (bottom - top) as u32;
     state.surface_width = format.coded_width;
     state.surface_height = format.coded_height;
 

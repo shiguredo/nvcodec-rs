@@ -309,38 +309,42 @@ impl BufferFormat {
     }
 
     /// Y プレーン (または packed フォーマット) の 1 行あたりのバイト数を返す
-    fn bytes_per_row(self, width: u32) -> u32 {
-        match self {
+    fn bytes_per_row(self, width: u32) -> Result<u32, Error> {
+        let multiplier = match self {
             // Planar 8bit: 1 byte/pixel
             BufferFormat::Nv12 | BufferFormat::Yv12 | BufferFormat::Iyuv | BufferFormat::Yuv444 => {
-                width
+                1u32
             }
             // Planar 10bit: 2 bytes/pixel
-            BufferFormat::Yuv420_10bit | BufferFormat::Yuv444_10bit => width * 2,
-            // Packed 8bit: 4 bytes/pixel (ARGB/ABGR)
-            BufferFormat::Argb | BufferFormat::Abgr => width * 4,
-            // Packed 10bit: 4 bytes/pixel (A2R10G10B10/A2B10G10R10)
-            BufferFormat::Argb10 | BufferFormat::Abgr10 => width * 4,
-        }
+            BufferFormat::Yuv420_10bit | BufferFormat::Yuv444_10bit => 2,
+            // Packed 8bit/10bit: 4 bytes/pixel
+            BufferFormat::Argb | BufferFormat::Abgr | BufferFormat::Argb10 | BufferFormat::Abgr10 => 4,
+        };
+        width.checked_mul(multiplier).ok_or_else(|| {
+            Error::new_custom("bytes_per_row", "width overflow in pitch calculation")
+        })
     }
 
     /// 指定された幅と高さに対するフレームデータのバイトサイズを計算する
-    fn frame_size(self, width: u32, height: u32) -> usize {
-        let pixels = (width * height) as usize;
-        match self {
+    fn frame_size(self, width: u32, height: u32) -> Result<usize, Error> {
+        let pixels = (width as usize).checked_mul(height as usize).ok_or_else(|| {
+            Error::new_custom("frame_size", "width * height overflow")
+        })?;
+        let size = match self {
             // YUV 4:2:0 (8bit): width * height * 3 / 2
-            BufferFormat::Nv12 | BufferFormat::Yv12 | BufferFormat::Iyuv => pixels * 3 / 2,
+            BufferFormat::Nv12 | BufferFormat::Yv12 | BufferFormat::Iyuv => pixels.checked_mul(3).map(|v| v / 2),
             // YUV 4:4:4 (8bit): width * height * 3
-            BufferFormat::Yuv444 => pixels * 3,
+            BufferFormat::Yuv444 => pixels.checked_mul(3),
             // YUV 4:2:0 (10bit, 2 bytes/pixel): width * height * 3
-            BufferFormat::Yuv420_10bit => pixels * 3,
+            BufferFormat::Yuv420_10bit => pixels.checked_mul(3),
             // YUV 4:4:4 (10bit, 2 bytes/pixel): width * height * 6
-            BufferFormat::Yuv444_10bit => pixels * 6,
+            BufferFormat::Yuv444_10bit => pixels.checked_mul(6),
             // Packed (8bit, 4 bytes/pixel): width * height * 4
-            BufferFormat::Argb | BufferFormat::Abgr => pixels * 4,
+            BufferFormat::Argb | BufferFormat::Abgr => pixels.checked_mul(4),
             // Packed (10bit, 4 bytes/pixel): width * height * 4
-            BufferFormat::Argb10 | BufferFormat::Abgr10 => pixels * 4,
-        }
+            BufferFormat::Argb10 | BufferFormat::Abgr10 => pixels.checked_mul(4),
+        };
+        size.ok_or_else(|| Error::new_custom("frame_size", "frame size overflow"))
     }
 }
 
@@ -507,7 +511,7 @@ impl Encoder {
                 height: config.height,
                 buffer_format: config.buffer_format.to_sys(),
                 buffer_format_enum: config.buffer_format,
-                expected_frame_size: config.buffer_format.frame_size(config.width, config.height),
+                expected_frame_size: config.buffer_format.frame_size(config.width, config.height)?,
                 encoded_frames: VecDeque::new(),
                 framerate_den: config.framerate_den as u64,
                 frame_count: 0,
@@ -715,7 +719,7 @@ impl Encoder {
             }
             if params.width.is_some() || params.height.is_some() {
                 self.expected_frame_size =
-                    self.buffer_format_enum.frame_size(self.width, self.height);
+                    self.buffer_format_enum.frame_size(self.width, self.height)?;
             }
             if let Some(fps_den) = params.framerate_den {
                 self.framerate_den = fps_den as u64;
@@ -955,7 +959,7 @@ impl Encoder {
             register_resource.resourceToRegister = device_input as *mut c_void;
             register_resource.width = self.width;
             register_resource.height = self.height;
-            register_resource.pitch = self.buffer_format_enum.bytes_per_row(self.width);
+            register_resource.pitch = self.buffer_format_enum.bytes_per_row(self.width)?;
             register_resource.bufferFormat = self.buffer_format;
             register_resource.bufferUsage = sys::_NV_ENC_BUFFER_USAGE_NV_ENC_INPUT_IMAGE;
 
@@ -1043,7 +1047,7 @@ impl Encoder {
             pic_params.version = sys::NV_ENC_PIC_PARAMS_VER;
             pic_params.inputWidth = self.width;
             pic_params.inputHeight = self.height;
-            pic_params.inputPitch = self.buffer_format_enum.bytes_per_row(self.width);
+            pic_params.inputPitch = self.buffer_format_enum.bytes_per_row(self.width)?;
             pic_params.inputBuffer = mapped_resource;
             pic_params.outputBitstream = output_buffer;
             pic_params.bufferFmt = self.buffer_format;
