@@ -318,7 +318,10 @@ impl BufferFormat {
             // Planar 10bit: 2 bytes/pixel
             BufferFormat::Yuv420_10bit | BufferFormat::Yuv444_10bit => 2,
             // Packed 8bit/10bit: 4 bytes/pixel
-            BufferFormat::Argb | BufferFormat::Abgr | BufferFormat::Argb10 | BufferFormat::Abgr10 => 4,
+            BufferFormat::Argb
+            | BufferFormat::Abgr
+            | BufferFormat::Argb10
+            | BufferFormat::Abgr10 => 4,
         };
         width.checked_mul(multiplier).ok_or_else(|| {
             Error::new_custom("bytes_per_row", "width overflow in pitch calculation")
@@ -327,12 +330,14 @@ impl BufferFormat {
 
     /// 指定された幅と高さに対するフレームデータのバイトサイズを計算する
     fn frame_size(self, width: u32, height: u32) -> Result<usize, Error> {
-        let pixels = (width as usize).checked_mul(height as usize).ok_or_else(|| {
-            Error::new_custom("frame_size", "width * height overflow")
-        })?;
+        let pixels = (width as usize)
+            .checked_mul(height as usize)
+            .ok_or_else(|| Error::new_custom("frame_size", "width * height overflow"))?;
         let size = match self {
             // YUV 4:2:0 (8bit): width * height * 3 / 2
-            BufferFormat::Nv12 | BufferFormat::Yv12 | BufferFormat::Iyuv => pixels.checked_mul(3).map(|v| v / 2),
+            BufferFormat::Nv12 | BufferFormat::Yv12 | BufferFormat::Iyuv => {
+                pixels.checked_mul(3).map(|v| v / 2)
+            }
             // YUV 4:4:4 (8bit): width * height * 3
             BufferFormat::Yuv444 => pixels.checked_mul(3),
             // YUV 4:2:0 (10bit, 2 bytes/pixel): width * height * 3
@@ -511,7 +516,9 @@ impl Encoder {
                 height: config.height,
                 buffer_format: config.buffer_format.to_sys(),
                 buffer_format_enum: config.buffer_format,
-                expected_frame_size: config.buffer_format.frame_size(config.width, config.height)?,
+                expected_frame_size: config
+                    .buffer_format
+                    .frame_size(config.width, config.height)?,
                 encoded_frames: VecDeque::new(),
                 framerate_den: config.framerate_den as u64,
                 frame_count: 0,
@@ -718,8 +725,9 @@ impl Encoder {
                 self.height = height;
             }
             if params.width.is_some() || params.height.is_some() {
-                self.expected_frame_size =
-                    self.buffer_format_enum.frame_size(self.width, self.height)?;
+                self.expected_frame_size = self
+                    .buffer_format_enum
+                    .frame_size(self.width, self.height)?;
             }
             if let Some(fps_den) = params.framerate_den {
                 self.framerate_den = fps_den as u64;
