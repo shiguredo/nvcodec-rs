@@ -637,7 +637,7 @@ impl CudaLibrary {
     {
         self.cu_ctx_push_current(ctx)?;
 
-        // panic 時にも必ず pop するためのガード
+        // panic 時にも必ず pop するためのガード（panic 時は戻り値を検査できないので握り潰す）
         let pop_guard = crate::ReleaseGuard::new(|| {
             let mut popped_ctx = std::ptr::null_mut();
             let _ = self.cu_ctx_pop_current(&mut popped_ctx);
@@ -645,8 +645,10 @@ impl CudaLibrary {
 
         let result = f();
 
-        // 正常パスでは明示的にガードを消費して pop する
-        drop(pop_guard);
+        // 正常パスではガードをキャンセルし、明示的に pop してエラーを検査する
+        pop_guard.cancel();
+        let mut popped_ctx = std::ptr::null_mut();
+        self.cu_ctx_pop_current(&mut popped_ctx)?;
 
         result
     }

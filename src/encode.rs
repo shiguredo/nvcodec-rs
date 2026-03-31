@@ -1080,6 +1080,16 @@ impl Encoder {
                 .unwrap_or(sys::_NVENCSTATUS_NV_ENC_ERR_INVALID_PTR);
             Error::check_nvenc(status, "nvEncLockBitstream")?;
 
+            // どの分岐でも必ず unlock するためのガード
+            let unlock_fn = self.encoder.nvEncUnlockBitstream;
+            let h_encoder = self.h_encoder;
+            let output_bitstream = lock_bitstream.outputBitstream;
+            let _unlock_guard = crate::ReleaseGuard::new(move || {
+                if let Some(f) = unlock_fn {
+                    let _ = f(h_encoder, output_bitstream);
+                }
+            });
+
             // ビットストリームがロックされている間にエンコード済みデータをコピー
             let ptr = lock_bitstream.bitstreamBufferPtr as *const u8;
             let size = lock_bitstream.bitstreamSizeInBytes as usize;
@@ -1093,14 +1103,6 @@ impl Encoder {
             } else {
                 std::slice::from_raw_parts(ptr, size).to_vec()
             };
-
-            let status = self
-                .encoder
-                .nvEncUnlockBitstream
-                .map(|f| f(self.h_encoder, lock_bitstream.outputBitstream));
-            if let Some(status) = status {
-                Error::check_nvenc(status, "nvEncUnlockBitstream")?;
-            }
 
             let timestamp = lock_bitstream.outputTimeStamp;
             let picture_type = PictureType::new(lock_bitstream.pictureType);

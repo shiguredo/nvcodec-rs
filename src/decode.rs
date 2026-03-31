@@ -366,7 +366,19 @@ unsafe extern "C" fn handle_video_sequence(
         }
     }));
 
-    result.unwrap_or(0)
+    match result {
+        Ok(v) => v,
+        Err(_) => {
+            // panic を検知したことを利用側に伝える
+            if let Ok(state) = state_mutex.lock() {
+                let _ = state.frame_tx.send(Err(Error::new_custom(
+                    "handle_video_sequence",
+                    "panic occurred in FFI callback",
+                )));
+            }
+            0
+        }
+    }
 }
 
 fn handle_video_sequence_inner(
@@ -446,7 +458,19 @@ unsafe extern "C" fn handle_picture_decode(
         }
     }));
 
-    result.unwrap_or(0)
+    match result {
+        Ok(v) => v,
+        Err(_) => {
+            // panic を検知したことを利用側に伝える
+            if let Ok(state) = state_mutex.lock() {
+                let _ = state.frame_tx.send(Err(Error::new_custom(
+                    "handle_picture_decode",
+                    "panic occurred in FFI callback",
+                )));
+            }
+            0
+        }
+    }
 }
 
 fn handle_picture_decode_inner(
@@ -496,7 +520,19 @@ unsafe extern "C" fn handle_picture_display(
         }
     }));
 
-    result.unwrap_or(0)
+    match result {
+        Ok(v) => v,
+        Err(_) => {
+            // panic を検知したことを利用側に伝える
+            if let Ok(state) = state_mutex.lock() {
+                let _ = state.frame_tx.send(Err(Error::new_custom(
+                    "handle_picture_display",
+                    "panic occurred in FFI callback",
+                )));
+            }
+            0
+        }
+    }
 }
 
 fn handle_picture_display_inner(
