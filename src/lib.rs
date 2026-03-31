@@ -627,16 +627,24 @@ impl CudaLibrary {
     }
 
     /// CUDA context を push して、クロージャを実行し、自動的に pop する
+    ///
+    /// クロージャが panic しても pop は必ず実行される（CUDA コンテキストスタックの整合性を保つため）
     fn with_context<F, R>(&self, ctx: sys::CUcontext, f: F) -> Result<R, Error>
     where
         F: FnOnce() -> Result<R, Error>,
     {
         self.cu_ctx_push_current(ctx)?;
 
+        // panic 時にも必ず pop するためのガード
+        let pop_guard = crate::ReleaseGuard::new(|| {
+            let mut popped_ctx = std::ptr::null_mut();
+            let _ = self.cu_ctx_pop_current(&mut popped_ctx);
+        });
+
         let result = f();
 
-        let mut popped_ctx = std::ptr::null_mut();
-        self.cu_ctx_pop_current(&mut popped_ctx)?;
+        // 正常パスでは明示的にガードを消費して pop する
+        drop(pop_guard);
 
         result
     }

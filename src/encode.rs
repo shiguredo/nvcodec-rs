@@ -308,6 +308,22 @@ impl BufferFormat {
         }
     }
 
+    /// Y プレーン (または packed フォーマット) の 1 行あたりのバイト数を返す
+    fn bytes_per_row(self, width: u32) -> u32 {
+        match self {
+            // Planar 8bit: 1 byte/pixel
+            BufferFormat::Nv12 | BufferFormat::Yv12 | BufferFormat::Iyuv | BufferFormat::Yuv444 => {
+                width
+            }
+            // Planar 10bit: 2 bytes/pixel
+            BufferFormat::Yuv420_10bit | BufferFormat::Yuv444_10bit => width * 2,
+            // Packed 8bit: 4 bytes/pixel (ARGB/ABGR)
+            BufferFormat::Argb | BufferFormat::Abgr => width * 4,
+            // Packed 10bit: 4 bytes/pixel (A2R10G10B10/A2B10G10R10)
+            BufferFormat::Argb10 | BufferFormat::Abgr10 => width * 4,
+        }
+    }
+
     /// 指定された幅と高さに対するフレームデータのバイトサイズを計算する
     fn frame_size(self, width: u32, height: u32) -> usize {
         let pixels = (width * height) as usize;
@@ -916,7 +932,7 @@ impl Encoder {
             register_resource.resourceToRegister = device_input as *mut c_void;
             register_resource.width = self.width;
             register_resource.height = self.height;
-            register_resource.pitch = self.width;
+            register_resource.pitch = self.buffer_format_enum.bytes_per_row(self.width);
             register_resource.bufferFormat = self.buffer_format;
             register_resource.bufferUsage = sys::_NV_ENC_BUFFER_USAGE_NV_ENC_INPUT_IMAGE;
 
@@ -1004,7 +1020,7 @@ impl Encoder {
             pic_params.version = sys::NV_ENC_PIC_PARAMS_VER;
             pic_params.inputWidth = self.width;
             pic_params.inputHeight = self.height;
-            pic_params.inputPitch = self.width;
+            pic_params.inputPitch = self.buffer_format_enum.bytes_per_row(self.width);
             pic_params.inputBuffer = mapped_resource;
             pic_params.outputBitstream = output_buffer;
             pic_params.bufferFmt = self.buffer_format;
@@ -1042,11 +1058,18 @@ impl Encoder {
             Error::check_nvenc(status, "nvEncLockBitstream")?;
 
             // ビットストリームがロックされている間にエンコード済みデータをコピー
-            let encoded_data = std::slice::from_raw_parts(
-                lock_bitstream.bitstreamBufferPtr as *const u8,
-                lock_bitstream.bitstreamSizeInBytes as usize,
-            )
-            .to_vec();
+            let ptr = lock_bitstream.bitstreamBufferPtr as *const u8;
+            let size = lock_bitstream.bitstreamSizeInBytes as usize;
+            let encoded_data = if ptr.is_null() {
+                return Err(Error::new_custom(
+                    "nvEncLockBitstream",
+                    "bitstreamBufferPtr is null",
+                ));
+            } else if size == 0 {
+                Vec::new()
+            } else {
+                std::slice::from_raw_parts(ptr, size).to_vec()
+            };
 
             let status = self
                 .encoder

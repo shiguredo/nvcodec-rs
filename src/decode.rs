@@ -1,4 +1,5 @@
 use std::ffi::c_void;
+use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::ptr;
 use std::sync::Mutex;
 use std::sync::mpsc::{self, Receiver, Sender};
@@ -40,33 +41,19 @@ pub enum DecoderCodec {
 }
 
 /// デコーダー出力サーフェスフォーマット (NVDEC: cudaVideoSurfaceFormat)
+///
+/// 現在はフレームコピー処理が NV12 前提のため、NV12 のみサポートしている。
+/// 他フォーマットが必要になった場合は、コピー処理の分岐と DecodedFrame の拡張を同時に行うこと。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SurfaceFormat {
     /// Semi-Planar YUV 4:2:0 8bit [Y plane + interleaved UV plane]
     Nv12,
-    /// Semi-Planar YUV 4:2:0 16bit [Y plane + interleaved UV plane]
-    P016,
-    /// Planar YUV 4:4:4 8bit [Y plane + U plane + V plane]
-    Yuv444,
-    /// Planar YUV 4:4:4 16bit [Y plane + U plane + V plane]
-    Yuv444_16bit,
-    /// Semi-Planar YUV 4:2:2 8bit [Y plane + interleaved UV plane]
-    Nv16,
-    /// Semi-Planar YUV 4:2:2 16bit [Y plane + interleaved UV plane]
-    P216,
 }
 
 impl SurfaceFormat {
     fn to_sys(self) -> u32 {
         match self {
             SurfaceFormat::Nv12 => sys::cudaVideoSurfaceFormat_enum_cudaVideoSurfaceFormat_NV12,
-            SurfaceFormat::P016 => sys::cudaVideoSurfaceFormat_enum_cudaVideoSurfaceFormat_P016,
-            SurfaceFormat::Yuv444 => sys::cudaVideoSurfaceFormat_enum_cudaVideoSurfaceFormat_YUV444,
-            SurfaceFormat::Yuv444_16bit => {
-                sys::cudaVideoSurfaceFormat_enum_cudaVideoSurfaceFormat_YUV444_16Bit
-            }
-            SurfaceFormat::Nv16 => sys::cudaVideoSurfaceFormat_enum_cudaVideoSurfaceFormat_NV16,
-            SurfaceFormat::P216 => sys::cudaVideoSurfaceFormat_enum_cudaVideoSurfaceFormat_P216,
         }
     }
 }
@@ -360,21 +347,26 @@ unsafe extern "C" fn handle_video_sequence(
         return 0;
     }
 
-    let format = unsafe { &*format };
-    let state = unsafe { &*(user_data as *const Mutex<DecoderState>) };
-    let Ok(mut state) = state.lock() else {
-        // このケースは next_frame() の中でハンドリングされているので、ここでは何もする必要がない
-        return 0;
-    };
+    let state_mutex = unsafe { &*(user_data as *const Mutex<DecoderState>) };
 
-    let result = handle_video_sequence_inner(&mut state, format);
-    match result {
-        Ok(num_surfaces) => num_surfaces,
-        Err(e) => {
-            let _ = state.frame_tx.send(Err(e));
-            0
+    // FFI コールバック内の panic はプロセス abort に直結するため catch_unwind で隔離する
+    let result = catch_unwind(AssertUnwindSafe(|| {
+        let format = unsafe { &*format };
+        let Ok(mut state) = state_mutex.lock() else {
+            return 0;
+        };
+
+        let result = handle_video_sequence_inner(&mut state, format);
+        match result {
+            Ok(num_surfaces) => num_surfaces,
+            Err(e) => {
+                let _ = state.frame_tx.send(Err(e));
+                0
+            }
         }
-    }
+    }));
+
+    result.unwrap_or(0)
 }
 
 fn handle_video_sequence_inner(
@@ -436,20 +428,25 @@ unsafe extern "C" fn handle_picture_decode(
         return 0;
     }
 
-    let state = unsafe { &*(user_data as *const Mutex<DecoderState>) };
-    let Ok(mut state) = state.lock() else {
-        // このケースは next_frame() の中でハンドリングされているので、ここでは何もする必要がない
-        return 0;
-    };
+    let state_mutex = unsafe { &*(user_data as *const Mutex<DecoderState>) };
 
-    let result = handle_picture_decode_inner(&mut state, unsafe { &*pic_params });
-    match result {
-        Ok(_) => 1,
-        Err(e) => {
-            let _ = state.frame_tx.send(Err(e));
-            0
+    // FFI コールバック内の panic はプロセス abort に直結するため catch_unwind で隔離する
+    let result = catch_unwind(AssertUnwindSafe(|| {
+        let Ok(mut state) = state_mutex.lock() else {
+            return 0;
+        };
+
+        let result = handle_picture_decode_inner(&mut state, unsafe { &*pic_params });
+        match result {
+            Ok(_) => 1,
+            Err(e) => {
+                let _ = state.frame_tx.send(Err(e));
+                0
+            }
         }
-    }
+    }));
+
+    result.unwrap_or(0)
 }
 
 fn handle_picture_decode_inner(
@@ -481,20 +478,25 @@ unsafe extern "C" fn handle_picture_display(
         return 0;
     }
 
-    let state = unsafe { &*(user_data as *const Mutex<DecoderState>) };
-    let Ok(state) = state.lock() else {
-        // このケースは next_frame() の中でハンドリングされているので、ここでは何もする必要がない
-        return 0;
-    };
+    let state_mutex = unsafe { &*(user_data as *const Mutex<DecoderState>) };
 
-    let result = handle_picture_display_inner(&state, unsafe { &*disp_info });
-    match result {
-        Ok(_) => 1,
-        Err(e) => {
-            let _ = state.frame_tx.send(Err(e));
-            0
+    // FFI コールバック内の panic はプロセス abort に直結するため catch_unwind で隔離する
+    let result = catch_unwind(AssertUnwindSafe(|| {
+        let Ok(state) = state_mutex.lock() else {
+            return 0;
+        };
+
+        let result = handle_picture_display_inner(&state, unsafe { &*disp_info });
+        match result {
+            Ok(_) => 1,
+            Err(e) => {
+                let _ = state.frame_tx.send(Err(e));
+                0
+            }
         }
-    }
+    }));
+
+    result.unwrap_or(0)
 }
 
 fn handle_picture_display_inner(
