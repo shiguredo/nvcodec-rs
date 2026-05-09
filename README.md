@@ -161,9 +161,9 @@ for frame in rx.try_iter() {
 ### エンコーダーケーパビリティクエリ
 
 ```rust
-use shiguredo_nvcodec::{EncoderCodec, encode};
+use shiguredo_nvcodec::{EncoderCodec, query_encoder_caps};
 
-let caps = encode::query_caps(EncoderCodec::H264, 0)?;
+let caps = query_encoder_caps(EncoderCodec::H264, 0)?;
 println!("max width: {}", caps.width_max);
 println!("max height: {}", caps.height_max);
 println!("10-bit encode: {}", caps.support_10bit_encode);
@@ -172,9 +172,9 @@ println!("10-bit encode: {}", caps.support_10bit_encode);
 ### デコーダーケーパビリティクエリ
 
 ```rust
-use shiguredo_nvcodec::{DecoderCodec, decode};
+use shiguredo_nvcodec::{DecoderCodec, query_decoder_caps};
 
-let caps = decode::query_caps(DecoderCodec::H264, 0)?;
+let caps = query_decoder_caps(DecoderCodec::H264, 0)?;
 println!("supported: {}", caps.is_supported);
 println!("max: {}x{}", caps.max_width, caps.max_height);
 ```
