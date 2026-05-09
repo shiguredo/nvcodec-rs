@@ -271,7 +271,6 @@ impl DecoderState {
         Ok(())
     }
 
-
     /// デコード済みのフレームを取り出す
     pub fn next_frame(&mut self) -> Result<Option<RawFrame>, Error> {
         self.frame_rx.try_recv().ok().transpose()
@@ -301,13 +300,8 @@ impl Drop for DecoderState {
 }
 
 enum Job<T> {
-    Decode {
-        data: Vec<u8>,
-        user_data: T,
-    },
-    Flush {
-        done: SyncSender<()>,
-    },
+    Decode { data: Vec<u8>, user_data: T },
+    Flush { done: SyncSender<()> },
     Terminate,
 }
 
@@ -360,10 +354,14 @@ impl<T: Send + 'static> Decoder<T> {
     ///
     /// すべての pending フレームのコールバックが呼び出された後、このメソッドが戻る。
     /// flush 後も decode を継続できる。
-    pub fn flush(&self) {
+    pub fn flush(&self) -> Result<(), Error> {
         let (tx, rx) = mpsc::sync_channel(0);
-        let _ = self.job_tx.send(Job::Flush { done: tx });
-        let _ = rx.recv();
+        self.job_tx
+            .send(Job::Flush { done: tx })
+            .map_err(|_| Error::new_custom("flush", "send failed"))?;
+        rx.recv()
+            .map_err(|_| Error::new_custom("flush", "recv failed"))?;
+        Ok(())
     }
 }
 
@@ -563,7 +561,7 @@ unsafe extern "C" fn handle_picture_display(
 
     // FFI コールバック内の panic はプロセス abort に直結するため catch_unwind で隔離する
     let result = catch_unwind(AssertUnwindSafe(|| {
-        let result = handle_picture_display_inner(&state, unsafe { &*disp_info });
+        let result = handle_picture_display_inner(state, unsafe { &*disp_info });
         match result {
             Ok(_) => 1,
             Err(e) => {
@@ -723,11 +721,8 @@ impl<T> DecodedFrame<T> {
     }
 }
 
-fn run_worker<F, T>(
-    mut state: Box<DecoderState>,
-    callback: &mut F,
-    job_rx: Receiver<Job<T>>,
-) where
+fn run_worker<F, T>(mut state: Box<DecoderState>, callback: &mut F, job_rx: Receiver<Job<T>>)
+where
     F: FnMut(Result<DecodedFrame<T>, Error>) + Send + 'static,
     T: Send + 'static,
 {
@@ -880,11 +875,10 @@ mod tests {
     fn test_multiple_decoders() {
         let config = test_decoder_config(DecoderCodec::Hevc);
         let (_tx1, _rx1) = mpsc::sync_channel::<Result<DecodedFrame<()>, Error>>(4);
-        let _decoder1 =
-            Decoder::new(config.clone(), move |_frame| {
-                let _ = _tx1.send(_frame);
-            })
-            .expect("Failed to initialize first h265 decoder");
+        let _decoder1 = Decoder::new(config.clone(), move |_frame| {
+            let _ = _tx1.send(_frame);
+        })
+        .expect("Failed to initialize first h265 decoder");
 
         let (_tx2, _rx2) = mpsc::sync_channel::<Result<DecodedFrame<()>, Error>>(4);
         let _decoder2 = Decoder::new(config, move |_frame| {
@@ -947,7 +941,7 @@ mod tests {
             .expect("Failed to decode H.265 data");
 
         // フィニッシュ処理をテスト
-        decoder.flush();
+        decoder.flush().expect("flush failed");
 
         // デコード済みフレームを取得
         let frame = rx
@@ -1045,7 +1039,7 @@ mod tests {
             .expect("Failed to decode H.264 data");
 
         // フィニッシュ処理をテスト
-        decoder.flush();
+        decoder.flush().expect("flush failed");
 
         // デコード済みフレームを取得
         let frame = rx
@@ -1122,7 +1116,7 @@ mod tests {
             .expect("Failed to decode AV1 data");
 
         // フィニッシュ処理をテスト
-        decoder.flush();
+        decoder.flush().expect("flush failed");
 
         // デコード済みフレームを取得
         let frame = rx
@@ -1222,7 +1216,7 @@ mod tests {
             .expect("Failed to decode VP8 data");
 
         // フィニッシュ処理をテスト
-        decoder.flush();
+        decoder.flush().expect("flush failed");
 
         // デコード済みフレームを取得
         let frame = rx
@@ -1298,7 +1292,7 @@ mod tests {
             .expect("Failed to decode VP9 data");
 
         // フィニッシュ処理をテスト
-        decoder.flush();
+        decoder.flush().expect("flush failed");
 
         // デコード済みフレームを取得
         let frame = rx

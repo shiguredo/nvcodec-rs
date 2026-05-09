@@ -1235,10 +1235,14 @@ impl<T: Send + 'static> Encoder<T> {
     ///
     /// すべての pending フレームのコールバックが呼び出された後、このメソッドが戻る。
     /// flush 後も encode を継続できる。
-    pub fn flush(&self) {
+    pub fn flush(&self) -> Result<(), Error> {
         let (tx, rx) = mpsc::sync_channel(0);
-        let _ = self.job_tx.send(Job::Flush { done: tx });
-        let _ = rx.recv();
+        self.job_tx
+            .send(Job::Flush { done: tx })
+            .map_err(|_| Error::new_custom("flush", "send failed"))?;
+        rx.recv()
+            .map_err(|_| Error::new_custom("flush", "recv failed"))?;
+        Ok(())
     }
 
     /// エンコーダパラメータを再構成する
@@ -1685,7 +1689,7 @@ mod tests {
             .expect("failed to encode black frame");
 
         // エンコード完了を待機
-        encoder.flush();
+        encoder.flush().expect("flush failed");
 
         // エンコード済みフレームを取得
         let frames: Vec<_> = rx.try_iter().collect();
@@ -1741,7 +1745,7 @@ mod tests {
             .expect("failed to encode black frame");
 
         // エンコード完了を待機
-        encoder.flush();
+        encoder.flush().expect("flush failed");
 
         // エンコード済みフレームを取得
         let frames: Vec<_> = rx.try_iter().collect();
@@ -1797,7 +1801,7 @@ mod tests {
             .expect("failed to encode black frame");
 
         // エンコード完了を待機
-        encoder.flush();
+        encoder.flush().expect("flush failed");
 
         // エンコード済みフレームを取得
         let frames: Vec<_> = rx.try_iter().collect();
@@ -1852,7 +1856,7 @@ mod tests {
                 .expect("failed to encode frame");
         }
 
-        encoder.flush();
+        encoder.flush().expect("flush failed");
         drop(encoder);
 
         // 5 フレームすべてがエンコードされたことを確認
@@ -1880,7 +1884,7 @@ mod tests {
         .expect("failed to create h264 encoder");
 
         // フレームを送信せずに flush してもハングしないことを確認
-        encoder.flush();
+        encoder.flush().expect("flush failed");
         drop(encoder);
 
         let frames: Vec<_> = rx.try_iter().collect();
@@ -1931,7 +1935,7 @@ mod tests {
             )
             .expect("failed to encode frame after reconfigure");
 
-        encoder.flush();
+        encoder.flush().expect("flush failed");
         drop(encoder);
 
         let frames: Vec<_> = rx.try_iter().collect();
