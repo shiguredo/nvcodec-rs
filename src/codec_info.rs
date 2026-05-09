@@ -1,6 +1,6 @@
 //! コーデック情報の照会
 
-use crate::{CudaLibrary, Decoder, DecoderCodec, Encoder, EncoderCodec, Error};
+use crate::{CudaLibrary, Decoder, DecoderCodec, EncoderCodec, Error};
 
 /// コーデック種別
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -262,7 +262,7 @@ fn probe_encoding(codec: VideoCodecType, device_id: i32) -> EncodingInfo {
         None => return EncodingInfo::unsupported(),
     };
 
-    match Encoder::query_caps(encoder_codec, device_id) {
+    match crate::encode::query_caps(encoder_codec, device_id) {
         Ok(caps) => {
             let supported = caps.width_max > 0;
             EncodingInfo {
