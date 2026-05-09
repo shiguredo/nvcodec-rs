@@ -1,6 +1,6 @@
 //! コーデック情報の照会
 
-use crate::{CudaLibrary, Decoder, DecoderCodec, EncoderCodec, Error};
+use crate::{CudaLibrary, DecoderCodec, EncoderCodec, Error};
 
 /// コーデック種別
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -233,7 +233,7 @@ pub fn supported_codecs(device_id: i32) -> Result<Vec<CodecInfo>, Error> {
 /// NVDEC のデコードケーパビリティを照会する
 fn probe_decoding(codec: VideoCodecType, device_id: i32) -> DecodingInfo {
     let decoder_codec = codec.to_decoder_codec();
-    match Decoder::query_caps(decoder_codec, device_id) {
+    match crate::decode::query_caps(decoder_codec, device_id) {
         Ok(caps) => DecodingInfo {
             supported: caps.is_supported,
             hardware_accelerated: caps.is_supported,

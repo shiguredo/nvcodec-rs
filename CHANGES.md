@@ -11,6 +11,15 @@
 
 ## develop
 
+- [CHANGE] エンコーダの同期 API を非同期コールバック方式に変更する
+  - `Encoder::new()` に完了用のコールバックを渡すようにする
+  - `Encoder::next_frame()` は廃止
+  - @melpon
+- [CHANGE] デコーダの同期 API を非同期コールバック方式に変更する
+  - `Decoder::new()` に完了用のコールバックを渡すようにする
+  - `Decoder::next_frame()` は廃止
+  - @melpon
+
 ## 2026.1.0
 
 **リリース日**: 2026-03-31
