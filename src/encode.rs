@@ -1289,7 +1289,7 @@ impl<T> std::fmt::Debug for Encoder<T> {
 unsafe impl<T: Send> Send for Encoder<T> {}
 
 /// 指定コーデックのエンコーダのケーパビリティをクエリする
-pub fn query_caps(codec: EncoderCodec, device_id: i32) -> Result<EncoderCaps, Error> {
+pub fn query_encoder_caps(codec: EncoderCodec, device_id: i32) -> Result<EncoderCaps, Error> {
     EncoderState::query_caps(codec, device_id)
 }
 

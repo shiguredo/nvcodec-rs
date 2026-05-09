@@ -233,7 +233,7 @@ pub fn supported_codecs(device_id: i32) -> Result<Vec<CodecInfo>, Error> {
 /// NVDEC のデコードケーパビリティを照会する
 fn probe_decoding(codec: VideoCodecType, device_id: i32) -> DecodingInfo {
     let decoder_codec = codec.to_decoder_codec();
-    match crate::decode::query_caps(decoder_codec, device_id) {
+    match crate::query_decoder_caps(decoder_codec, device_id) {
         Ok(caps) => DecodingInfo {
             supported: caps.is_supported,
             hardware_accelerated: caps.is_supported,
@@ -262,7 +262,7 @@ fn probe_encoding(codec: VideoCodecType, device_id: i32) -> EncodingInfo {
         None => return EncodingInfo::unsupported(),
     };
 
-    match crate::encode::query_caps(encoder_codec, device_id) {
+    match crate::query_encoder_caps(encoder_codec, device_id) {
         Ok(caps) => {
             let supported = caps.width_max > 0;
             EncodingInfo {

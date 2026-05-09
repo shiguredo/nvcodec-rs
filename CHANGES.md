@@ -19,6 +19,9 @@
   - `Decoder::new()` に完了用のコールバックを渡すようにする
   - `Decoder::next_frame()` は廃止
   - @melpon
+- [CHANGE] `Encoder::query_caps()`, `Decoder::query_caps()` をリネームする
+  - `query_encoder_caps()` 及び `query_decoder_caps()` にリネーム
+  - @melpon
 
 ## 2026.1.0
 

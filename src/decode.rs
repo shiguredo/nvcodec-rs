@@ -383,7 +383,7 @@ impl<T> std::fmt::Debug for Decoder<T> {
 unsafe impl<T: Send> Send for Decoder<T> {}
 
 /// 指定コーデックのデコーダのケーパビリティをクエリする
-pub fn query_caps(codec: DecoderCodec, device_id: i32) -> Result<DecoderCaps, Error> {
+pub fn query_decoder_caps(codec: DecoderCodec, device_id: i32) -> Result<DecoderCaps, Error> {
     DecoderState::query_caps(codec, device_id)
 }
 
