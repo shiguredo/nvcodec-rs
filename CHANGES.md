@@ -11,6 +11,15 @@
 
 ## develop
 
+- [ADD] `EncodedFrame<T>` 構造体を追加する
+  - `user_data: T` フィールドを持ち、エンコード完了時に任意のユーザーデータを callback 経由で受け取れるようにする
+  - `into_parts()` メソッドでデータとユーザーデータに分解できる
+  - `user_data()` メソッドでユーザーデータの参照を取得できる
+  - @melpon
+- [ADD] `DecodedFrame<T>` に `user_data: T` フィールドを追加する
+  - `into_parts()` メソッドでデータとユーザーデータに分解できる
+  - `user_data()` メソッドでユーザーデータの参照を取得できる
+  - @melpon
 - [CHANGE] エンコーダの同期 API を非同期コールバック方式に変更する
   - `Encoder::new()` に完了用のコールバックを渡すようにする
   - `Encoder::next_frame()` は廃止

@@ -114,7 +114,7 @@ let force_idr_options = EncodeOptions {
 encoder.encode(&nv12_data, &force_idr_options, ())?;
 
 // 全エンコード完了を待機
-encoder.flush();
+encoder.flush()?;
 
 // エンコード済みフレームを取得
 for frame in rx.try_iter() {
@@ -146,7 +146,7 @@ let decoder = Decoder::new(config, move |frame: Result<DecodedFrame<()>, Error>|
 decoder.decode(&encoded_data, ())?;
 
 // 全デコード完了を待機
-decoder.flush();
+decoder.flush()?;
 
 // デコード済みフレームを取得
 for frame in rx.try_iter() {
@@ -234,11 +234,6 @@ for i in 0..count {
 | フォーマット | `SurfaceFormat` | 説明 |
 |---|---|---|
 | NV12 | `SurfaceFormat::Nv12` | Semi-Planar YUV 4:2:0 8bit |
-| P016 | `SurfaceFormat::P016` | Semi-Planar YUV 4:2:0 16bit |
-| YUV444 | `SurfaceFormat::Yuv444` | Planar YUV 4:4:4 8bit |
-| YUV444 16bit | `SurfaceFormat::Yuv444_16bit` | Planar YUV 4:4:4 16bit |
-| NV16 | `SurfaceFormat::Nv16` | Semi-Planar YUV 4:2:2 8bit |
-| P216 | `SurfaceFormat::P216` | Semi-Planar YUV 4:2:2 16bit |
 
 ## 動的解像度変更
 
