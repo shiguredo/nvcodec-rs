@@ -1513,21 +1513,20 @@ where
 
     match lock_result {
         Ok((data, timestamp, picture_type)) => {
-            let user_data = pending_user_data
-                .pop_front()
-                .expect("pending_user_data must not be empty during drain");
-
-            callback(Ok(EncodedFrame {
-                data,
-                timestamp,
-                picture_type,
-                user_data,
-            }));
+            if let Some(user_data) = pending_user_data.pop_front() {
+                callback(Ok(EncodedFrame {
+                    data,
+                    timestamp,
+                    picture_type,
+                    user_data,
+                }));
+            } else {
+                callback(Err(Error::new_custom("drain_one", "missing user data")));
+            }
         }
         Err(e) => {
-            if let Some(_user_data) = pending_user_data.pop_front() {
-                callback(Err(e));
-            }
+            pending_user_data.clear();
+            callback(Err(e));
         }
     }
 

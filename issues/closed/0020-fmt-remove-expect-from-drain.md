@@ -1,5 +1,7 @@
 # 0020-fmt-remove-expect-from-drain
 
+Completed: 2026-05-16
+Branch: feature/fix-drain-error-handling
 Created: 2026-05-10
 Model: deepseek-v4-pro
 
@@ -104,3 +106,9 @@ Ok((data, timestamp, picture_type)) => {
 
 - **issue 0018** (drain エラー握り潰し修正): 0018 の `pending_user_data.clear()` により後続 drain の Ok パスで `pop_front()` が `None` を返す。 0020 未適用の状態で 0018 を適用すると `.expect()` でパニックするため、 0020 → 0018 の順で適用する必要がある
 - **issue 0019** (CUDA コンテキスト管理統一): 0019 で `drain_one_with_ctx` → `drain_one` へのリネームが発生する。 0019 が先に適用される場合、エラーメッセージ中の関数名 `"drain_one_with_ctx"` を `"drain_one"` に調整すること
+
+## 解決方法
+
+`src/encode.rs` の `drain_one` 関数の `Ok` マッチアームから `.expect()` を削除し、`pop_front()` が `None` を返した場合はエラーコールバックで通知するようにした。
+
+これにより `pending_user_data` の不変条件が破れた場合のパニックが防止される。
