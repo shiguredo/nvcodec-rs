@@ -57,6 +57,19 @@
   - Err パスで `pending_user_data` の状態にかかわらず必ずエラーを通知し、残存 user_data を破棄する
   - @melpon
 
+
+- [UPDATE] `Encoder<T>::reconfigure` と `Encoder<T>::get_sequence_params` のレシーバを `&mut self` から `&self` に変更する
+  - 内部で `job_tx.send()` のみを使用するため可変借用は不要
+  - @melpon
+
+- [UPDATE] `EncoderState::expected_frame_size` フィールドを削除する
+  - フィールドは一度も読み取られることなく、毎回再計算されていた
+  - @melpon
+
+### misc
+
+- `EncoderState` と `DecoderState` の内部メソッドから不要な `pub` を削除する
+  - @melpon
 ## 2026.1.0
 
 **リリース日**: 2026-03-31
