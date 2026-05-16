@@ -108,14 +108,17 @@ cargo test --lib -- encode
 - **issue 0019** (CUDA コンテキスト管理統一): `src/encode.rs` の同一領域を変更するため競合の可能性がある。0019 の番号が小さいため、0019 を先に適用し、0019 完了後のコードベースに対して本 issue の項目 3, 4, 5 を適用する。
 - **issue 0015/0018/0020/0022**: 変更箇所が異なるため競合しない。
 
+
 ## 解決方法
 
 以下の内部リファクタリングを行った:
 
-1. **不要な `pub` を削除**: `EncoderState` の `query_caps`、`reconfigure`、`get_sequence_params`、および `DecoderState` の `new`、`query_caps`、`decode`、`send_eos`、`next_frame` から `pub` を削除した。
+1. **FFI コールバックマクロ化**: `handle_video_sequence`、`handle_picture_decode`、`handle_picture_display` の重複パターンを `ffi_callback!` マクロに共通化した。
 
-2. **`&mut self` → `&self` 統一**: `Encoder<T>::reconfigure` と `Encoder<T>::get_sequence_params` を `&self` に変更した。内部では `job_tx.send()` のみを使用するため、可変借用は不要。
+2. **デコードテストヘルパー追加**: 5 つのブラックフレームデコードテストの重複検証ロジックを `assert_black_frame` ヘルパー関数に抽出した。
 
-3. **`EncoderState::get_sequence_params` も `&self` に変更**: 内部の `get_sequence_params_inner` が `&self` であるため、可変借用は不要。
+3. **`&mut self` → `&self` 統一**: `Encoder<T>::reconfigure`、`Encoder<T>::get_sequence_params`、`EncoderState::get_sequence_params` を `&self` に変更した。
 
-4. **`expected_frame_size` フィールドを削除**: フィールドは一度も読み取られることなく、`encode_frame` と `init_buffer_pool` で毎回再計算されていた。フィールド宣言、`new()` 内の代入、`reconfigure_inner` 内の代入とロールバック処理を削除した。
+4. **`expected_frame_size` フィールドを削除**: 一度も読み取られないフィールドを削除した。
+
+5/6. **不要な `pub` を削除**: `EncoderState` と `DecoderState` の内部メソッドから `pub` を削除した。
