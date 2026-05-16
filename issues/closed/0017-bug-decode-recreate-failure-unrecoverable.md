@@ -1,5 +1,7 @@
 # 0017-bug-decode-recreate-failure-unrecoverable
 
+Completed: 2026-05-16
+Branch: feature/fix-decode-recreate-order
 Created: 2026-05-10
 Model: deepseek-v4-pro
 
@@ -185,3 +187,13 @@ GPU 依存のため `cuvid_create_decoder` 失敗を意図的に再現する moc
 - PBT / Fuzzing は不要（GPU 依存のエラーパスであり、新たなロジック追加が限定的なため）
 
 修正の妥当性は、疑似コードとパステーブルを照合したコードレビューによって全分岐の網羅性を確認する。
+
+## 解決方法
+
+`src/decode.rs` の `handle_video_sequence_inner` 関数を修正した:
+
+1. `display_area` と `coded_width`/`coded_height` の検証を最初に実行するようにした（`validate_display_area` ヘルパー関数を導入）
+2. デコーダーの再作成順序を destroy-then-create から create-then-destroy に変更した。新しいデコーダーを一時変数に作成し、成功した場合のみ古いデコーダーを破棄する
+3. create 失敗時は古いデコーダーを破棄して `state.decoder` を null にする
+4. 古いデコーダーの破棄失敗時は新しいデコーダーも破棄し、両方を null にする
+5. `destroy_old_decoder_and_null` ヘルパー関数を導入し、デコーダー破棄の責務を集約した
