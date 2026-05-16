@@ -97,7 +97,7 @@ unsafe impl Send for DecoderState {}
 
 impl DecoderState {
     /// 指定されたコーデック設定でデコーダーインスタンスを生成する
-    pub fn new(config: DecoderConfig) -> Result<Box<Self>, Error> {
+    fn new(config: DecoderConfig) -> Result<Box<Self>, Error> {
         let codec_type = match config.codec {
             DecoderCodec::H264 => sys::cudaVideoCodec_enum_cudaVideoCodec_H264,
             DecoderCodec::Hevc => sys::cudaVideoCodec_enum_cudaVideoCodec_HEVC,
@@ -110,7 +110,7 @@ impl DecoderState {
     }
 
     /// 指定コーデックのデコーダのケーパビリティをクエリする
-    pub fn query_caps(codec: DecoderCodec, device_id: i32) -> Result<DecoderCaps, Error> {
+    fn query_caps(codec: DecoderCodec, device_id: i32) -> Result<DecoderCaps, Error> {
         let codec_type = match codec {
             DecoderCodec::H264 => sys::cudaVideoCodec_enum_cudaVideoCodec_H264,
             DecoderCodec::Hevc => sys::cudaVideoCodec_enum_cudaVideoCodec_HEVC,

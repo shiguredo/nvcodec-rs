@@ -454,7 +454,6 @@ struct EncoderState {
     height: u32,
     buffer_format: sys::NV_ENC_BUFFER_FORMAT,
     buffer_format_enum: BufferFormat,
-    expected_frame_size: usize,
     framerate_den: u64,
     frame_count: u64,
     init_params: sys::NV_ENC_INITIALIZE_PARAMS,
@@ -533,9 +532,6 @@ impl EncoderState {
                 height: config.height,
                 buffer_format: buffer_format_sys,
                 buffer_format_enum: config.buffer_format,
-                expected_frame_size: config
-                    .buffer_format
-                    .frame_size(config.width, config.height)?,
                 framerate_den: config.framerate_den as u64,
                 frame_count: 0,
                 init_params: std::mem::zeroed(),
@@ -563,7 +559,7 @@ impl EncoderState {
     }
 
     /// 指定コーデックのエンコーダのケーパビリティをクエリする
-    pub fn query_caps(codec: EncoderCodec, device_id: i32) -> Result<EncoderCaps, Error> {
+    fn query_caps(codec: EncoderCodec, device_id: i32) -> Result<EncoderCaps, Error> {
         let codec_guid = match codec {
             EncoderCodec::H264 => sys::NV_ENC_CODEC_H264_GUID,
             EncoderCodec::Hevc => sys::NV_ENC_CODEC_HEVC_GUID,
@@ -677,7 +673,7 @@ impl EncoderState {
     ///
     /// ビットレートやフレームレートを動的に変更する。
     /// エンコーダの初期化時に設定された値を基準に、指定されたパラメータのみを上書きする。
-    pub fn reconfigure(&mut self, params: ReconfigureParams) -> Result<(), Error> {
+    fn reconfigure(&mut self, params: ReconfigureParams) -> Result<(), Error> {
         self.lib
             .clone()
             .with_context(self.ctx, || self.reconfigure_inner(params))
@@ -749,7 +745,6 @@ impl EncoderState {
             let old_width = self.width;
             let old_height = self.height;
             let old_pitch = self.pitch;
-            let old_expected_frame_size = self.expected_frame_size;
 
             if let Some(width) = params.width {
                 self.width = width;
@@ -758,10 +753,6 @@ impl EncoderState {
                 self.height = height;
             }
             if params.width.is_some() || params.height.is_some() {
-                self.expected_frame_size = self
-                    .buffer_format_enum
-                    .frame_size(self.width, self.height)?;
-
                 if params.width.is_some() {
                     self.pitch = self.buffer_format_enum.bytes_per_row(self.width)?;
                 }
@@ -771,7 +762,6 @@ impl EncoderState {
                     self.width = old_width;
                     self.height = old_height;
                     self.pitch = old_pitch;
-                    self.expected_frame_size = old_expected_frame_size;
                     return Err(e);
                 }
             }
@@ -905,7 +895,7 @@ impl EncoderState {
     /// シーケンスパラメータ（SPS/PPS または Sequence Header OBU）を取得する
     ///
     /// H.264/HEVC の場合は SPS/PPS、AV1 の場合は Sequence Header OBU を取得します。
-    pub fn get_sequence_params(&mut self) -> Result<Vec<u8>, Error> {
+    fn get_sequence_params(&self) -> Result<Vec<u8>, Error> {
         self.lib
             .with_context(self.ctx, || self.get_sequence_params_inner())
     }
@@ -1323,7 +1313,7 @@ impl<T: Send + 'static> Encoder<T> {
     /// 解像度を変更した直後の最初のエンコードフレームには、呼び出し元が
     /// `EncodeOptions { force_idr: true, output_spspps: true, .. }` を指定する必要がある。
     /// これを怠ると新しい解像度の SPS/PPS がビットストリームに出力されず、デコーダーが再生不能になる。
-    pub fn reconfigure(&mut self, params: ReconfigureParams) -> Result<(), Error> {
+    pub fn reconfigure(&self, params: ReconfigureParams) -> Result<(), Error> {
         let (tx, rx) = mpsc::sync_channel(0);
         self.job_tx
             .send(Job::Reconfigure { params, done: tx })
@@ -1335,7 +1325,7 @@ impl<T: Send + 'static> Encoder<T> {
     /// シーケンスパラメータ（SPS/PPS または Sequence Header OBU）を取得する
     ///
     /// H.264/HEVC の場合は SPS/PPS、AV1 の場合は Sequence Header OBU を取得します。
-    pub fn get_sequence_params(&mut self) -> Result<Vec<u8>, Error> {
+    pub fn get_sequence_params(&self) -> Result<Vec<u8>, Error> {
         let (tx, rx) = mpsc::sync_channel(0);
         self.job_tx
             .send(Job::GetSequenceParams { done: tx })
@@ -1623,7 +1613,7 @@ mod tests {
             profile: None,
             idr_period: None,
         }));
-        let mut encoder = Encoder::new(config, move |frame| {
+        let encoder = Encoder::new(config, move |frame| {
             let _ = tx.send(frame);
         })
         .expect("failed to create h264 encoder");
@@ -1649,7 +1639,7 @@ mod tests {
             profile: None,
             idr_period: None,
         }));
-        let mut encoder = Encoder::new(config, move |frame| {
+        let encoder = Encoder::new(config, move |frame| {
             let _ = tx.send(frame);
         })
         .expect("failed to create h265 encoder");
@@ -1675,7 +1665,7 @@ mod tests {
             profile: None,
             idr_period: None,
         }));
-        let mut encoder = Encoder::new(config, move |frame| {
+        let encoder = Encoder::new(config, move |frame| {
             let _ = tx.send(frame);
         })
         .expect("failed to create av1 encoder");
@@ -1943,7 +1933,7 @@ mod tests {
         let width = config.width;
         let height = config.height;
 
-        let mut encoder = Encoder::new(config, move |frame| {
+        let encoder = Encoder::new(config, move |frame| {
             let _ = tx.send(frame);
         })
         .expect("failed to create h264 encoder");
@@ -2039,7 +2029,7 @@ mod tests {
             720,
         );
 
-        let mut encoder = Encoder::new(config, move |frame| {
+        let encoder = Encoder::new(config, move |frame| {
             let _ = tx.send(frame);
         })
         .expect("failed to create h264 encoder");
@@ -2111,7 +2101,7 @@ mod tests {
             720,
         );
 
-        let mut encoder = Encoder::new(config, move |frame| {
+        let encoder = Encoder::new(config, move |frame| {
             let _ = tx.send(frame);
         })
         .expect("failed to create h264 encoder");
@@ -2183,7 +2173,7 @@ mod tests {
             480,
         );
 
-        let mut encoder = Encoder::new(config, move |frame| {
+        let encoder = Encoder::new(config, move |frame| {
             let _ = tx.send(frame);
         })
         .expect("failed to create h264 encoder");
@@ -2247,7 +2237,7 @@ mod tests {
             720,
         );
 
-        let mut encoder = Encoder::new(config, move |frame| {
+        let encoder = Encoder::new(config, move |frame| {
             let _ = tx.send(frame);
         })
         .expect("failed to create h264 encoder");
@@ -2311,7 +2301,7 @@ mod tests {
             720,
         );
 
-        let mut encoder = Encoder::new(config, move |frame| {
+        let encoder = Encoder::new(config, move |frame| {
             let _ = tx.send(frame);
         })
         .expect("failed to create h264 encoder");
