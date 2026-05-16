@@ -1389,4 +1389,58 @@ mod tests {
 
         drop(decoder);
     }
+
+    #[test]
+    fn test_decode_after_worker_terminated() {
+        use std::mem::ManuallyDrop;
+
+        let (tx, _rx) = mpsc::sync_channel::<Result<DecodedFrame<()>, Error>>(4);
+        let config = test_decoder_config(DecoderCodec::H264);
+
+        let mut decoder = ManuallyDrop::new(
+            Decoder::new(config, move |frame| {
+                let _ = tx.send(frame);
+            })
+            .unwrap(),
+        );
+
+        unsafe { ManuallyDrop::drop(&mut decoder) };
+
+        let result = decoder.decode(&[], ());
+        assert_eq!(
+            result.unwrap_err().to_string(),
+            "decode() failed: decoder worker thread has terminated"
+        );
+
+        unsafe {
+            ManuallyDrop::drop(&mut decoder);
+        }
+    }
+
+    #[test]
+    fn test_flush_after_decoder_worker_terminated() {
+        use std::mem::ManuallyDrop;
+
+        let (tx, _rx) = mpsc::sync_channel::<Result<DecodedFrame<()>, Error>>(4);
+        let config = test_decoder_config(DecoderCodec::H264);
+
+        let mut decoder = ManuallyDrop::new(
+            Decoder::new(config, move |frame| {
+                let _ = tx.send(frame);
+            })
+            .unwrap(),
+        );
+
+        unsafe { ManuallyDrop::drop(&mut decoder) };
+
+        let result = decoder.flush();
+        assert_eq!(
+            result.unwrap_err().to_string(),
+            "flush() failed: send failed"
+        );
+
+        unsafe {
+            ManuallyDrop::drop(&mut decoder);
+        }
+    }
 }

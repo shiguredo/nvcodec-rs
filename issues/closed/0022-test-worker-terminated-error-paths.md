@@ -1,5 +1,7 @@
 # 0022-test-worker-terminated-error-paths
 
+Completed: 2026-05-16
+Branch: feature/test-worker-terminated-error-paths
 Created: 2026-05-10
 Model: deepseek-v4-pro
 
@@ -115,3 +117,19 @@ std::mem::forget(encoder);
 ## CHANGES.md
 
 テスト追加のみのため、記載は不要。
+
+## 解決方法
+
+`src/encode.rs` と `src/decode.rs` の `#[cfg(test)] mod tests` に、ワーカースレッド終了後のエラーパスを検証する単体テストを追加した。
+
+Encoder 側（4 件）:
+- `test_encode_after_worker_terminated`:  encode() が `"encoder worker thread has terminated"` エラーを返すことを確認
+- `test_flush_after_encoder_worker_terminated`: flush() が `"send failed"` エラーを返すことを確認
+- `test_reconfigure_after_encoder_worker_terminated`: reconfigure() が `"send failed"` エラーを返すことを確認
+- `test_get_sequence_params_after_encoder_worker_terminated`: get_sequence_params() が `"send failed"` エラーを返すことを確認
+
+Decoder 側（2 件）:
+- `test_decode_after_worker_terminated`: decode() が `"decoder worker thread has terminated"` エラーを返すことを確認
+- `test_flush_after_decoder_worker_terminated`: flush() が `"send failed"` エラーを返すことを確認
+
+全テストで `ManuallyDrop` を使用してワーカースレッドを手動終了させ、終了後にメソッド呼び出しを行うパターンを採用した。

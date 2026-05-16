@@ -2382,4 +2382,132 @@ mod tests {
             );
         }
     }
+
+    #[test]
+    fn test_encode_after_worker_terminated() {
+        use std::mem::ManuallyDrop;
+
+        let (tx, _rx) = mpsc::sync_channel::<Result<EncodedFrame<()>, Error>>(4);
+        let config = test_encoder_config(CodecConfig::H264(H264EncoderConfig {
+            profile: None,
+            idr_period: None,
+        }));
+
+        let mut encoder = ManuallyDrop::new(
+            Encoder::new(config, move |frame| {
+                let _ = tx.send(frame);
+            })
+            .unwrap(),
+        );
+
+        unsafe { ManuallyDrop::drop(&mut encoder) };
+
+        let result = encoder.encode(
+            &[],
+            &EncodeOptions {
+                force_intra: false,
+                force_idr: false,
+                output_spspps: false,
+            },
+            (),
+        );
+        assert_eq!(
+            result.unwrap_err().to_string(),
+            "encode() failed: encoder worker thread has terminated"
+        );
+
+        unsafe {
+            ManuallyDrop::drop(&mut encoder);
+        }
+    }
+
+    #[test]
+    fn test_flush_after_encoder_worker_terminated() {
+        use std::mem::ManuallyDrop;
+
+        let (tx, _rx) = mpsc::sync_channel::<Result<EncodedFrame<()>, Error>>(4);
+        let config = test_encoder_config(CodecConfig::H264(H264EncoderConfig {
+            profile: None,
+            idr_period: None,
+        }));
+
+        let mut encoder = ManuallyDrop::new(
+            Encoder::new(config, move |frame| {
+                let _ = tx.send(frame);
+            })
+            .unwrap(),
+        );
+
+        unsafe { ManuallyDrop::drop(&mut encoder) };
+
+        let result = encoder.flush();
+        assert_eq!(
+            result.unwrap_err().to_string(),
+            "flush() failed: send failed"
+        );
+
+        unsafe {
+            ManuallyDrop::drop(&mut encoder);
+        }
+    }
+
+    #[test]
+    fn test_reconfigure_after_encoder_worker_terminated() {
+        use std::mem::ManuallyDrop;
+
+        let (tx, _rx) = mpsc::sync_channel::<Result<EncodedFrame<()>, Error>>(4);
+        let config = test_encoder_config(CodecConfig::H264(H264EncoderConfig {
+            profile: None,
+            idr_period: None,
+        }));
+
+        let mut encoder = ManuallyDrop::new(
+            Encoder::new(config, move |frame| {
+                let _ = tx.send(frame);
+            })
+            .unwrap(),
+        );
+
+        unsafe { ManuallyDrop::drop(&mut encoder) };
+
+        let result = encoder.reconfigure(ReconfigureParams::default());
+        assert_eq!(
+            result.unwrap_err().to_string(),
+            "reconfigure() failed: send failed"
+        );
+
+        unsafe {
+            ManuallyDrop::drop(&mut encoder);
+        }
+    }
+
+    #[test]
+    fn test_get_sequence_params_after_encoder_worker_terminated() {
+        use std::mem::ManuallyDrop;
+
+        let (tx, _rx) = mpsc::sync_channel::<Result<EncodedFrame<()>, Error>>(4);
+        let config = test_encoder_config(CodecConfig::H264(H264EncoderConfig {
+            profile: None,
+            idr_period: None,
+        }));
+
+        let mut encoder = ManuallyDrop::new(
+            Encoder::new(config, move |frame| {
+                let _ = tx.send(frame);
+            })
+            .unwrap(),
+        );
+
+        unsafe { ManuallyDrop::drop(&mut encoder) };
+
+        let result = encoder.get_sequence_params();
+        assert_eq!(
+            result.unwrap_err().to_string(),
+            "get_sequence_params() failed: send failed"
+        );
+
+        unsafe {
+            ManuallyDrop::drop(&mut encoder);
+        }
+    }
 }
