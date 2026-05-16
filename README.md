@@ -65,8 +65,9 @@ DOCS_RS=1 cargo doc --no-deps
 ### エンコード
 
 ```rust
+use std::sync::mpsc;
 use shiguredo_nvcodec::{
-    BufferFormat, CodecConfig, EncodeOptions, Encoder, EncoderConfig,
+    BufferFormat, CodecConfig, EncodeOptions, EncodedFrame, Encoder, EncoderConfig, Error,
     H264EncoderConfig, Preset, TuningInfo, RateControlMode,
 };
 
@@ -91,7 +92,10 @@ let config = EncoderConfig {
     device_id: 0,
 };
 
-let mut encoder = Encoder::new(config)?;
+let (tx, rx) = mpsc::sync_channel(4);
+let encoder = Encoder::new(config, move |frame: Result<EncodedFrame<()>, Error>| {
+    let _ = tx.send(frame);
+})?;
 
 // NV12 フレームデータをエンコード
 let options = EncodeOptions {
@@ -99,7 +103,7 @@ let options = EncodeOptions {
     force_idr: false,
     output_spspps: false,
 };
-encoder.encode(&nv12_data, &options)?;
+encoder.encode(&nv12_data, &options, ())?;
 
 // IDR フレームを強制してエンコード
 let force_idr_options = EncodeOptions {
@@ -107,18 +111,23 @@ let force_idr_options = EncodeOptions {
     force_idr: true,
     output_spspps: false,
 };
-encoder.encode(&nv12_data, &force_idr_options)?;
+encoder.encode(&nv12_data, &force_idr_options, ())?;
+
+// 全エンコード完了を待機
+encoder.flush()?;
 
 // エンコード済みフレームを取得
-while let Some(encoded) = encoder.next_frame() {
-    println!("encoded bytes: {}", encoded.data().len());
+for frame in rx.try_iter() {
+    let frame = frame?;
+    println!("encoded bytes: {}", frame.data().len());
 }
 ```
 
 ### デコード
 
 ```rust
-use shiguredo_nvcodec::{Decoder, DecoderCodec, DecoderConfig, SurfaceFormat};
+use std::sync::mpsc;
+use shiguredo_nvcodec::{DecodedFrame, Decoder, DecoderCodec, DecoderConfig, Error, SurfaceFormat};
 
 let config = DecoderConfig {
     codec: DecoderCodec::H264,
@@ -127,14 +136,21 @@ let config = DecoderConfig {
     max_display_delay: 0,
     surface_format: SurfaceFormat::Nv12,
 };
-let mut decoder = Decoder::new(config)?;
+
+let (tx, rx) = mpsc::sync_channel(4);
+let decoder = Decoder::new(config, move |frame: Result<DecodedFrame<()>, Error>| {
+    let _ = tx.send(frame);
+})?;
 
 // エンコード済みデータをデコード
-decoder.decode(&encoded_data)?;
-decoder.finish()?;
+decoder.decode(&encoded_data, ())?;
+
+// 全デコード完了を待機
+decoder.flush()?;
 
 // デコード済みフレームを取得
-while let Some(frame) = decoder.next_frame()? {
+for frame in rx.try_iter() {
+    let frame = frame?;
     // NV12 フォーマットのデコード結果を取得
     let y_plane = frame.y_plane();
     let uv_plane = frame.uv_plane();
@@ -145,9 +161,9 @@ while let Some(frame) = decoder.next_frame()? {
 ### エンコーダーケーパビリティクエリ
 
 ```rust
-use shiguredo_nvcodec::{Encoder, EncoderCodec};
+use shiguredo_nvcodec::{EncoderCodec, query_encoder_caps};
 
-let caps = Encoder::query_caps(EncoderCodec::H264, 0)?;
+let caps = query_encoder_caps(EncoderCodec::H264, 0)?;
 println!("max width: {}", caps.width_max);
 println!("max height: {}", caps.height_max);
 println!("10-bit encode: {}", caps.support_10bit_encode);
@@ -156,9 +172,9 @@ println!("10-bit encode: {}", caps.support_10bit_encode);
 ### デコーダーケーパビリティクエリ
 
 ```rust
-use shiguredo_nvcodec::{Decoder, DecoderCodec};
+use shiguredo_nvcodec::{DecoderCodec, query_decoder_caps};
 
-let caps = Decoder::query_caps(DecoderCodec::H264, 0)?;
+let caps = query_decoder_caps(DecoderCodec::H264, 0)?;
 println!("supported: {}", caps.is_supported);
 println!("max: {}x{}", caps.max_width, caps.max_height);
 ```
@@ -218,11 +234,6 @@ for i in 0..count {
 | フォーマット | `SurfaceFormat` | 説明 |
 |---|---|---|
 | NV12 | `SurfaceFormat::Nv12` | Semi-Planar YUV 4:2:0 8bit |
-| P016 | `SurfaceFormat::P016` | Semi-Planar YUV 4:2:0 16bit |
-| YUV444 | `SurfaceFormat::Yuv444` | Planar YUV 4:4:4 8bit |
-| YUV444 16bit | `SurfaceFormat::Yuv444_16bit` | Planar YUV 4:4:4 16bit |
-| NV16 | `SurfaceFormat::Nv16` | Semi-Planar YUV 4:2:2 8bit |
-| P216 | `SurfaceFormat::P216` | Semi-Planar YUV 4:2:2 16bit |
 
 ## 動的解像度変更
 
@@ -263,12 +274,17 @@ encoder.reconfigure(ReconfigureParams {
 
 ```rust
 // 解像度が変わっても同じデコーダーで継続可能
-decoder.decode(&data_1080p)?;
-let frame = decoder.next_frame()?.unwrap();
+let (tx, rx) = mpsc::sync_channel(4);
+let decoder = Decoder::new(config, move |frame: Result<DecodedFrame<u32>, Error>| {
+    let _ = tx.send(frame);
+})?;
+
+decoder.decode(&data_1080p, 0)?;
+let frame = rx.recv()??;
 assert_eq!(frame.width(), 1920);
 
-decoder.decode(&data_720p)?;
-let frame = decoder.next_frame()?.unwrap();
+decoder.decode(&data_720p, 1)?;
+let frame = rx.recv()??;
 assert_eq!(frame.width(), 1280);  // 自動的に変更される
 ```
 

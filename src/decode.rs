@@ -1,8 +1,9 @@
+use std::collections::VecDeque;
 use std::ffi::c_void;
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::ptr;
-use std::sync::Mutex;
-use std::sync::mpsc::{self, Receiver, Sender};
+use std::sync::mpsc::{self, Receiver, Sender, SyncSender};
+use std::thread::JoinHandle;
 
 use crate::{CudaLibrary, Error, sys};
 
@@ -77,19 +78,26 @@ pub struct DecoderConfig {
     pub surface_format: SurfaceFormat,
 }
 
-/// デコーダー
-pub struct Decoder {
+struct DecoderState {
     lib: CudaLibrary,
     ctx: sys::CUcontext,
     ctx_lock: sys::CUvideoctxlock,
     parser: sys::CUvideoparser,
-    state: Box<Mutex<DecoderState>>,
-    frame_rx: Receiver<Result<DecodedFrame, Error>>,
+    decoder: sys::CUvideodecoder,
+    width: u32,
+    height: u32,
+    surface_width: u32,
+    surface_height: u32,
+    surface_format: u32,
+    frame_tx: Sender<Result<RawFrame, Error>>,
+    frame_rx: Receiver<Result<RawFrame, Error>>,
 }
 
-impl Decoder {
+unsafe impl Send for DecoderState {}
+
+impl DecoderState {
     /// 指定されたコーデック設定でデコーダーインスタンスを生成する
-    pub fn new(config: DecoderConfig) -> Result<Self, Error> {
+    pub fn new(config: DecoderConfig) -> Result<Box<Self>, Error> {
         let codec_type = match config.codec {
             DecoderCodec::H264 => sys::cudaVideoCodec_enum_cudaVideoCodec_H264,
             DecoderCodec::Hevc => sys::cudaVideoCodec_enum_cudaVideoCodec_HEVC,
@@ -114,7 +122,6 @@ impl Decoder {
         Self::query_caps_with_codec(device_id, codec_type)
     }
 
-    /// 指定コーデックのデコーダのケーパビリティをクエリする
     fn query_caps_with_codec(
         device_id: i32,
         codec_type: sys::cudaVideoCodec,
@@ -157,11 +164,10 @@ impl Decoder {
         }
     }
 
-    /// 指定されたコーデックタイプでデコーダーインスタンスを生成する
     fn new_with_codec(
         codec_type: sys::cudaVideoCodec,
         config: DecoderConfig,
-    ) -> Result<Self, Error> {
+    ) -> Result<Box<Self>, Error> {
         unsafe {
             let lib = CudaLibrary::load()?;
 
@@ -187,8 +193,11 @@ impl Decoder {
             let (frame_tx, frame_rx) = mpsc::channel();
 
             // デコーダーの状態を作成
-            let state = Box::new(Mutex::new(DecoderState {
+            let mut state = Box::new(DecoderState {
                 lib: lib.clone(),
+                ctx,
+                ctx_lock,
+                parser: ptr::null_mut(),
                 decoder: ptr::null_mut(),
                 width: 0,
                 height: 0,
@@ -196,16 +205,15 @@ impl Decoder {
                 surface_height: 0,
                 surface_format: config.surface_format.to_sys(),
                 frame_tx,
-                ctx,
-                ctx_lock,
-            }));
+                frame_rx,
+            });
 
             // 映像パーサーを作成する
             let mut parser_params: sys::CUVIDPARSERPARAMS = std::mem::zeroed();
             parser_params.CodecType = codec_type;
             parser_params.ulMaxNumDecodeSurfaces = config.max_num_decode_surfaces;
             parser_params.ulMaxDisplayDelay = config.max_display_delay;
-            parser_params.pUserData = (&*state) as *const _ as *mut c_void;
+            parser_params.pUserData = state.as_mut() as *const _ as *mut c_void;
             parser_params.pfnSequenceCallback = Some(handle_video_sequence);
             parser_params.pfnDecodePicture = Some(handle_picture_decode);
             parser_params.pfnDisplayPicture = Some(handle_picture_display);
@@ -213,18 +221,14 @@ impl Decoder {
             let mut parser = ptr::null_mut();
             lib.cuvid_create_video_parser(&mut parser, &mut parser_params)?;
 
+            // parser を state に保存する
+            state.parser = parser;
+
             // 成功したのでクリーンアップをキャンセル
             ctx_guard.cancel();
             ctx_lock_guard.cancel();
 
-            Ok(Self {
-                lib,
-                ctx,
-                ctx_lock,
-                parser,
-                state,
-                frame_rx,
-            })
+            Ok(state)
         }
     }
 
@@ -237,7 +241,9 @@ impl Decoder {
             let mut packet: sys::CUVIDSOURCEDATAPACKET = std::mem::zeroed();
             packet.payload = data.as_ptr();
             packet.payload_size = data.len() as u64;
-            packet.flags = 0;
+            // １回のデコードごとに１枚の映像が生成されるはずなので
+            // CUVID_PKT_ENDOFPICTURE を指定する
+            packet.flags = sys::CUvideopacketflags_CUVID_PKT_ENDOFPICTURE as u64;
             packet.timestamp = 0;
 
             self.lib.cuvid_parse_video_data(self.parser, &mut packet)?;
@@ -246,8 +252,7 @@ impl Decoder {
         Ok(())
     }
 
-    /// これ以上データが来ないことをデコーダーに伝える
-    pub fn finish(&mut self) -> Result<(), Error> {
+    pub fn send_eos(&mut self) -> Result<(), Error> {
         unsafe {
             // EOS をデコーダーに伝える
             let mut packet: sys::CUVIDSOURCEDATAPACKET = std::mem::zeroed();
@@ -267,39 +272,21 @@ impl Decoder {
     }
 
     /// デコード済みのフレームを取り出す
-    pub fn next_frame(&mut self) -> Result<Option<DecodedFrame>, Error> {
-        if self.state.is_poisoned() {
-            return Err(Error::new_custom(
-                "next_frame",
-                "decoder state is poisoned (a thread panicked while holding the lock)",
-            ));
-        }
+    pub fn next_frame(&mut self) -> Result<Option<RawFrame>, Error> {
         self.frame_rx.try_recv().ok().transpose()
     }
 }
 
-impl Drop for Decoder {
+impl Drop for DecoderState {
     fn drop(&mut self) {
-        // 非同期デコード処理が完了するまで待機する
-        // finish() が呼ばれていない場合でも、進行中のコールバックが
-        // state や CUDA コンテキストに触れている可能性があるため同期が必要
-        if !self.ctx.is_null() {
-            let _ = self
-                .lib
-                .with_context(self.ctx, || self.lib.cu_ctx_synchronize());
-        }
-
         if !self.parser.is_null() {
             let _ = self.lib.cuvid_destroy_video_parser(self.parser);
         }
 
-        // ここでロック確保に失敗してもできることはないので、成功時にだけ処理を行う
-        if let Ok(state) = self.state.lock()
-            && !state.decoder.is_null()
-        {
+        if !self.decoder.is_null() {
             let _ = self
                 .lib
-                .with_context(self.ctx, || self.lib.cuvid_destroy_decoder(state.decoder));
+                .with_context(self.ctx, || self.lib.cuvid_destroy_decoder(self.decoder));
         }
 
         if !self.ctx_lock.is_null() {
@@ -312,39 +299,92 @@ impl Drop for Decoder {
     }
 }
 
-impl std::fmt::Debug for Decoder {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let state = self.state.lock().ok();
+enum Job<T> {
+    Decode { data: Vec<u8>, user_data: T },
+    Flush { done: SyncSender<()> },
+    Terminate,
+}
 
-        f.debug_struct("Decoder")
-            .field("ctx", &format_args!("{:p}", self.ctx))
-            .field("ctx_lock", &format_args!("{:p}", self.ctx_lock))
-            .field("parser", &format_args!("{:p}", self.parser))
-            .field(
-                "decoder",
-                &state.as_ref().map(|s| format!("{:p}", s.decoder)),
-            )
-            .field("width", &state.as_ref().map(|s| s.width))
-            .field("height", &state.as_ref().map(|s| s.height))
-            .field("surface_width", &state.as_ref().map(|s| s.surface_width))
-            .field("surface_height", &state.as_ref().map(|s| s.surface_height))
-            .finish()
+/// デコーダー
+///
+/// 内部で専用のワーカースレッドを起動し、非同期でデコードを行う。
+/// デコードが完了すると、コンストラクタで渡したコールバックがワーカースレッド上で即座に呼び出される。
+pub struct Decoder<T> {
+    job_tx: SyncSender<Job<T>>,
+    worker: Option<JoinHandle<()>>,
+}
+
+impl<T: Send + 'static> Decoder<T> {
+    /// デコーダーを生成し、内部ワーカースレッドを起動する
+    pub fn new<F>(config: DecoderConfig, mut callback: F) -> Result<Self, Error>
+    where
+        F: FnMut(Result<DecodedFrame<T>, Error>) + Send + 'static,
+    {
+        let (job_tx, job_rx) = mpsc::sync_channel::<Job<T>>(4);
+
+        let state = DecoderState::new(config)?;
+
+        let worker = std::thread::Builder::new()
+            .name("nvcodec-decoder".into())
+            .spawn(move || {
+                run_worker(state, &mut callback, job_rx);
+            })
+            .map_err(|_e| Error::new_custom("Decoder::new", "failed to spawn decoder thread"))?;
+
+        Ok(Self {
+            job_tx,
+            worker: Some(worker),
+        })
+    }
+
+    /// 圧縮された映像フレームをデコードする
+    ///
+    /// フレームデータとユーザーデータをワーカースレッドに送信し、即座に戻る。
+    /// デコードが完了すると、コンストラクタで渡したコールバックが呼び出される。
+    pub fn decode(&self, data: &[u8], user_data: T) -> Result<(), Error> {
+        self.job_tx
+            .send(Job::Decode {
+                data: data.to_vec(),
+                user_data,
+            })
+            .map_err(|_| Error::new_custom("decode", "decoder worker thread has terminated"))
+    }
+
+    /// 送信済みの未完了フレームがすべて完了するまで待機する
+    ///
+    /// すべての pending フレームのコールバックが呼び出された後、このメソッドが戻る。
+    /// flush 後も decode を継続できる。
+    pub fn flush(&self) -> Result<(), Error> {
+        let (tx, rx) = mpsc::sync_channel(0);
+        self.job_tx
+            .send(Job::Flush { done: tx })
+            .map_err(|_| Error::new_custom("flush", "send failed"))?;
+        rx.recv()
+            .map_err(|_| Error::new_custom("flush", "recv failed"))?;
+        Ok(())
     }
 }
 
-unsafe impl Send for Decoder {}
+impl<T> Drop for Decoder<T> {
+    fn drop(&mut self) {
+        let _ = self.job_tx.send(Job::Terminate);
+        if let Some(worker) = self.worker.take() {
+            let _ = worker.join();
+        }
+    }
+}
 
-struct DecoderState {
-    lib: CudaLibrary,
-    decoder: sys::CUvideodecoder,
-    width: u32,
-    height: u32,
-    surface_width: u32,
-    surface_height: u32,
-    surface_format: u32,
-    frame_tx: Sender<Result<DecodedFrame, Error>>,
-    ctx: sys::CUcontext,
-    ctx_lock: sys::CUvideoctxlock,
+impl<T> std::fmt::Debug for Decoder<T> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Decoder").finish_non_exhaustive()
+    }
+}
+
+unsafe impl<T: Send> Send for Decoder<T> {}
+
+/// 指定コーデックのデコーダのケーパビリティをクエリする
+pub fn query_decoder_caps(codec: DecoderCodec, device_id: i32) -> Result<DecoderCaps, Error> {
+    DecoderState::query_caps(codec, device_id)
 }
 
 // パーサーがシーケンスヘッダーを検出した時に呼ばれるコールバック
@@ -356,16 +396,13 @@ unsafe extern "C" fn handle_video_sequence(
         return 0;
     }
 
-    let state_mutex = unsafe { &*(user_data as *const Mutex<DecoderState>) };
+    let state = unsafe { &mut *(user_data as *mut DecoderState) };
 
     // FFI コールバック内の panic はプロセス abort に直結するため catch_unwind で隔離する
     let result = catch_unwind(AssertUnwindSafe(|| {
         let format = unsafe { &*format };
-        let Ok(mut state) = state_mutex.lock() else {
-            return 0;
-        };
 
-        let result = handle_video_sequence_inner(&mut state, format);
+        let result = handle_video_sequence_inner(state, format);
         match result {
             Ok(num_surfaces) => num_surfaces,
             Err(e) => {
@@ -379,12 +416,10 @@ unsafe extern "C" fn handle_video_sequence(
         Ok(v) => v,
         Err(_) => {
             // panic を検知したことを利用側に伝える
-            if let Ok(state) = state_mutex.lock() {
-                let _ = state.frame_tx.send(Err(Error::new_custom(
-                    "handle_video_sequence",
-                    "panic occurred in FFI callback",
-                )));
-            }
+            let _ = state.frame_tx.send(Err(Error::new_custom(
+                "handle_video_sequence",
+                "panic occurred in FFI callback",
+            )));
             0
         }
     }
@@ -466,15 +501,11 @@ unsafe extern "C" fn handle_picture_decode(
         return 0;
     }
 
-    let state_mutex = unsafe { &*(user_data as *const Mutex<DecoderState>) };
+    let state = unsafe { &mut *(user_data as *mut DecoderState) };
 
     // FFI コールバック内の panic はプロセス abort に直結するため catch_unwind で隔離する
     let result = catch_unwind(AssertUnwindSafe(|| {
-        let Ok(mut state) = state_mutex.lock() else {
-            return 0;
-        };
-
-        let result = handle_picture_decode_inner(&mut state, unsafe { &*pic_params });
+        let result = handle_picture_decode_inner(state, unsafe { &*pic_params });
         match result {
             Ok(_) => 1,
             Err(e) => {
@@ -488,12 +519,10 @@ unsafe extern "C" fn handle_picture_decode(
         Ok(v) => v,
         Err(_) => {
             // panic を検知したことを利用側に伝える
-            if let Ok(state) = state_mutex.lock() {
-                let _ = state.frame_tx.send(Err(Error::new_custom(
-                    "handle_picture_decode",
-                    "panic occurred in FFI callback",
-                )));
-            }
+            let _ = state.frame_tx.send(Err(Error::new_custom(
+                "handle_picture_decode",
+                "panic occurred in FFI callback",
+            )));
             0
         }
     }
@@ -528,15 +557,11 @@ unsafe extern "C" fn handle_picture_display(
         return 0;
     }
 
-    let state_mutex = unsafe { &*(user_data as *const Mutex<DecoderState>) };
+    let state = unsafe { &mut *(user_data as *mut DecoderState) };
 
     // FFI コールバック内の panic はプロセス abort に直結するため catch_unwind で隔離する
     let result = catch_unwind(AssertUnwindSafe(|| {
-        let Ok(state) = state_mutex.lock() else {
-            return 0;
-        };
-
-        let result = handle_picture_display_inner(&state, unsafe { &*disp_info });
+        let result = handle_picture_display_inner(state, unsafe { &*disp_info });
         match result {
             Ok(_) => 1,
             Err(e) => {
@@ -550,12 +575,10 @@ unsafe extern "C" fn handle_picture_display(
         Ok(v) => v,
         Err(_) => {
             // panic を検知したことを利用側に伝える
-            if let Ok(state) = state_mutex.lock() {
-                let _ = state.frame_tx.send(Err(Error::new_custom(
-                    "handle_picture_display",
-                    "panic occurred in FFI callback",
-                )));
-            }
+            let _ = state.frame_tx.send(Err(Error::new_custom(
+                "handle_picture_display",
+                "panic occurred in FFI callback",
+            )));
             0
         }
     }
@@ -620,7 +643,7 @@ fn handle_picture_display_inner(
         )?;
 
         // デコード済みフレームを作成
-        Ok(DecodedFrame {
+        Ok(RawFrame {
             width: state.width,
             height: state.height,
             pitch: pitch as usize,
@@ -634,16 +657,26 @@ fn handle_picture_display_inner(
     Ok(())
 }
 
-/// デコードされた映像フレーム (NV12 形式)
+/// 内部用のデコード済み映像フレーム
 #[derive(Debug, Clone)]
-pub struct DecodedFrame {
+struct RawFrame {
     width: u32,
     height: u32,
     pitch: usize,
     data: Vec<u8>,
 }
 
-impl DecodedFrame {
+/// デコードされた映像フレーム (NV12 形式)
+#[derive(Debug, Clone)]
+pub struct DecodedFrame<T> {
+    width: u32,
+    height: u32,
+    pitch: usize,
+    data: Vec<u8>,
+    user_data: T,
+}
+
+impl<T> DecodedFrame<T> {
     /// フレームの Y 成分のデータを返す
     pub fn y_plane(&self) -> &[u8] {
         let y_size = self.pitch * self.height as usize;
@@ -676,11 +709,101 @@ impl DecodedFrame {
     pub fn height(&self) -> usize {
         self.height as usize
     }
+
+    /// ユーザーデータを取得する
+    pub fn user_data(&self) -> &T {
+        &self.user_data
+    }
+
+    /// フレームデータとユーザーデータに分解する（所有権を移動）
+    pub fn into_parts(self) -> (Vec<u8>, T) {
+        (self.data, self.user_data)
+    }
+}
+
+fn run_worker<F, T>(mut state: Box<DecoderState>, callback: &mut F, job_rx: Receiver<Job<T>>)
+where
+    F: FnMut(Result<DecodedFrame<T>, Error>) + Send + 'static,
+    T: Send + 'static,
+{
+    let mut pending_user_data: VecDeque<T> = VecDeque::new();
+
+    loop {
+        match job_rx.recv() {
+            Ok(Job::Decode { data, user_data }) => {
+                if let Err(e) = state.decode(&data) {
+                    callback(Err(e));
+                    continue;
+                }
+
+                pending_user_data.push_back(user_data);
+                drain_frames(&mut state, callback, &mut pending_user_data);
+            }
+            Ok(Job::Flush { done }) => {
+                let _ = state.send_eos();
+
+                drain_frames(&mut state, callback, &mut pending_user_data);
+
+                let _ = done.send(());
+            }
+            Ok(Job::Terminate) | Err(_) => {
+                // 残っている非同期処理を完了させる
+                let _ = state.send_eos();
+
+                drain_frames(&mut state, callback, &mut pending_user_data);
+
+                // state の Drop がここで走り、CUDA リソースが解放される
+                return;
+            }
+        }
+    }
+}
+
+fn drain_frames<F, T>(
+    state: &mut DecoderState,
+    callback: &mut F,
+    pending_user_data: &mut VecDeque<T>,
+) where
+    F: FnMut(Result<DecodedFrame<T>, Error>) + Send + 'static,
+    T: Send + 'static,
+{
+    loop {
+        match state.next_frame() {
+            Ok(None) => {
+                // 結果が存在しなくなったなら終了
+                break;
+            }
+            Ok(Some(raw)) => {
+                if let Some(user_data) = pending_user_data.pop_front() {
+                    callback(Ok(DecodedFrame {
+                        width: raw.width,
+                        height: raw.height,
+                        pitch: raw.pitch,
+                        data: raw.data,
+                        user_data,
+                    }));
+                } else {
+                    // デコード結果が存在するのに対応するユーザーデータが存在しない
+                    // これは通常あり得ないはずだけど、エラーを取りこぼさない為にエラーのコールバックを呼ぶ
+                    callback(Err(Error::new_custom("drain_frames", "missing user data")));
+                    break;
+                }
+            }
+            // エラーが起きたら全てのユーザーデータを削除して
+            // コールバックを呼ぶ
+            Err(e) => {
+                pending_user_data.clear();
+                callback(Err(e));
+                break;
+            }
+        }
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::mpsc;
 
     /// テスト用のデコーダー設定を生成する
     fn test_decoder_config(codec: DecoderCodec) -> DecoderConfig {
@@ -695,46 +818,73 @@ mod tests {
 
     #[test]
     fn init_h264_decoder() {
+        let (_tx, _rx) = mpsc::sync_channel::<Result<DecodedFrame<()>, Error>>(4);
         let config = test_decoder_config(DecoderCodec::H264);
-        let _decoder = Decoder::new(config).expect("Failed to initialize h264 decoder");
+        let _decoder = Decoder::new(config, move |_frame| {
+            let _ = _tx.send(_frame);
+        })
+        .expect("Failed to initialize h264 decoder");
         println!("h264 decoder initialized successfully");
     }
 
     #[test]
     fn init_h265_decoder() {
+        let (_tx, _rx) = mpsc::sync_channel::<Result<DecodedFrame<()>, Error>>(4);
         let config = test_decoder_config(DecoderCodec::Hevc);
-        let _decoder = Decoder::new(config).expect("Failed to initialize h265 decoder");
+        let _decoder = Decoder::new(config, move |_frame| {
+            let _ = _tx.send(_frame);
+        })
+        .expect("Failed to initialize h265 decoder");
         println!("h265 decoder initialized successfully");
     }
 
     #[test]
     fn init_av1_decoder() {
+        let (_tx, _rx) = mpsc::sync_channel::<Result<DecodedFrame<()>, Error>>(4);
         let config = test_decoder_config(DecoderCodec::Av1);
-        let _decoder = Decoder::new(config).expect("Failed to initialize av1 decoder");
+        let _decoder = Decoder::new(config, move |_frame| {
+            let _ = _tx.send(_frame);
+        })
+        .expect("Failed to initialize av1 decoder");
         println!("av1 decoder initialized successfully");
     }
 
     #[test]
     fn init_vp8_decoder() {
+        let (_tx, _rx) = mpsc::sync_channel::<Result<DecodedFrame<()>, Error>>(4);
         let config = test_decoder_config(DecoderCodec::Vp8);
-        let _decoder = Decoder::new(config).expect("Failed to initialize vp8 decoder");
+        let _decoder = Decoder::new(config, move |_frame| {
+            let _ = _tx.send(_frame);
+        })
+        .expect("Failed to initialize vp8 decoder");
         println!("vp8 decoder initialized successfully");
     }
 
     #[test]
     fn init_vp9_decoder() {
+        let (_tx, _rx) = mpsc::sync_channel::<Result<DecodedFrame<()>, Error>>(4);
         let config = test_decoder_config(DecoderCodec::Vp9);
-        let _decoder = Decoder::new(config).expect("Failed to initialize vp9 decoder");
+        let _decoder = Decoder::new(config, move |_frame| {
+            let _ = _tx.send(_frame);
+        })
+        .expect("Failed to initialize vp9 decoder");
         println!("vp9 decoder initialized successfully");
     }
 
     #[test]
     fn test_multiple_decoders() {
         let config = test_decoder_config(DecoderCodec::Hevc);
-        // CUDA 初期化が 1 回だけ実行されることを確認するため、複数のデコーダーを作成
-        let _decoder1 =
-            Decoder::new(config.clone()).expect("Failed to initialize first h265 decoder");
-        let _decoder2 = Decoder::new(config).expect("Failed to initialize second h265 decoder");
+        let (_tx1, _rx1) = mpsc::sync_channel::<Result<DecodedFrame<()>, Error>>(4);
+        let _decoder1 = Decoder::new(config.clone(), move |_frame| {
+            let _ = _tx1.send(_frame);
+        })
+        .expect("Failed to initialize first h265 decoder");
+
+        let (_tx2, _rx2) = mpsc::sync_channel::<Result<DecodedFrame<()>, Error>>(4);
+        let _decoder2 = Decoder::new(config, move |_frame| {
+            let _ = _tx2.send(_frame);
+        })
+        .expect("Failed to initialize second h265 decoder");
         println!("Multiple h265 decoders initialized successfully");
     }
 
@@ -779,21 +929,25 @@ mod tests {
         h265_data.extend_from_slice(&frame_data);
 
         let config = test_decoder_config(DecoderCodec::Hevc);
-        let mut decoder = Decoder::new(config).expect("Failed to create h265 decoder");
+        let (tx, rx) = mpsc::sync_channel::<Result<DecodedFrame<()>, Error>>(4);
+        let decoder = Decoder::new(config, move |frame| {
+            let _ = tx.send(frame);
+        })
+        .expect("Failed to create h265 decoder");
 
         // デコードを実行
         decoder
-            .decode(&h265_data)
+            .decode(&h265_data, ())
             .expect("Failed to decode H.265 data");
 
         // フィニッシュ処理をテスト
-        decoder.finish().expect("Failed to finish decoding");
+        decoder.flush().expect("flush failed");
 
         // デコード済みフレームを取得
-        let frame = decoder
-            .next_frame()
-            .expect("Decoding error occurred")
-            .expect("No decoded frame available");
+        let frame = rx
+            .recv()
+            .expect("No decoded frame available")
+            .expect("Decoding error occurred");
 
         assert_eq!(frame.width(), 640);
         assert_eq!(frame.height(), 480);
@@ -836,6 +990,8 @@ mod tests {
             frame.y_stride()
         );
         println!("Y average: {}, UV average: {}", y_avg, uv_avg);
+
+        drop(decoder);
     }
 
     #[test]
@@ -871,21 +1027,25 @@ mod tests {
         h264_data.extend_from_slice(&frame_data);
 
         let config = test_decoder_config(DecoderCodec::H264);
-        let mut decoder = Decoder::new(config).expect("Failed to create h264 decoder");
+        let (tx, rx) = mpsc::sync_channel::<Result<DecodedFrame<()>, Error>>(4);
+        let decoder = Decoder::new(config, move |frame| {
+            let _ = tx.send(frame);
+        })
+        .expect("Failed to create h264 decoder");
 
         // デコードを実行
         decoder
-            .decode(&h264_data)
+            .decode(&h264_data, ())
             .expect("Failed to decode H.264 data");
 
         // フィニッシュ処理をテスト
-        decoder.finish().expect("Failed to finish decoding");
+        decoder.flush().expect("flush failed");
 
         // デコード済みフレームを取得
-        let frame = decoder
-            .next_frame()
-            .expect("Decoding error occurred")
-            .expect("No decoded frame available");
+        let frame = rx
+            .recv()
+            .expect("No decoded frame available")
+            .expect("Decoding error occurred");
 
         assert_eq!(frame.width(), 640);
         assert_eq!(frame.height(), 480);
@@ -928,6 +1088,8 @@ mod tests {
             frame.y_stride()
         );
         println!("Y average: {}, UV average: {}", y_avg, uv_avg);
+
+        drop(decoder);
     }
 
     #[test]
@@ -942,21 +1104,25 @@ mod tests {
         ];
 
         let config = test_decoder_config(DecoderCodec::Av1);
-        let mut decoder = Decoder::new(config).expect("Failed to create av1 decoder");
+        let (tx, rx) = mpsc::sync_channel::<Result<DecodedFrame<()>, Error>>(4);
+        let decoder = Decoder::new(config, move |frame| {
+            let _ = tx.send(frame);
+        })
+        .expect("Failed to create av1 decoder");
 
         // デコードを実行
         decoder
-            .decode(&av1_data)
+            .decode(&av1_data, ())
             .expect("Failed to decode AV1 data");
 
         // フィニッシュ処理をテスト
-        decoder.finish().expect("Failed to finish decoding");
+        decoder.flush().expect("flush failed");
 
         // デコード済みフレームを取得
-        let frame = decoder
-            .next_frame()
-            .expect("Decoding error occurred")
-            .expect("No decoded frame available");
+        let frame = rx
+            .recv()
+            .expect("No decoded frame available")
+            .expect("Decoding error occurred");
 
         assert_eq!(frame.width(), 640);
         assert_eq!(frame.height(), 480);
@@ -999,6 +1165,8 @@ mod tests {
             frame.y_stride()
         );
         println!("Y average: {}, UV average: {}", y_avg, uv_avg);
+
+        drop(decoder);
     }
 
     #[test]
@@ -1036,21 +1204,25 @@ mod tests {
         ];
 
         let config = test_decoder_config(DecoderCodec::Vp8);
-        let mut decoder = Decoder::new(config).expect("Failed to create vp8 decoder");
+        let (tx, rx) = mpsc::sync_channel::<Result<DecodedFrame<()>, Error>>(4);
+        let decoder = Decoder::new(config, move |frame| {
+            let _ = tx.send(frame);
+        })
+        .expect("Failed to create vp8 decoder");
 
         // デコードを実行
         decoder
-            .decode(&vp8_data)
+            .decode(&vp8_data, ())
             .expect("Failed to decode VP8 data");
 
         // フィニッシュ処理をテスト
-        decoder.finish().expect("Failed to finish decoding");
+        decoder.flush().expect("flush failed");
 
         // デコード済みフレームを取得
-        let frame = decoder
-            .next_frame()
-            .expect("Decoding error occurred")
-            .expect("No decoded frame available");
+        let frame = rx
+            .recv()
+            .expect("No decoded frame available")
+            .expect("Decoding error occurred");
 
         assert_eq!(frame.width(), 640);
         assert_eq!(frame.height(), 480);
@@ -1093,6 +1265,8 @@ mod tests {
             frame.y_stride()
         );
         println!("Y average: {}, UV average: {}", y_avg, uv_avg);
+
+        drop(decoder);
     }
 
     #[test]
@@ -1106,21 +1280,25 @@ mod tests {
         ];
 
         let config = test_decoder_config(DecoderCodec::Vp9);
-        let mut decoder = Decoder::new(config).expect("Failed to create vp9 decoder");
+        let (tx, rx) = mpsc::sync_channel::<Result<DecodedFrame<()>, Error>>(4);
+        let decoder = Decoder::new(config, move |frame| {
+            let _ = tx.send(frame);
+        })
+        .expect("Failed to create vp9 decoder");
 
         // デコードを実行
         decoder
-            .decode(&vp9_data)
+            .decode(&vp9_data, ())
             .expect("Failed to decode VP9 data");
 
         // フィニッシュ処理をテスト
-        decoder.finish().expect("Failed to finish decoding");
+        decoder.flush().expect("flush failed");
 
         // デコード済みフレームを取得
-        let frame = decoder
-            .next_frame()
-            .expect("Decoding error occurred")
-            .expect("No decoded frame available");
+        let frame = rx
+            .recv()
+            .expect("No decoded frame available")
+            .expect("Decoding error occurred");
 
         assert_eq!(frame.width(), 640);
         assert_eq!(frame.height(), 480);
@@ -1163,5 +1341,7 @@ mod tests {
             frame.y_stride()
         );
         println!("Y average: {}, UV average: {}", y_avg, uv_avg);
+
+        drop(decoder);
     }
 }
