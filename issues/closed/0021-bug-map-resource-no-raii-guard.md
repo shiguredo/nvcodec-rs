@@ -1,5 +1,7 @@
 # 0021-bug-map-resource-no-raii-guard
 
+Completed: 2026-05-16
+Branch: feature/fix-map-resource-raii-guard
 Created: 2026-05-10
 Model: DeepSeek v4-pro
 
@@ -151,3 +153,7 @@ fn encode_frame(
 - 変更後は `CHANGES.md` の `## develop` セクションに以下を追記する:
   - `- [FIX] encode_frame 内で map_resource の後始末に ReleaseGuard を使用し、エラー発生時に自動で unmap されるようにする`
   - `  - @melpon`
+
+## 解決方法
+
+`src/encode.rs` の `encode_frame_inner` で、`map_resource` 成功後に `ReleaseGuard` による RAII パターンを導入した。エンコード失敗時は `ReleaseGuard` の drop により自動的に `nvEncUnmapInputResource` が呼ばれ、成功時は `cancel()` でリソースを mapped 状態に保つ。これにより割り当てられたリソースのクリーンアップが `encode_frame_inner` 内で自己完結するようになった。
