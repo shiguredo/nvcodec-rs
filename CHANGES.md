@@ -11,6 +11,12 @@
 
 ## develop
 
+- [UPDATE] `EncoderState` の CUDA コンテキスト管理を `with_context` パターンに統一する
+  - `encode_frame`, `lock_and_copy_bitstream`, `send_eos`, `unmap_resource` でコンテキスト管理を自己完結させる
+  - `run_worker` と `drain_one_with_ctx` から手動の `cuCtxPushCurrent` / `cuCtxPopCurrent` を除去する
+  - `drain_one_with_ctx` を `drain_one` にリネームする
+  - これにより `.expect()` パニックの温床が消滅し、issue 0016 も自然解決する
+  - @melpon
 - [ADD] `EncodedFrame<T>` 構造体を追加する
   - `user_data: T` フィールドを持ち、エンコード完了時に任意のユーザーデータを callback 経由で受け取れるようにする
   - `into_parts()` メソッドでデータとユーザーデータに分解できる

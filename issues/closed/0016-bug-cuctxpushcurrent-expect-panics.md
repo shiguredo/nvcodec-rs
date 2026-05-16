@@ -1,5 +1,7 @@
 # 0016-bug-cuctxpushcurrent-expect-panics
 
+Completed: 2026-05-16
+Branch: feature/change-unify-cuda-context
 Created: 2026-05-10
 Model: DeepSeek v4-pro
 
@@ -97,3 +99,9 @@ issue 0019 で `encode_frame`、`lock_and_copy_bitstream`、`send_eos` が `with
     issue 0022 の担当範囲とする
 - PBT / Fuzzing は不要（この修正は既存の `with_context` パターンの適用範囲拡大であり、
   新たなロジックを追加しないため）
+
+## 解決方法
+
+issue 0019 (`with_context` 統一) の完了により、`run_worker` と `drain_one_with_ctx` 内の手動 `cuCtxPushCurrent` / `cuCtxPopCurrent` 呼び出しがすべて除去された。これにより本 issue が対象としていた `.expect()` パニックの温床もすべて消滅した。
+
+`encode_frame`, `lock_and_copy_bitstream`, `send_eos`, `unmap_resource` の各メソッドが `with_context` で自己完結するようになり、エラーは `Result` 経由で適切に伝播する。

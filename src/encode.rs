@@ -1041,6 +1041,14 @@ impl EncoderState {
     }
 
     fn unmap_resource(&mut self, bfr_idx: usize) {
+        let lib = self.lib.clone();
+        let _ = lib.with_context(self.ctx, || {
+            self.unmap_resource_inner(bfr_idx);
+            Ok(())
+        });
+    }
+
+    fn unmap_resource_inner(&mut self, bfr_idx: usize) {
         unsafe {
             let Some(mapped) = self.mapped_inputs[bfr_idx].take() else {
                 return;
@@ -1053,6 +1061,16 @@ impl EncoderState {
     }
 
     fn encode_frame(
+        &mut self,
+        bfr_idx: usize,
+        data: &[u8],
+        options: &EncodeOptions,
+    ) -> Result<(), Error> {
+        let lib = self.lib.clone();
+        lib.with_context(self.ctx, || self.encode_frame_inner(bfr_idx, data, options))
+    }
+
+    fn encode_frame_inner(
         &mut self,
         bfr_idx: usize,
         data: &[u8],
@@ -1097,7 +1115,12 @@ impl EncoderState {
                 .nvEncEncodePicture
                 .map(|f| f(self.h_encoder, &mut pic_params))
                 .unwrap_or(sys::_NVENCSTATUS_NV_ENC_ERR_INVALID_PTR);
-            Error::check_nvenc(status, "nvEncEncodePicture")?;
+
+            if let Err(e) = Error::check_nvenc(status, "nvEncEncodePicture") {
+                // エンコード失敗時は mapped resource を unmap する
+                self.unmap_resource_inner(bfr_idx);
+                return Err(e);
+            }
 
             Ok(())
         }
@@ -1107,54 +1130,61 @@ impl EncoderState {
         &self,
         bfr_idx: usize,
     ) -> Result<(Vec<u8>, u64, PictureType), Error> {
-        unsafe {
-            let mut lock_bitstream: sys::NV_ENC_LOCK_BITSTREAM = std::mem::zeroed();
-            lock_bitstream.version = sys::NV_ENC_LOCK_BITSTREAM_VER;
-            lock_bitstream.outputBitstream = self.bitstream_buffers[bfr_idx];
+        self.lib.with_context(self.ctx, || {
+            unsafe {
+                let mut lock_bitstream: sys::NV_ENC_LOCK_BITSTREAM = std::mem::zeroed();
+                lock_bitstream.version = sys::NV_ENC_LOCK_BITSTREAM_VER;
+                lock_bitstream.outputBitstream = self.bitstream_buffers[bfr_idx];
 
-            let status = self
-                .encoder
-                .nvEncLockBitstream
-                .map(|f| f(self.h_encoder, &mut lock_bitstream))
-                .unwrap_or(sys::_NVENCSTATUS_NV_ENC_ERR_INVALID_PTR);
-            Error::check_nvenc(status, "nvEncLockBitstream")?;
+                let status = self
+                    .encoder
+                    .nvEncLockBitstream
+                    .map(|f| f(self.h_encoder, &mut lock_bitstream))
+                    .unwrap_or(sys::_NVENCSTATUS_NV_ENC_ERR_INVALID_PTR);
+                Error::check_nvenc(status, "nvEncLockBitstream")?;
 
-            // どの分岐でも必ず unlock するためのガード
-            let unlock_fn = self.encoder.nvEncUnlockBitstream;
-            let h_encoder = self.h_encoder;
-            let output_bitstream = lock_bitstream.outputBitstream;
-            let _unlock_guard = ReleaseGuard::new(move || {
-                if let Some(f) = unlock_fn {
-                    let _ = f(h_encoder, output_bitstream);
+                // どの分岐でも必ず unlock するためのガード
+                let unlock_fn = self.encoder.nvEncUnlockBitstream;
+                let h_encoder = self.h_encoder;
+                let output_bitstream = lock_bitstream.outputBitstream;
+                let _unlock_guard = ReleaseGuard::new(move || {
+                    if let Some(f) = unlock_fn {
+                        let _ = f(h_encoder, output_bitstream);
+                    }
+                });
+
+                // ビットストリームがロックされている間にエンコード済みデータをコピー
+                let ptr = lock_bitstream.bitstreamBufferPtr as *const u8;
+                let size = lock_bitstream.bitstreamSizeInBytes as usize;
+
+                if ptr.is_null() {
+                    return Err(Error::new_custom(
+                        "nvEncLockBitstream",
+                        "bitstreamBufferPtr is null",
+                    ));
                 }
-            });
 
-            // ビットストリームがロックされている間にエンコード済みデータをコピー
-            let ptr = lock_bitstream.bitstreamBufferPtr as *const u8;
-            let size = lock_bitstream.bitstreamSizeInBytes as usize;
+                let data = if size == 0 {
+                    Vec::new()
+                } else {
+                    std::slice::from_raw_parts(ptr, size).to_vec()
+                };
 
-            if ptr.is_null() {
-                return Err(Error::new_custom(
-                    "nvEncLockBitstream",
-                    "bitstreamBufferPtr is null",
-                ));
+                let timestamp = lock_bitstream.outputTimeStamp;
+                let picture_type = PictureType::new(lock_bitstream.pictureType);
+
+                Ok((data, timestamp, picture_type))
             }
-
-            let data = if size == 0 {
-                Vec::new()
-            } else {
-                std::slice::from_raw_parts(ptr, size).to_vec()
-            };
-
-            let timestamp = lock_bitstream.outputTimeStamp;
-            let picture_type = PictureType::new(lock_bitstream.pictureType);
-
-            Ok((data, timestamp, picture_type))
-        }
+        })
     }
 
     /// エンコーダーを終了し、残りのフレームを取得する
     fn send_eos(&mut self) -> Result<(), Error> {
+        let lib = self.lib.clone();
+        lib.with_context(self.ctx, || self.send_eos_inner())
+    }
+
+    fn send_eos_inner(&mut self) -> Result<(), Error> {
         unsafe {
             let mut pic_params: sys::NV_ENC_PIC_PARAMS = std::mem::zeroed();
             pic_params.version = sys::NV_ENC_PIC_PARAMS_VER;
@@ -1416,20 +1446,12 @@ where
             }) => {
                 // バッファが満杯なら、古いフレームを drain して空ける
                 while state.i_to_send - state.i_got >= state.n_encoder_buffer {
-                    drain_one_with_ctx(&mut state, &mut pending_user_data, callback);
+                    drain_one(&mut state, &mut pending_user_data, callback);
                 }
 
                 let bfr_idx = state.i_to_send % state.n_encoder_buffer;
 
-                let lib = state.lib.clone();
-                let ctx = state.ctx;
-                lib.cu_ctx_push_current(ctx)
-                    .expect("cuCtxPushCurrent in encode");
-
                 let encode_result = state.encode_frame(bfr_idx, &data, &options);
-
-                let mut popped = ptr::null_mut();
-                let _ = lib.cu_ctx_pop_current(&mut popped);
 
                 match encode_result {
                     Ok(()) => {
@@ -1438,17 +1460,11 @@ where
 
                         // 完了済みフレームを drain（delay window 制御）
                         while state.i_got + state.n_output_delay < state.i_to_send {
-                            drain_one_with_ctx(&mut state, &mut pending_user_data, callback);
+                            drain_one(&mut state, &mut pending_user_data, callback);
                         }
                     }
                     Err(e) => {
-                        // フレームの送信に失敗した。unmap してエラー通知
-                        let lib = state.lib.clone();
-                        let ctx = state.ctx;
-                        let _ = lib.cu_ctx_push_current(ctx);
-                        state.unmap_resource(bfr_idx);
-                        let mut popped = ptr::null_mut();
-                        let _ = lib.cu_ctx_pop_current(&mut popped);
+                        // encode_frame_inner 内で unmap 済み
                         callback(Err(e));
                     }
                 }
@@ -1457,7 +1473,7 @@ where
                 // 全 in-flight フレームを drain してから reconfigure を実行する
                 // バッファプール再構築との競合を防ぐ
                 while state.i_got < state.i_to_send {
-                    drain_one_with_ctx(&mut state, &mut pending_user_data, callback);
+                    drain_one(&mut state, &mut pending_user_data, callback);
                 }
                 let _ = done.send(state.reconfigure(params));
             }
@@ -1467,23 +1483,17 @@ where
             Ok(Job::Flush { done }) => {
                 // 保留中の全フレームを drain
                 while state.i_got < state.i_to_send {
-                    drain_one_with_ctx(&mut state, &mut pending_user_data, callback);
+                    drain_one(&mut state, &mut pending_user_data, callback);
                 }
                 let _ = done.send(());
             }
             Ok(Job::Terminate) | Err(_) => {
                 // EOS 送信
-                let lib = state.lib.clone();
-                let ctx = state.ctx;
-                lib.cu_ctx_push_current(ctx)
-                    .expect("cuCtxPushCurrent in terminate");
                 let _ = state.send_eos();
-                let mut popped = ptr::null_mut();
-                let _ = lib.cu_ctx_pop_current(&mut popped);
 
                 // 残り全 drain
                 while state.i_got < state.i_to_send {
-                    drain_one_with_ctx(&mut state, &mut pending_user_data, callback);
+                    drain_one(&mut state, &mut pending_user_data, callback);
                 }
 
                 return;
@@ -1492,25 +1502,14 @@ where
     }
 }
 
-fn drain_one_with_ctx<F, T>(
-    state: &mut EncoderState,
-    pending_user_data: &mut VecDeque<T>,
-    callback: &mut F,
-) where
+fn drain_one<F, T>(state: &mut EncoderState, pending_user_data: &mut VecDeque<T>, callback: &mut F)
+where
     F: FnMut(Result<EncodedFrame<T>, Error>) + Send + 'static,
     T: Send + 'static,
 {
     let bfr_idx = state.i_got % state.n_encoder_buffer;
 
-    let lib = state.lib.clone();
-    let ctx = state.ctx;
-    lib.cu_ctx_push_current(ctx)
-        .expect("cuCtxPushCurrent in drain_one");
-
     let lock_result = state.lock_and_copy_bitstream(bfr_idx);
-
-    let mut popped = ptr::null_mut();
-    let _ = lib.cu_ctx_pop_current(&mut popped);
 
     match lock_result {
         Ok((data, timestamp, picture_type)) => {
@@ -1533,12 +1532,7 @@ fn drain_one_with_ctx<F, T>(
     }
 
     // unmap してリソースを解放（次回の map_resource で再利用可能にする）
-    let lib = state.lib.clone();
-    let ctx = state.ctx;
-    let _ = lib.cu_ctx_push_current(ctx);
     state.unmap_resource(bfr_idx);
-    let mut popped = ptr::null_mut();
-    let _ = lib.cu_ctx_pop_current(&mut popped);
 
     state.i_got += 1;
 }
