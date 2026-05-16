@@ -1,6 +1,8 @@
 # 0019-fmt-unify-cuda-context-management
 
 Created: 2026-05-10
+Completed: 2026-05-16
+Branch: feature/change-unify-cuda-context
 Model: DeepSeek v4-pro
 
 ## 背景
@@ -262,3 +264,21 @@ fn drain_one<F, T>(...) {
 - [UPDATE] `EncoderState` の CUDA コンテキスト管理を `with_context` パターンに統一する
   - `encode_frame`, `lock_and_copy_bitstream`, `send_eos`, `unmap_resource` でコンテキスト管理を自己完結させる
   - `run_worker` と `drain_one_with_ctx` から手動の `cuCtxPushCurrent` / `cuCtxPopCurrent` を除去する
+
+## 解決方法
+
+`src/encode.rs` の CUDA コンテキスト管理を `with_context` パターンに統一した:
+
+1. `encode_frame` をラッパー + `encode_frame_inner` に分割。ラッパーが `with_context` を呼び、inner が実際の処理を行う。inner は `nvEncEncodePicture` 失敗時に `unmap_resource_inner` で mapped resource を適切に解放する。
+
+2. `lock_and_copy_bitstream` を `with_context` でラップ。`&self` メソッドのため clone 不要。
+
+3. `send_eos` をラッパー + `send_eos_inner` に分割。
+
+4. `unmap_resource` をラッパー + `unmap_resource_inner` に分割。inner は `cleanup_buffer_pool` や `encode_frame_inner` のエラーパスから直接呼べる。
+
+5. `run_worker` から手動の `cuCtxPushCurrent` / `cuCtxPopCurrent` ブロックをすべて除去。
+
+6. `drain_one_with_ctx` → `drain_one` にリネームし、手動 push/pop を除去。
+
+これにより `.expect()` パニックの温床となっていた手動コンテキスト管理が消滅し、issue 0016 の修正も自然解決する。
