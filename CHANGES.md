@@ -31,6 +31,12 @@
 - [CHANGE] `Encoder::query_caps()`, `Decoder::query_caps()` をリネームする
   - `query_encoder_caps()` 及び `query_decoder_caps()` にリネーム
   - @melpon
+- [FIX] エンコーダーの解像度変更時にバッファプールと pitch が再構築されない問題を修正する
+  - `reconfigure_inner` で `self.pitch` とバッファプール（`device_inputs` / `registered_resources` / `bitstream_buffers`）を解像度変更時に更新する
+  - `run_worker` の `Job::Reconfigure` 分岐で in-flight フレームを全て drain してから reconfigure を実行する
+  - `cleanup_buffer_pool` を idempotent 化（再呼び出し時にパニックしない）
+  - `Encoder::reconfigure` の doc コメントに解像度変更後の IDR フレーム送出要件を追記する
+  - @melpon
 
 ## 2026.1.0
 
