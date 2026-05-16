@@ -1,5 +1,7 @@
 # 0018-bug-drain-error-silently-dropped
 
+Completed: 2026-05-16
+Branch: feature/fix-drain-error-handling
 Created: 2026-05-10
 Model: deepseek-v4-pro
 
@@ -94,3 +96,12 @@ Err(e) => {
 ## 前提条件
 
 **issue 0020 が先に適用されていること**。0020 未適用の状態で本修正のみを適用すると、Ok パスの `.expect()` でパニックが発生する（詳細は「修正方針」セクション参照）。
+
+## 解決方法
+
+`src/encode.rs` の `drain_one` 関数の `Err(e)` マッチアームを修正した:
+
+1. `if let Some(_user_data)` ガードを外し、`pending_user_data` の状態にかかわらず必ず `callback(Err(e))` を呼ぶようにした
+2. 後続の drain での不整合を防ぐため、`pending_user_data.clear()` で残存 user_data を破棄する
+
+これにより `lock_and_copy_bitstream` エラー時にコールバックが呼ばれない問題が解消された。

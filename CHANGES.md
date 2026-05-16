@@ -47,6 +47,10 @@
   - 新しいデコーダーを作成してから古いデコーダーを破棄する順序に変更する
   - `display_area` 検証をデコーダー作成より先に実行する
   - @melpon
+- [FIX] `drain_one` のエラーハンドリングを改善する
+  - Ok パスから `.expect()` を除去し、`pending_user_data` が空の場合はエラーコールバックで通知する
+  - Err パスで `pending_user_data` の状態にかかわらず必ずエラーを通知し、残存 user_data を破棄する
+  - @melpon
 
 ## 2026.1.0
 
