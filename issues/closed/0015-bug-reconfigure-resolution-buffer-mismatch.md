@@ -1,6 +1,8 @@
 # 0015-bug-reconfigure-resolution-buffer-mismatch
 
 Created: 2026-05-10
+Completed: 2026-05-16
+Branch: feature/fix-reconfigure-buffer-mismatch
 Model: deepseek-v4-pro
 
 ## 優先度
@@ -113,3 +115,26 @@ fn cleanup_buffer_pool(&mut self) {
   - エンコード中に `reconfigure` を発行し、全フレームが正しく完了することを確認する（パイプライン競合のテスト）
   - テスト用の `EncoderConfig` には `max_encode_width` / `max_encode_height` を明示的に大きな値で指定すること
 - PBT は不要（単体テストで境界値をカバーできるため）
+
+## 解決方法
+
+`src/encode.rs` に以下の修正を行った:
+
+1. **`cleanup_buffer_pool` を idempotent にする**: `device_inputs` が空の場合は早期リターンし、クリーンアップ後に全ベクタを `clear()` し `mapped_inputs` を `fill(None)` でリセットするようにした。これにより `Drop` からの再呼び出しや `reconfigure_inner` 内での再構築が安全になる。
+
+2. **`reconfigure_inner` で `self.pitch` を更新**: 幅が変更された場合に `self.pitch = self.buffer_format_enum.bytes_per_row(self.width)?` を実行し、NVENC に正しい pitch 値が渡されるようにした。
+
+3. **`reconfigure_inner` でバッファプールを再構築**: 解像度変更時（`params.width.is_some() || params.height.is_some()`）に `self.cleanup_buffer_pool()` → `self.init_buffer_pool()` を呼び、新しい解像度に対応する GPU メモリバッファを再割り当てするようにした。
+
+4. **`run_worker` の `Job::Reconfigure` 分岐で in-flight フレームを drain**: `state.i_got < state.i_to_send` の間 `drain_one_with_ctx` を呼び、全 in-flight フレームを完了させてから `reconfigure` を実行するようにした。これによりバッファプール再構築と後続の `drain_one_with_ctx` の競合（use-after-free）を防ぐ。
+
+5. **`Encoder::reconfigure` の doc コメントに警告を追加**: 解像度変更後の最初のエンコードフレームには `force_idr: true, output_spspps: true` を指定する必要があることを明記した。
+
+### 追加したテスト
+
+- `test_reconfigure_resolution_upscale_h264`: 640x480 → 1280x720 への解像度拡大
+- `test_reconfigure_resolution_downscale_h264`: 1280x720 → 640x480 への解像度縮小
+- `test_reconfigure_width_only_h264`: 幅のみの変更（640→960）
+- `test_reconfigure_height_only_h264`: 高さのみの変更（480→720）
+- `test_reconfigure_during_encoding_h264`: in-flight フレームが存在する状態での reconfigure（パイプライン競合の検証）
+- テスト用の `test_encoder_config_with_max_resolution` および `create_black_frame` ヘルパー関数を追加

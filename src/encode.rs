@@ -746,6 +746,11 @@ impl EncoderState {
             self.init_params = reconfig_params.reInitEncodeParams;
             self.init_params.encodeConfig = &mut self.encode_config;
 
+            let old_width = self.width;
+            let old_height = self.height;
+            let old_pitch = self.pitch;
+            let old_expected_frame_size = self.expected_frame_size;
+
             if let Some(width) = params.width {
                 self.width = width;
             }
@@ -756,6 +761,19 @@ impl EncoderState {
                 self.expected_frame_size = self
                     .buffer_format_enum
                     .frame_size(self.width, self.height)?;
+
+                if params.width.is_some() {
+                    self.pitch = self.buffer_format_enum.bytes_per_row(self.width)?;
+                }
+
+                self.cleanup_buffer_pool();
+                if let Err(e) = self.init_buffer_pool() {
+                    self.width = old_width;
+                    self.height = old_height;
+                    self.pitch = old_pitch;
+                    self.expected_frame_size = old_expected_frame_size;
+                    return Err(e);
+                }
             }
             if let Some(fps_den) = params.framerate_den {
                 self.framerate_den = fps_den as u64;
@@ -975,6 +993,9 @@ impl EncoderState {
     }
 
     fn cleanup_buffer_pool(&mut self) {
+        if self.device_inputs.is_empty() {
+            return; // 既にクリーンアップ済み
+        }
         let _ = self.lib.with_context(self.ctx, || {
             for i in 0..self.n_encoder_buffer {
                 if let Some(mapped) = self.mapped_inputs[i].take() {
@@ -995,6 +1016,10 @@ impl EncoderState {
             }
             Ok(())
         });
+        self.device_inputs.clear();
+        self.registered_resources.clear();
+        self.bitstream_buffers.clear();
+        self.mapped_inputs.fill(None);
     }
 
     fn map_resource(&mut self, bfr_idx: usize) -> Result<sys::NV_ENC_INPUT_PTR, Error> {
@@ -1247,8 +1272,12 @@ impl<T: Send + 'static> Encoder<T> {
 
     /// エンコーダパラメータを再構成する
     ///
-    /// ビットレートやフレームレートを動的に変更する。
+    /// ビットレートやフレームレート、解像度を動的に変更する。
     /// エンコーダの初期化時に設定された値を基準に、指定されたパラメータのみを上書きする。
+    ///
+    /// 解像度を変更した直後の最初のエンコードフレームには、呼び出し元が
+    /// `EncodeOptions { force_idr: true, output_spspps: true, .. }` を指定する必要がある。
+    /// これを怠ると新しい解像度の SPS/PPS がビットストリームに出力されず、デコーダーが再生不能になる。
     pub fn reconfigure(&mut self, params: ReconfigureParams) -> Result<(), Error> {
         let (tx, rx) = mpsc::sync_channel(0);
         self.job_tx
@@ -1425,6 +1454,11 @@ where
                 }
             }
             Ok(Job::Reconfigure { params, done }) => {
+                // 全 in-flight フレームを drain してから reconfigure を実行する
+                // バッファプール再構築との競合を防ぐ
+                while state.i_got < state.i_to_send {
+                    drain_one_with_ctx(&mut state, &mut pending_user_data, callback);
+                }
                 let _ = done.send(state.reconfigure(params));
             }
             Ok(Job::GetSequenceParams { done }) => {
@@ -1944,5 +1978,400 @@ mod tests {
         let first = frames[0].as_ref().expect("First frame should be Ok");
         assert_eq!(first.user_data, 1);
         assert!(!first.data().is_empty(), "Encoded frame should have data");
+    }
+
+    /// 解像度変更用のエンコーダー設定を生成する
+    /// max_encode_width / max_encode_height を初期解像度より大きく指定する
+    fn test_encoder_config_with_max_resolution(
+        codec: CodecConfig,
+        width: u32,
+        height: u32,
+        max_width: u32,
+        max_height: u32,
+    ) -> EncoderConfig {
+        EncoderConfig {
+            codec,
+            width,
+            height,
+            max_encode_width: Some(max_width),
+            max_encode_height: Some(max_height),
+            framerate_num: 30,
+            framerate_den: 1,
+            average_bitrate: Some(5_000_000),
+            preset: Preset::P4,
+            tuning_info: TuningInfo::LOW_LATENCY,
+            rate_control_mode: RateControlMode::Vbr,
+            gop_length: None,
+            frame_interval_p: 1,
+            buffer_format: BufferFormat::Nv12,
+            device_id: 0,
+        }
+    }
+
+    /// 指定された解像度の NV12 黒フレームを作成する
+    fn create_black_frame(width: u32, height: u32) -> Vec<u8> {
+        let y_size = (width * height) as usize;
+        let uv_size = (width * height / 2) as usize;
+        let mut frame = vec![16u8; y_size + uv_size];
+        frame[y_size..].fill(128);
+        frame
+    }
+
+    #[test]
+    fn test_reconfigure_resolution_upscale_h264() {
+        let (tx, rx) = mpsc::sync_channel::<Result<EncodedFrame<u32>, Error>>(8);
+        let config = test_encoder_config_with_max_resolution(
+            CodecConfig::H264(H264EncoderConfig {
+                profile: None,
+                idr_period: None,
+            }),
+            640,
+            480,
+            1280,
+            720,
+        );
+
+        let mut encoder = Encoder::new(config, move |frame| {
+            let _ = tx.send(frame);
+        })
+        .expect("failed to create h264 encoder");
+
+        // 初期解像度でエンコード
+        let frame_640x480 = create_black_frame(640, 480);
+        encoder
+            .encode(
+                &frame_640x480,
+                &EncodeOptions {
+                    force_intra: false,
+                    force_idr: true,
+                    output_spspps: true,
+                },
+                1,
+            )
+            .expect("failed to encode frame at 640x480");
+
+        // 解像度を 1280x720 に拡大
+        encoder
+            .reconfigure(ReconfigureParams {
+                width: Some(1280),
+                height: Some(720),
+                ..Default::default()
+            })
+            .expect("failed to reconfigure to 1280x720");
+
+        // 新解像度でエンコード
+        let frame_1280x720 = create_black_frame(1280, 720);
+        encoder
+            .encode(
+                &frame_1280x720,
+                &EncodeOptions {
+                    force_intra: false,
+                    force_idr: true,
+                    output_spspps: true,
+                },
+                2,
+            )
+            .expect("failed to encode frame at 1280x720");
+
+        encoder.flush().expect("flush failed");
+        drop(encoder);
+
+        let frames: Vec<_> = rx.try_iter().collect();
+        assert!(
+            frames.len() >= 2,
+            "Expected at least 2 encoded frames, got {}",
+            frames.len()
+        );
+
+        for frame in &frames {
+            let frame = frame.as_ref().expect("Frame should be Ok");
+            assert!(!frame.data().is_empty(), "Frame should have data");
+        }
+    }
+
+    #[test]
+    fn test_reconfigure_resolution_downscale_h264() {
+        let (tx, rx) = mpsc::sync_channel::<Result<EncodedFrame<u32>, Error>>(8);
+        let config = test_encoder_config_with_max_resolution(
+            CodecConfig::H264(H264EncoderConfig {
+                profile: None,
+                idr_period: None,
+            }),
+            1280,
+            720,
+            1280,
+            720,
+        );
+
+        let mut encoder = Encoder::new(config, move |frame| {
+            let _ = tx.send(frame);
+        })
+        .expect("failed to create h264 encoder");
+
+        // 初期解像度でエンコード
+        let frame_1280x720 = create_black_frame(1280, 720);
+        encoder
+            .encode(
+                &frame_1280x720,
+                &EncodeOptions {
+                    force_intra: false,
+                    force_idr: true,
+                    output_spspps: true,
+                },
+                1,
+            )
+            .expect("failed to encode frame at 1280x720");
+
+        // 解像度を 640x480 に縮小
+        encoder
+            .reconfigure(ReconfigureParams {
+                width: Some(640),
+                height: Some(480),
+                ..Default::default()
+            })
+            .expect("failed to reconfigure to 640x480");
+
+        // 新解像度でエンコード
+        let frame_640x480 = create_black_frame(640, 480);
+        encoder
+            .encode(
+                &frame_640x480,
+                &EncodeOptions {
+                    force_intra: false,
+                    force_idr: true,
+                    output_spspps: true,
+                },
+                2,
+            )
+            .expect("failed to encode frame at 640x480");
+
+        encoder.flush().expect("flush failed");
+        drop(encoder);
+
+        let frames: Vec<_> = rx.try_iter().collect();
+        assert!(
+            frames.len() >= 2,
+            "Expected at least 2 encoded frames, got {}",
+            frames.len()
+        );
+
+        for frame in &frames {
+            let frame = frame.as_ref().expect("Frame should be Ok");
+            assert!(!frame.data().is_empty(), "Frame should have data");
+        }
+    }
+
+    #[test]
+    fn test_reconfigure_width_only_h264() {
+        let (tx, rx) = mpsc::sync_channel::<Result<EncodedFrame<u32>, Error>>(8);
+        let config = test_encoder_config_with_max_resolution(
+            CodecConfig::H264(H264EncoderConfig {
+                profile: None,
+                idr_period: None,
+            }),
+            640,
+            480,
+            960,
+            480,
+        );
+
+        let mut encoder = Encoder::new(config, move |frame| {
+            let _ = tx.send(frame);
+        })
+        .expect("failed to create h264 encoder");
+
+        // 初期解像度でエンコード
+        encoder
+            .encode(
+                &create_black_frame(640, 480),
+                &EncodeOptions {
+                    force_intra: false,
+                    force_idr: true,
+                    output_spspps: true,
+                },
+                1,
+            )
+            .expect("failed to encode frame at 640x480");
+
+        // 幅のみ変更
+        encoder
+            .reconfigure(ReconfigureParams {
+                width: Some(960),
+                ..Default::default()
+            })
+            .expect("failed to reconfigure width to 960");
+
+        // 新解像度でエンコード
+        encoder
+            .encode(
+                &create_black_frame(960, 480),
+                &EncodeOptions {
+                    force_intra: false,
+                    force_idr: true,
+                    output_spspps: true,
+                },
+                2,
+            )
+            .expect("failed to encode frame at 960x480");
+
+        encoder.flush().expect("flush failed");
+        drop(encoder);
+
+        let frames: Vec<_> = rx.try_iter().collect();
+        assert!(!frames.is_empty(), "No encoded frames received");
+        for frame in &frames {
+            let frame = frame.as_ref().expect("Frame should be Ok");
+            assert!(!frame.data().is_empty(), "Frame should have data");
+        }
+    }
+
+    #[test]
+    fn test_reconfigure_height_only_h264() {
+        let (tx, rx) = mpsc::sync_channel::<Result<EncodedFrame<u32>, Error>>(8);
+        let config = test_encoder_config_with_max_resolution(
+            CodecConfig::H264(H264EncoderConfig {
+                profile: None,
+                idr_period: None,
+            }),
+            640,
+            480,
+            640,
+            720,
+        );
+
+        let mut encoder = Encoder::new(config, move |frame| {
+            let _ = tx.send(frame);
+        })
+        .expect("failed to create h264 encoder");
+
+        // 初期解像度でエンコード
+        encoder
+            .encode(
+                &create_black_frame(640, 480),
+                &EncodeOptions {
+                    force_intra: false,
+                    force_idr: true,
+                    output_spspps: true,
+                },
+                1,
+            )
+            .expect("failed to encode frame at 640x480");
+
+        // 高さのみ変更
+        encoder
+            .reconfigure(ReconfigureParams {
+                height: Some(720),
+                ..Default::default()
+            })
+            .expect("failed to reconfigure height to 720");
+
+        // 新解像度でエンコード
+        encoder
+            .encode(
+                &create_black_frame(640, 720),
+                &EncodeOptions {
+                    force_intra: false,
+                    force_idr: true,
+                    output_spspps: true,
+                },
+                2,
+            )
+            .expect("failed to encode frame at 640x720");
+
+        encoder.flush().expect("flush failed");
+        drop(encoder);
+
+        let frames: Vec<_> = rx.try_iter().collect();
+        assert!(!frames.is_empty(), "No encoded frames received");
+        for frame in &frames {
+            let frame = frame.as_ref().expect("Frame should be Ok");
+            assert!(!frame.data().is_empty(), "Frame should have data");
+        }
+    }
+
+    #[test]
+    fn test_reconfigure_during_encoding_h264() {
+        let (tx, rx) = mpsc::sync_channel::<Result<EncodedFrame<u32>, Error>>(8);
+        let config = test_encoder_config_with_max_resolution(
+            CodecConfig::H264(H264EncoderConfig {
+                profile: None,
+                idr_period: None,
+            }),
+            640,
+            480,
+            1280,
+            720,
+        );
+
+        let mut encoder = Encoder::new(config, move |frame| {
+            let _ = tx.send(frame);
+        })
+        .expect("failed to create h264 encoder");
+
+        // 複数フレームをエンコード（in-flight フレーム有りの reconfigure をテスト）
+        let frame_640x480 = create_black_frame(640, 480);
+        for i in 0..3u32 {
+            encoder
+                .encode(
+                    &frame_640x480,
+                    &EncodeOptions {
+                        force_intra: false,
+                        force_idr: i == 0,
+                        output_spspps: i == 0,
+                    },
+                    i,
+                )
+                .expect("failed to encode frame");
+        }
+
+        // エンコード中に reconfigure を発行（パイプライン競合を検証）
+        encoder
+            .reconfigure(ReconfigureParams {
+                width: Some(1280),
+                height: Some(720),
+                ..Default::default()
+            })
+            .expect("failed to reconfigure during encoding");
+
+        // 新解像度でエンコード継続
+        let frame_1280x720 = create_black_frame(1280, 720);
+        for i in 3..5u32 {
+            encoder
+                .encode(
+                    &frame_1280x720,
+                    &EncodeOptions {
+                        force_intra: false,
+                        force_idr: true,
+                        output_spspps: true,
+                    },
+                    i,
+                )
+                .expect("failed to encode frame");
+        }
+
+        encoder.flush().expect("flush failed");
+        drop(encoder);
+
+        let frames: Vec<_> = rx.try_iter().collect();
+        assert_eq!(
+            frames.len(),
+            5,
+            "Expected 5 encoded frames, got {}",
+            frames.len()
+        );
+
+        let user_data_values: Vec<u32> = frames
+            .iter()
+            .map(|f| f.as_ref().expect("Frame should be Ok").user_data)
+            .collect();
+
+        // 全 5 フレームの user_data が受信されていることを確認
+        for expected in 0..5u32 {
+            assert!(
+                user_data_values.contains(&expected),
+                "Missing frame with user_data={}",
+                expected
+            );
+        }
     }
 }
