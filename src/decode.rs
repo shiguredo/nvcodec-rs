@@ -387,42 +387,50 @@ pub fn query_decoder_caps(codec: DecoderCodec, device_id: i32) -> Result<Decoder
     DecoderState::query_caps(codec, device_id)
 }
 
-// パーサーがシーケンスヘッダーを検出した時に呼ばれるコールバック
-unsafe extern "C" fn handle_video_sequence(
-    user_data: *mut c_void,
-    format: *mut sys::CUVIDEOFORMAT,
-) -> i32 {
-    if user_data.is_null() || format.is_null() {
-        return 0;
-    }
+/// FFI コールバックの共通パターンを生成するマクロ
+///
+/// パラメータ:
+/// - $name: FFI 関数名
+/// - $param_type: コールバックの引数型
+/// - $param_name: 引数名
+/// - $state_binding: state の束縛方法（`let state = &mut *(...)` または `let state = &*(...)`）
+/// - $inner: inner 関数呼び出し式（戻り値は Result<T, Error>）
+/// - $ok_map: Ok 時に inner の戻り値から i32 を生成する式
+/// - $ctx: エラーコンテキスト文字列
+macro_rules! ffi_callback {
+    ($name:ident, $param_type:ty, $param_name:ident, $state_binding:expr, $inner:expr, $ok_map:expr, $ctx:expr) => {
+        unsafe extern "C" fn $name(user_data: *mut c_void, $param_name: *mut $param_type) -> i32 {
+            if user_data.is_null() || $param_name.is_null() {
+                return 0;
+            }
 
-    let state = unsafe { &mut *(user_data as *mut DecoderState) };
+            let state = unsafe { $state_binding(user_data as *mut DecoderState) };
 
-    // FFI コールバック内の panic はプロセス abort に直結するため catch_unwind で隔離する
-    let result = catch_unwind(AssertUnwindSafe(|| {
-        let format = unsafe { &*format };
+            // FFI コールバック内の panic はプロセス abort に直結するため catch_unwind で隔離する
+            let result = catch_unwind(AssertUnwindSafe(|| {
+                let result = $inner(state, unsafe { &*$param_name });
+                match result {
+                    Ok(val) => $ok_map(val),
+                    Err(e) => {
+                        let _ = state.frame_tx.send(Err(e));
+                        0
+                    }
+                }
+            }));
 
-        let result = handle_video_sequence_inner(state, format);
-        match result {
-            Ok(num_surfaces) => num_surfaces,
-            Err(e) => {
-                let _ = state.frame_tx.send(Err(e));
-                0
+            match result {
+                Ok(v) => v,
+                Err(_) => {
+                    // panic を検知したことを利用側に伝える
+                    let _ = state.frame_tx.send(Err(Error::new_custom(
+                        $ctx,
+                        "panic occurred in FFI callback",
+                    )));
+                    0
+                }
             }
         }
-    }));
-
-    match result {
-        Ok(v) => v,
-        Err(_) => {
-            // panic を検知したことを利用側に伝える
-            let _ = state.frame_tx.send(Err(Error::new_custom(
-                "handle_video_sequence",
-                "panic occurred in FFI callback",
-            )));
-            0
-        }
-    }
+    };
 }
 
 /// 既存デコーダーを破棄し、state.decoder を null にする
@@ -537,41 +545,35 @@ fn validate_display_area(format: &sys::CUVIDEOFORMAT) -> Option<Error> {
     None
 }
 
-// デコードすべきピクチャーがある時に呼ばれるコールバック
-unsafe extern "C" fn handle_picture_decode(
-    user_data: *mut c_void,
-    pic_params: *mut sys::CUVIDPICPARAMS,
-) -> i32 {
-    if user_data.is_null() || pic_params.is_null() {
-        return 0;
-    }
+ffi_callback!(
+    handle_video_sequence,
+    sys::CUVIDEOFORMAT,
+    format,
+    |ptr: *mut DecoderState| -> &mut DecoderState { &mut *ptr },
+    handle_video_sequence_inner,
+    |val| val,
+    "handle_video_sequence"
+);
 
-    let state = unsafe { &mut *(user_data as *mut DecoderState) };
+ffi_callback!(
+    handle_picture_decode,
+    sys::CUVIDPICPARAMS,
+    pic_params,
+    |ptr: *mut DecoderState| -> &mut DecoderState { &mut *ptr },
+    handle_picture_decode_inner,
+    |_: ()| 1,
+    "handle_picture_decode"
+);
 
-    // FFI コールバック内の panic はプロセス abort に直結するため catch_unwind で隔離する
-    let result = catch_unwind(AssertUnwindSafe(|| {
-        let result = handle_picture_decode_inner(state, unsafe { &*pic_params });
-        match result {
-            Ok(_) => 1,
-            Err(e) => {
-                let _ = state.frame_tx.send(Err(e));
-                0
-            }
-        }
-    }));
-
-    match result {
-        Ok(v) => v,
-        Err(_) => {
-            // panic を検知したことを利用側に伝える
-            let _ = state.frame_tx.send(Err(Error::new_custom(
-                "handle_picture_decode",
-                "panic occurred in FFI callback",
-            )));
-            0
-        }
-    }
-}
+ffi_callback!(
+    handle_picture_display,
+    sys::CUVIDPARSERDISPINFO,
+    disp_info,
+    |ptr: *mut DecoderState| -> &DecoderState { &*ptr },
+    handle_picture_display_inner,
+    |_: ()| 1,
+    "handle_picture_display"
+);
 
 fn handle_picture_decode_inner(
     state: &mut DecoderState,
@@ -591,42 +593,6 @@ fn handle_picture_decode_inner(
     })?;
 
     Ok(())
-}
-
-// デコード済みフレームを表示する時に呼ばれるコールバック
-unsafe extern "C" fn handle_picture_display(
-    user_data: *mut c_void,
-    disp_info: *mut sys::CUVIDPARSERDISPINFO,
-) -> i32 {
-    if user_data.is_null() || disp_info.is_null() {
-        return 0;
-    }
-
-    let state = unsafe { &mut *(user_data as *mut DecoderState) };
-
-    // FFI コールバック内の panic はプロセス abort に直結するため catch_unwind で隔離する
-    let result = catch_unwind(AssertUnwindSafe(|| {
-        let result = handle_picture_display_inner(state, unsafe { &*disp_info });
-        match result {
-            Ok(_) => 1,
-            Err(e) => {
-                let _ = state.frame_tx.send(Err(e));
-                0
-            }
-        }
-    }));
-
-    match result {
-        Ok(v) => v,
-        Err(_) => {
-            // panic を検知したことを利用側に伝える
-            let _ = state.frame_tx.send(Err(Error::new_custom(
-                "handle_picture_display",
-                "panic occurred in FFI callback",
-            )));
-            0
-        }
-    }
 }
 
 fn handle_picture_display_inner(
@@ -861,6 +827,38 @@ mod tests {
         }
     }
 
+    /// デコードされた黒フレームの検証を行う
+    fn assert_black_frame(frame: &DecodedFrame<()>, expected_width: usize, expected_height: usize) {
+        assert_eq!(frame.width(), expected_width);
+        assert_eq!(frame.height(), expected_height);
+
+        assert_eq!(frame.y_plane().len(), frame.y_stride() * frame.height());
+        assert_eq!(
+            frame.uv_plane().len(),
+            frame.uv_stride() * frame.height().div_ceil(2)
+        );
+
+        assert!(frame.y_stride() >= frame.width());
+        assert!(frame.uv_stride() >= frame.width());
+
+        let y_data = frame.y_plane();
+        let uv_data = frame.uv_plane();
+
+        let y_avg = y_data.iter().map(|&x| x as u32).sum::<u32>() / y_data.len() as u32;
+        assert!(
+            (10..=30).contains(&y_avg),
+            "Y average should be around 16 for black, got {}",
+            y_avg
+        );
+
+        let uv_avg = uv_data.iter().map(|&x| x as u32).sum::<u32>() / uv_data.len() as u32;
+        assert!(
+            (70..=140).contains(&uv_avg),
+            "UV average should be in reasonable range, got {}",
+            uv_avg
+        );
+    }
+
     #[test]
     fn init_h264_decoder() {
         let (_tx, _rx) = mpsc::sync_channel::<Result<DecodedFrame<()>, Error>>(4);
@@ -994,47 +992,7 @@ mod tests {
             .expect("No decoded frame available")
             .expect("Decoding error occurred");
 
-        assert_eq!(frame.width(), 640);
-        assert_eq!(frame.height(), 480);
-
-        // Y 平面と UV 平面のデータサイズを確認
-        assert_eq!(frame.y_plane().len(), frame.y_stride() * frame.height());
-        assert_eq!(
-            frame.uv_plane().len(),
-            frame.uv_stride() * frame.height().div_ceil(2)
-        );
-
-        // ストライドが幅以上であることを確認（GPU アラインメントのため）
-        assert!(frame.y_stride() >= frame.width());
-        assert!(frame.uv_stride() >= frame.width());
-
-        // 黒画面なので、Y 成分は 16 付近、UV 成分は 128 付近の値になることを確認
-        let y_data = frame.y_plane();
-        let uv_data = frame.uv_plane();
-
-        // Y 成分の平均値をチェック（完全な黒は 16）
-        let y_avg = y_data.iter().map(|&x| x as u32).sum::<u32>() / y_data.len() as u32;
-        assert!(
-            (10..=30).contains(&y_avg),
-            "Y average should be around 16 for black, got {}",
-            y_avg
-        );
-
-        // UV 成分の平均値をチェック
-        let uv_avg = uv_data.iter().map(|&x| x as u32).sum::<u32>() / uv_data.len() as u32;
-        assert!(
-            (70..=140).contains(&uv_avg),
-            "UV average should be in reasonable range for the encoded frame, got {}",
-            uv_avg
-        );
-
-        println!(
-            "Successfully decoded H.265 black frame: {}x{} (stride: {})",
-            frame.width(),
-            frame.height(),
-            frame.y_stride()
-        );
-        println!("Y average: {}, UV average: {}", y_avg, uv_avg);
+        assert_black_frame(&frame, 640, 480);
 
         drop(decoder);
     }
@@ -1092,47 +1050,7 @@ mod tests {
             .expect("No decoded frame available")
             .expect("Decoding error occurred");
 
-        assert_eq!(frame.width(), 640);
-        assert_eq!(frame.height(), 480);
-
-        // Y 平面と UV 平面のデータサイズを確認
-        assert_eq!(frame.y_plane().len(), frame.y_stride() * frame.height());
-        assert_eq!(
-            frame.uv_plane().len(),
-            frame.uv_stride() * frame.height().div_ceil(2)
-        );
-
-        // ストライドが幅以上であることを確認（GPU アラインメントのため）
-        assert!(frame.y_stride() >= frame.width());
-        assert!(frame.uv_stride() >= frame.width());
-
-        // 黒画面なので、Y 成分は 16 付近、UV 成分は 128 付近の値になることを確認
-        let y_data = frame.y_plane();
-        let uv_data = frame.uv_plane();
-
-        // Y 成分の平均値をチェック（完全な黒は 16）
-        let y_avg = y_data.iter().map(|&x| x as u32).sum::<u32>() / y_data.len() as u32;
-        assert!(
-            (10..=30).contains(&y_avg),
-            "Y average should be around 16 for black, got {}",
-            y_avg
-        );
-
-        // UV 成分の平均値をチェック
-        let uv_avg = uv_data.iter().map(|&x| x as u32).sum::<u32>() / uv_data.len() as u32;
-        assert!(
-            (70..=140).contains(&uv_avg),
-            "UV average should be in reasonable range for the encoded frame, got {}",
-            uv_avg
-        );
-
-        println!(
-            "Successfully decoded H.264 black frame: {}x{} (stride: {})",
-            frame.width(),
-            frame.height(),
-            frame.y_stride()
-        );
-        println!("Y average: {}, UV average: {}", y_avg, uv_avg);
+        assert_black_frame(&frame, 640, 480);
 
         drop(decoder);
     }
@@ -1169,47 +1087,7 @@ mod tests {
             .expect("No decoded frame available")
             .expect("Decoding error occurred");
 
-        assert_eq!(frame.width(), 640);
-        assert_eq!(frame.height(), 480);
-
-        // Y 平面と UV 平面のデータサイズを確認
-        assert_eq!(frame.y_plane().len(), frame.y_stride() * frame.height());
-        assert_eq!(
-            frame.uv_plane().len(),
-            frame.uv_stride() * frame.height().div_ceil(2)
-        );
-
-        // ストライドが幅以上であることを確認（GPU アラインメントのため）
-        assert!(frame.y_stride() >= frame.width());
-        assert!(frame.uv_stride() >= frame.width());
-
-        // 黒画面なので、Y 成分は 16 付近、UV 成分は 128 付近の値になることを確認
-        let y_data = frame.y_plane();
-        let uv_data = frame.uv_plane();
-
-        // Y 成分の平均値をチェック（完全な黒は 16）
-        let y_avg = y_data.iter().map(|&x| x as u32).sum::<u32>() / y_data.len() as u32;
-        assert!(
-            (10..=30).contains(&y_avg),
-            "Y average should be around 16 for black, got {}",
-            y_avg
-        );
-
-        // UV 成分の平均値をチェック
-        let uv_avg = uv_data.iter().map(|&x| x as u32).sum::<u32>() / uv_data.len() as u32;
-        assert!(
-            (70..=140).contains(&uv_avg),
-            "UV average should be in reasonable range for the encoded frame, got {}",
-            uv_avg
-        );
-
-        println!(
-            "Successfully decoded AV1 black frame: {}x{} (stride: {})",
-            frame.width(),
-            frame.height(),
-            frame.y_stride()
-        );
-        println!("Y average: {}, UV average: {}", y_avg, uv_avg);
+        assert_black_frame(&frame, 640, 480);
 
         drop(decoder);
     }
@@ -1269,47 +1147,7 @@ mod tests {
             .expect("No decoded frame available")
             .expect("Decoding error occurred");
 
-        assert_eq!(frame.width(), 640);
-        assert_eq!(frame.height(), 480);
-
-        // Y 平面と UV 平面のデータサイズを確認
-        assert_eq!(frame.y_plane().len(), frame.y_stride() * frame.height());
-        assert_eq!(
-            frame.uv_plane().len(),
-            frame.uv_stride() * frame.height().div_ceil(2)
-        );
-
-        // ストライドが幅以上であることを確認（GPU アラインメントのため）
-        assert!(frame.y_stride() >= frame.width());
-        assert!(frame.uv_stride() >= frame.width());
-
-        // 黒画面なので、Y 成分は 16 付近、UV 成分は 128 付近の値になることを確認
-        let y_data = frame.y_plane();
-        let uv_data = frame.uv_plane();
-
-        // Y 成分の平均値をチェック（完全な黒は 16）
-        let y_avg = y_data.iter().map(|&x| x as u32).sum::<u32>() / y_data.len() as u32;
-        assert!(
-            (10..=30).contains(&y_avg),
-            "Y average should be around 16 for black, got {}",
-            y_avg
-        );
-
-        // UV 成分の平均値をチェック
-        let uv_avg = uv_data.iter().map(|&x| x as u32).sum::<u32>() / uv_data.len() as u32;
-        assert!(
-            (70..=140).contains(&uv_avg),
-            "UV average should be in reasonable range for the encoded frame, got {}",
-            uv_avg
-        );
-
-        println!(
-            "Successfully decoded VP8 black frame: {}x{} (stride: {})",
-            frame.width(),
-            frame.height(),
-            frame.y_stride()
-        );
-        println!("Y average: {}, UV average: {}", y_avg, uv_avg);
+        assert_black_frame(&frame, 640, 480);
 
         drop(decoder);
     }
@@ -1345,47 +1183,7 @@ mod tests {
             .expect("No decoded frame available")
             .expect("Decoding error occurred");
 
-        assert_eq!(frame.width(), 640);
-        assert_eq!(frame.height(), 480);
-
-        // Y 平面と UV 平面のデータサイズを確認
-        assert_eq!(frame.y_plane().len(), frame.y_stride() * frame.height());
-        assert_eq!(
-            frame.uv_plane().len(),
-            frame.uv_stride() * frame.height().div_ceil(2)
-        );
-
-        // ストライドが幅以上であることを確認（GPU アラインメントのため）
-        assert!(frame.y_stride() >= frame.width());
-        assert!(frame.uv_stride() >= frame.width());
-
-        // 黒画面なので、Y 成分は 16 付近、UV 成分は 128 付近の値になることを確認
-        let y_data = frame.y_plane();
-        let uv_data = frame.uv_plane();
-
-        // Y 成分の平均値をチェック（完全な黒は 16）
-        let y_avg = y_data.iter().map(|&x| x as u32).sum::<u32>() / y_data.len() as u32;
-        assert!(
-            (10..=30).contains(&y_avg),
-            "Y average should be around 16 for black, got {}",
-            y_avg
-        );
-
-        // UV 成分の平均値をチェック
-        let uv_avg = uv_data.iter().map(|&x| x as u32).sum::<u32>() / uv_data.len() as u32;
-        assert!(
-            (70..=140).contains(&uv_avg),
-            "UV average should be in reasonable range for the encoded frame, got {}",
-            uv_avg
-        );
-
-        println!(
-            "Successfully decoded VP9 black frame: {}x{} (stride: {})",
-            frame.width(),
-            frame.height(),
-            frame.y_stride()
-        );
-        println!("Y average: {}, UV average: {}", y_avg, uv_avg);
+        assert_black_frame(&frame, 640, 480);
 
         drop(decoder);
     }
