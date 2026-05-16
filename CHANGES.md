@@ -17,25 +17,55 @@
   - `drain_one_with_ctx` を `drain_one` にリネームする
   - これにより `.expect()` パニックの温床が消滅し、issue 0016 も自然解決する
   - @melpon
+
+- [FIX] `encode_frame_inner` で mapped resource に RAII ガード（ReleaseGuard）を導入する
+  - エンコード失敗時に ReleaseGuard の drop で自動的に unmap されるようにする
+  - 成功時は cancel() でガードを解除し、後続の drain が unmap を担当する
+  - @melpon
 - [ADD] `EncodedFrame<T>` 構造体を追加する
   - `user_data: T` フィールドを持ち、エンコード完了時に任意のユーザーデータを callback 経由で受け取れるようにする
   - `into_parts()` メソッドでデータとユーザーデータに分解できる
   - `user_data()` メソッドでユーザーデータの参照を取得できる
   - @melpon
+
+- [FIX] `encode_frame_inner` で mapped resource に RAII ガード（ReleaseGuard）を導入する
+  - エンコード失敗時に ReleaseGuard の drop で自動的に unmap されるようにする
+  - 成功時は cancel() でガードを解除し、後続の drain が unmap を担当する
+  - @melpon
 - [ADD] `DecodedFrame<T>` に `user_data: T` フィールドを追加する
   - `into_parts()` メソッドでデータとユーザーデータに分解できる
   - `user_data()` メソッドでユーザーデータの参照を取得できる
+  - @melpon
+
+- [FIX] `encode_frame_inner` で mapped resource に RAII ガード（ReleaseGuard）を導入する
+  - エンコード失敗時に ReleaseGuard の drop で自動的に unmap されるようにする
+  - 成功時は cancel() でガードを解除し、後続の drain が unmap を担当する
   - @melpon
 - [CHANGE] エンコーダの同期 API を非同期コールバック方式に変更する
   - `Encoder::new()` に完了用のコールバックを渡すようにする
   - `Encoder::next_frame()` は廃止
   - @melpon
+
+- [FIX] `encode_frame_inner` で mapped resource に RAII ガード（ReleaseGuard）を導入する
+  - エンコード失敗時に ReleaseGuard の drop で自動的に unmap されるようにする
+  - 成功時は cancel() でガードを解除し、後続の drain が unmap を担当する
+  - @melpon
 - [CHANGE] デコーダの同期 API を非同期コールバック方式に変更する
   - `Decoder::new()` に完了用のコールバックを渡すようにする
   - `Decoder::next_frame()` は廃止
   - @melpon
+
+- [FIX] `encode_frame_inner` で mapped resource に RAII ガード（ReleaseGuard）を導入する
+  - エンコード失敗時に ReleaseGuard の drop で自動的に unmap されるようにする
+  - 成功時は cancel() でガードを解除し、後続の drain が unmap を担当する
+  - @melpon
 - [CHANGE] `Encoder::query_caps()`, `Decoder::query_caps()` をリネームする
   - `query_encoder_caps()` 及び `query_decoder_caps()` にリネーム
+  - @melpon
+
+- [FIX] `encode_frame_inner` で mapped resource に RAII ガード（ReleaseGuard）を導入する
+  - エンコード失敗時に ReleaseGuard の drop で自動的に unmap されるようにする
+  - 成功時は cancel() でガードを解除し、後続の drain が unmap を担当する
   - @melpon
 - [FIX] エンコーダーの解像度変更時にバッファプールと pitch が再構築されない問題を修正する
   - `reconfigure_inner` で `self.pitch` とバッファプール（`device_inputs` / `registered_resources` / `bitstream_buffers`）を解像度変更時に更新する
@@ -43,13 +73,33 @@
   - `cleanup_buffer_pool` を idempotent 化（再呼び出し時にパニックしない）
   - `Encoder::reconfigure` の doc コメントに解像度変更後の IDR フレーム送出要件を追記する
   - @melpon
+
+- [FIX] `encode_frame_inner` で mapped resource に RAII ガード（ReleaseGuard）を導入する
+  - エンコード失敗時に ReleaseGuard の drop で自動的に unmap されるようにする
+  - 成功時は cancel() でガードを解除し、後続の drain が unmap を担当する
+  - @melpon
 - [FIX] 解像度変更時のデコーダー再作成が失敗した場合に状態が回復不能になる問題を修正する
   - 新しいデコーダーを作成してから古いデコーダーを破棄する順序に変更する
   - `display_area` 検証をデコーダー作成より先に実行する
   - @melpon
+
+- [FIX] `encode_frame_inner` で mapped resource に RAII ガード（ReleaseGuard）を導入する
+  - エンコード失敗時に ReleaseGuard の drop で自動的に unmap されるようにする
+  - 成功時は cancel() でガードを解除し、後続の drain が unmap を担当する
+  - @melpon
 - [FIX] `drain_one` のエラーハンドリングを改善する
   - Ok パスから `.expect()` を除去し、`pending_user_data` が空の場合はエラーコールバックで通知する
   - Err パスで `pending_user_data` の状態にかかわらず必ずエラーを通知し、残存 user_data を破棄する
+  - @melpon
+
+- [FIX] `encode_frame_inner` で mapped resource に RAII ガード（ReleaseGuard）を導入する
+  - エンコード失敗時に ReleaseGuard の drop で自動的に unmap されるようにする
+  - 成功時は cancel() でガードを解除し、後続の drain が unmap を担当する
+  - @melpon
+
+- [FIX] `encode_frame_inner` で mapped resource に RAII ガード（ReleaseGuard）を導入する
+  - エンコード失敗時に ReleaseGuard の drop で自動的に unmap されるようにする
+  - 成功時は cancel() でガードを解除し、後続の drain が unmap を担当する
   - @melpon
 
 ## 2026.1.0

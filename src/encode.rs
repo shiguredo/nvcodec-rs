@@ -1094,6 +1094,15 @@ impl EncoderState {
             // リソースマップ
             let mapped = self.map_resource(bfr_idx)?;
 
+            // エラー時に自動で unmap するガード
+            let unmap_fn = self.encoder.nvEncUnmapInputResource;
+            let h_encoder = self.h_encoder;
+            let unmap_guard = ReleaseGuard::new(move || {
+                if let Some(f) = unmap_fn {
+                    let _ = f(h_encoder, mapped);
+                }
+            });
+
             // エンコード
             let mut pic_params: sys::NV_ENC_PIC_PARAMS = std::mem::zeroed();
             pic_params.version = sys::NV_ENC_PIC_PARAMS_VER;
@@ -1118,9 +1127,15 @@ impl EncoderState {
 
             if let Err(e) = Error::check_nvenc(status, "nvEncEncodePicture") {
                 // エンコード失敗時は mapped resource を unmap する
+                // ReleaseGuard の drop が自動で unmap を実行し、
+                // mapped_inputs のエントリは unmap_resource_inner でクリアする
                 self.unmap_resource_inner(bfr_idx);
                 return Err(e);
             }
+
+            // エンコード成功時はリソースを mapped 状態に保つ
+            // （後続の drain で unmap_resource が担当する）
+            unmap_guard.cancel();
 
             Ok(())
         }
