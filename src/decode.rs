@@ -386,24 +386,17 @@ pub fn query_decoder_caps(codec: DecoderCodec, device_id: i32) -> Result<Decoder
     DecoderState::query_caps(codec, device_id)
 }
 
-/// 既存デコーダーを破棄し、state.decoder を null にする
-fn destroy_old_decoder_and_null(state: &mut DecoderState) {
-    if !state.decoder.is_null() {
-        let _ = state
-            .lib
-            .with_context(state.ctx, || state.lib.cuvid_destroy_decoder(state.decoder));
-        state.decoder = ptr::null_mut();
-    }
-}
-
 fn handle_video_sequence_inner(
     state: &mut DecoderState,
     format: &sys::CUVIDEOFORMAT,
 ) -> Result<i32, Error> {
-    // display_area の検証を最初に行う
-    if let Some(e) = validate_display_area(format) {
-        destroy_old_decoder_and_null(state);
-        return Err(e);
+    // デコーダーが既に作成されている場合は破棄して再作成する
+    // ストリーム中の解像度変更に対応するため
+    if !state.decoder.is_null() {
+        state
+            .lib
+            .with_context(state.ctx, || state.lib.cuvid_destroy_decoder(state.decoder))?;
+        state.decoder = ptr::null_mut();
     }
 
     // デコーダーの作成情報を設定
@@ -430,55 +423,12 @@ fn handle_video_sequence_inner(
     // パーサーと共有するコンテキストロックを使用
     create_info.vidLock = state.ctx_lock;
 
-    // 新しいデコーダーを一時変数に作成する
-    let mut new_decoder = ptr::null_mut();
-    if let Err(e) = state.lib.with_context(state.ctx, || {
+    state.lib.with_context(state.ctx, || {
         state
             .lib
-            .cuvid_create_decoder(&mut new_decoder, &mut create_info)
-    }) {
-        // create 失敗時: 古いデコーダーでは新しい解像度のデータをデコードできないため破棄する
-        destroy_old_decoder_and_null(state);
-        return Err(e);
-    }
-
-    // create 成功 → 古いデコーダーを破棄する
-    if !state.decoder.is_null()
-        && let Err(e) = state
-            .lib
-            .with_context(state.ctx, || state.lib.cuvid_destroy_decoder(state.decoder))
-    {
-        // 古いデコーダーの破棄に失敗した場合:
-        // 新デコーダーを破棄し、state.decoder を null にしてリークを防ぐ
-        let _ = state
-            .lib
-            .with_context(state.ctx, || state.lib.cuvid_destroy_decoder(new_decoder));
-        state.decoder = ptr::null_mut();
-        return Err(e);
-    }
-
-    state.decoder = new_decoder;
-
-    let left = format.display_area.left;
-    let right = format.display_area.right;
-    let top = format.display_area.top;
-    let bottom = format.display_area.bottom;
-    state.width = (right - left) as u32;
-    state.height = (bottom - top) as u32;
-    state.surface_width = format.coded_width;
-    state.surface_height = format.coded_height;
-
-    Ok(format.min_num_decode_surfaces as i32)
-}
-
-/// display_area が不正な値を持つ場合にエラーを返す
-fn validate_display_area(format: &sys::CUVIDEOFORMAT) -> Option<Error> {
-    if format.coded_width == 0 || format.coded_height == 0 {
-        return Some(Error::new_custom(
-            "handle_video_sequence",
-            "coded_width or coded_height is zero",
-        ));
-    }
+            .cuvid_create_decoder(&mut state.decoder, &mut create_info)
+    })?;
+    // display_area は signed 整数のため、壊れたストリームで負値になる可能性がある
     let left = format.display_area.left;
     let right = format.display_area.right;
     let top = format.display_area.top;
@@ -490,12 +440,17 @@ fn validate_display_area(format: &sys::CUVIDEOFORMAT) -> Option<Error> {
         || right as u32 > format.coded_width
         || bottom as u32 > format.coded_height
     {
-        return Some(Error::new_custom(
+        return Err(Error::new_custom(
             "handle_video_sequence",
             "invalid display_area in video format",
         ));
     }
-    None
+    state.width = (right - left) as u32;
+    state.height = (bottom - top) as u32;
+    state.surface_width = format.coded_width;
+    state.surface_height = format.coded_height;
+
+    Ok(format.min_num_decode_surfaces as i32)
 }
 
 unsafe extern "C" fn handle_video_sequence(
