@@ -1039,14 +1039,27 @@ impl EncoderState {
     }
 
     fn unmap_resource_inner(&mut self, bfr_idx: usize) {
+        Self::unmap_resource_inner_static(
+            &mut self.mapped_inputs,
+            bfr_idx,
+            &self.encoder,
+            self.h_encoder,
+        );
+    }
+
+    fn unmap_resource_inner_static(
+        mapped_inputs: &mut [Option<sys::NV_ENC_INPUT_PTR>],
+        bfr_idx: usize,
+        encoder: &sys::NV_ENCODE_API_FUNCTION_LIST,
+        h_encoder: *mut c_void,
+    ) {
         unsafe {
-            let Some(mapped) = self.mapped_inputs[bfr_idx].take() else {
+            let Some(mapped) = mapped_inputs[bfr_idx].take() else {
                 return;
             };
-            let _ = self
-                .encoder
+            let _ = encoder
                 .nvEncUnmapInputResource
-                .map(|f| f(self.h_encoder, mapped));
+                .map(|f| f(h_encoder, mapped));
         }
     }
 
@@ -1085,12 +1098,11 @@ impl EncoderState {
             let mapped = self.map_resource(bfr_idx)?;
 
             // エラー時に自動で unmap するガード
-            let unmap_fn = self.encoder.nvEncUnmapInputResource;
+            let mapped_inputs = &mut self.mapped_inputs;
             let h_encoder = self.h_encoder;
-            let unmap_guard = ReleaseGuard::new(move || {
-                if let Some(f) = unmap_fn {
-                    let _ = f(h_encoder, mapped);
-                }
+            let encoder = &self.encoder;
+            let unmap_guard = ReleaseGuard::new(|| {
+                Self::unmap_resource_inner_static(mapped_inputs, bfr_idx, encoder, h_encoder);
             });
 
             // エンコード
@@ -1115,13 +1127,7 @@ impl EncoderState {
                 .map(|f| f(self.h_encoder, &mut pic_params))
                 .unwrap_or(sys::_NVENCSTATUS_NV_ENC_ERR_INVALID_PTR);
 
-            if let Err(e) = Error::check_nvenc(status, "nvEncEncodePicture") {
-                // エンコード失敗時は mapped resource を unmap する
-                // ReleaseGuard の drop が自動で unmap を実行し、
-                // mapped_inputs のエントリは unmap_resource_inner でクリアする
-                self.unmap_resource_inner(bfr_idx);
-                return Err(e);
-            }
+            Error::check_nvenc(status, "nvEncEncodePicture")?;
 
             // エンコード成功時はリソースを mapped 状態に保つ
             // （後続の drain で unmap_resource が担当する）
