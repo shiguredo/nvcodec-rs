@@ -1,6 +1,5 @@
 use std::collections::VecDeque;
 use std::ffi::c_void;
-use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::ptr;
 use std::sync::mpsc::{self, Receiver, Sender, SyncSender};
 use std::thread::JoinHandle;
@@ -387,52 +386,6 @@ pub fn query_decoder_caps(codec: DecoderCodec, device_id: i32) -> Result<Decoder
     DecoderState::query_caps(codec, device_id)
 }
 
-/// FFI コールバックの共通パターンを生成するマクロ
-///
-/// パラメータ:
-/// - $name: FFI 関数名
-/// - $param_type: コールバックの引数型
-/// - $param_name: 引数名
-/// - $state_binding: state の束縛方法（`let state = &mut *(...)` または `let state = &*(...)`）
-/// - $inner: inner 関数呼び出し式（戻り値は Result<T, Error>）
-/// - $ok_map: Ok 時に inner の戻り値から i32 を生成する式
-/// - $ctx: エラーコンテキスト文字列
-macro_rules! ffi_callback {
-    ($name:ident, $param_type:ty, $param_name:ident, $state_binding:expr, $inner:expr, $ok_map:expr, $ctx:expr) => {
-        unsafe extern "C" fn $name(user_data: *mut c_void, $param_name: *mut $param_type) -> i32 {
-            if user_data.is_null() || $param_name.is_null() {
-                return 0;
-            }
-
-            let state = unsafe { $state_binding(user_data as *mut DecoderState) };
-
-            // FFI コールバック内の panic はプロセス abort に直結するため catch_unwind で隔離する
-            let result = catch_unwind(AssertUnwindSafe(|| {
-                let result = $inner(state, unsafe { &*$param_name });
-                match result {
-                    Ok(val) => $ok_map(val),
-                    Err(e) => {
-                        let _ = state.frame_tx.send(Err(e));
-                        0
-                    }
-                }
-            }));
-
-            match result {
-                Ok(v) => v,
-                Err(_) => {
-                    // panic を検知したことを利用側に伝える
-                    let _ = state.frame_tx.send(Err(Error::new_custom(
-                        $ctx,
-                        "panic occurred in FFI callback",
-                    )));
-                    0
-                }
-            }
-        }
-    };
-}
-
 /// 既存デコーダーを破棄し、state.decoder を null にする
 fn destroy_old_decoder_and_null(state: &mut DecoderState) {
     if !state.decoder.is_null() {
@@ -545,35 +498,56 @@ fn validate_display_area(format: &sys::CUVIDEOFORMAT) -> Option<Error> {
     None
 }
 
-ffi_callback!(
-    handle_video_sequence,
-    sys::CUVIDEOFORMAT,
-    format,
-    |ptr: *mut DecoderState| -> &mut DecoderState { &mut *ptr },
-    handle_video_sequence_inner,
-    |val| val,
-    "handle_video_sequence"
-);
+unsafe extern "C" fn handle_video_sequence(
+    user_data: *mut c_void,
+    format: *mut sys::CUVIDEOFORMAT,
+) -> i32 {
+    if user_data.is_null() || format.is_null() {
+        return 0;
+    }
+    let state = unsafe { &mut *(user_data as *mut DecoderState) };
+    match handle_video_sequence_inner(state, unsafe { &*format }) {
+        Ok(val) => val,
+        Err(e) => {
+            let _ = state.frame_tx.send(Err(e));
+            0
+        }
+    }
+}
 
-ffi_callback!(
-    handle_picture_decode,
-    sys::CUVIDPICPARAMS,
-    pic_params,
-    |ptr: *mut DecoderState| -> &mut DecoderState { &mut *ptr },
-    handle_picture_decode_inner,
-    |_: ()| 1,
-    "handle_picture_decode"
-);
+unsafe extern "C" fn handle_picture_decode(
+    user_data: *mut c_void,
+    pic_params: *mut sys::CUVIDPICPARAMS,
+) -> i32 {
+    if user_data.is_null() || pic_params.is_null() {
+        return 0;
+    }
+    let state = unsafe { &mut *(user_data as *mut DecoderState) };
+    match handle_picture_decode_inner(state, unsafe { &*pic_params }) {
+        Ok(()) => 1,
+        Err(e) => {
+            let _ = state.frame_tx.send(Err(e));
+            0
+        }
+    }
+}
 
-ffi_callback!(
-    handle_picture_display,
-    sys::CUVIDPARSERDISPINFO,
-    disp_info,
-    |ptr: *mut DecoderState| -> &DecoderState { &*ptr },
-    handle_picture_display_inner,
-    |_: ()| 1,
-    "handle_picture_display"
-);
+unsafe extern "C" fn handle_picture_display(
+    user_data: *mut c_void,
+    disp_info: *mut sys::CUVIDPARSERDISPINFO,
+) -> i32 {
+    if user_data.is_null() || disp_info.is_null() {
+        return 0;
+    }
+    let state = unsafe { &*(user_data as *const DecoderState) };
+    match handle_picture_display_inner(state, unsafe { &*disp_info }) {
+        Ok(()) => 1,
+        Err(e) => {
+            let _ = state.frame_tx.send(Err(e));
+            0
+        }
+    }
+}
 
 fn handle_picture_decode_inner(
     state: &mut DecoderState,
