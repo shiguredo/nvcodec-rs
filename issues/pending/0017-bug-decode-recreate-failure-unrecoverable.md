@@ -3,6 +3,10 @@
 Created: 2026-05-10
 Model: deepseek-v4-pro
 
+## Pending 理由
+
+コードが複雑になる割に効果が限定的な上に完璧な実装が不可能であるため
+
 ## 背景
 
 issue 0006 で `handle_video_sequence_inner` にストリーム中の解像度変更対応が実装された。この実装では、古いデコーダーを `cuvid_destroy_decoder` で破棄してから新しいデコーダーを `cuvid_create_decoder` で作成する（destroy-then-create 順序）。この順序のため、新規作成に失敗すると古いデコーダーが既に存在しない状態から回復できない。
