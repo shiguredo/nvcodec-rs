@@ -515,9 +515,6 @@ impl EncoderState {
                 Ok((encoder_api, h_encoder))
             })?;
 
-            // ここまで成功したらクリーンアップをキャンセル（あとは Drop に任せる）
-            ctx_guard.cancel();
-
             let buffer_format_sys = config.buffer_format.to_sys();
             let pitch = config.buffer_format.bytes_per_row(config.width)?;
             let n_encoder_buffer = config.frame_interval_p as usize + 3;
@@ -553,6 +550,8 @@ impl EncoderState {
                 state.init_buffer_pool()?;
                 Ok(())
             })?;
+
+            ctx_guard.cancel();
 
             Ok(state)
         }
@@ -604,7 +603,7 @@ impl EncoderState {
 
                 // セッションを確実に閉じるためのガード
                 let destroy_fn = encoder_api.nvEncDestroyEncoder;
-                let session_guard = ReleaseGuard::new(move || {
+                let _ = ReleaseGuard::new(move || {
                     if let Some(f) = destroy_fn {
                         f(h_encoder);
                     }
@@ -655,9 +654,6 @@ impl EncoderState {
                         sys::_NV_ENC_CAPS_NV_ENC_CAPS_SUPPORT_TEMPORAL_AQ,
                     )? != 0,
                 };
-
-                // セッションガードがスコープアウト時にエンコーダを破棄する
-                drop(session_guard);
 
                 Ok(caps)
             })?;
