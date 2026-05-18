@@ -1448,7 +1448,6 @@ where
                         }
                     }
                     Err(e) => {
-                        // encode_frame_inner 内で unmap 済み
                         callback(Err(e));
                     }
                 }
@@ -2448,6 +2447,94 @@ mod tests {
         unsafe {
             ManuallyDrop::drop(&mut encoder);
         }
+    }
+
+    /// 現在の実装では n_output_delay フレーム分の遅延が callback に発生することを確認する
+    ///
+    /// run_worker 内の post-drain（encode.rs:1445-1448）は
+    /// `i_got + n_output_delay < i_to_send` が成立するまで drain しない。
+    /// これにより、frame N の callback は必ず frame N + n_output_delay の
+    /// encode() 送信時まで遅延する。
+    ///
+    /// 本テストでは frame_interval_p = 0（n_encoder_buffer=3, n_output_delay=2）とし、
+    /// 30fps 相当のフレーム間隔（33ms）で encode() を 4 回呼び出す。
+    /// 各 encode() の前に encode_count をインクリメントし、
+    /// 最初に発火した callback の時点で encode_count を first_cb_after に記録する。
+    ///
+    /// 期待値:
+    ///   現状の実装では first_cb_after >= 3（n_output_delay+1）
+    ///   drain スレッド化後は encode() 直後から drain が試行されるため
+    ///   本テストが FAIL する（first_cb_after が 1 や 2 になる）ことをもって
+    ///   遅延解消の証拠とする。
+    #[test]
+    fn test_callback_delayed_by_n_output_delay() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::time::Duration;
+
+        // n_encoder_buffer = frame_interval_p + 3 = 3
+        // n_output_delay   = n_encoder_buffer - 1 = 2
+        // したがって最初の callback は 3 回目（n_output_delay + 1）の
+        // encode() 呼び出し後まで発火しないはず
+        let mut config = test_encoder_config(CodecConfig::H264(H264EncoderConfig {
+            profile: None,
+            idr_period: None,
+        }));
+        config.frame_interval_p = 0;
+
+        let width = config.width;
+        let height = config.height;
+        let n_encoder_buffer = config.frame_interval_p as usize + 3;
+
+        // encode_count: encode() が呼ばれるたびにメインスレッドでインクリメント
+        // first_cb_after: 最初の callback 発火時点の encode_count を記録
+        //   compare_exchange により最初の callback だけが書き込む
+        let encode_count = Arc::new(AtomicUsize::new(0));
+        let first_cb_after = Arc::new(AtomicUsize::new(0));
+        let (cb_tx, _cb_rx) =
+            mpsc::sync_channel::<Result<EncodedFrame<u32>, Error>>(n_encoder_buffer.max(8));
+
+        let ec = encode_count.clone();
+        let fca = first_cb_after.clone();
+        let encoder = Encoder::new(config, move |frame| {
+            let count = ec.load(Ordering::SeqCst);
+            fca.compare_exchange(0, count, Ordering::SeqCst, Ordering::SeqCst)
+                .ok();
+            let _ = cb_tx.send(frame);
+        })
+        .expect("failed to create h264 encoder");
+
+        let frame_data = create_black_frame(width, height);
+        let opts = EncodeOptions {
+            force_intra: false,
+            force_idr: false,
+            output_spspps: false,
+        };
+
+        // 30fps 相当のフレーム間隔で送信。
+        // sleep により drain スレッドが encode() の間に drain を完了できる
+        // 十分な時間を与える（現状の実装では drain そのものが遅延しているため
+        // sleep の有無にかかわらず callback は遅延するが、drain スレッド化後の
+        // 差分を明確にするために入れている）
+        let frame_interval = Duration::from_millis(33);
+
+        for i in 0..4u32 {
+            encode_count.fetch_add(1, Ordering::SeqCst);
+            encoder.encode(&frame_data, &opts, i).unwrap();
+            std::thread::sleep(frame_interval);
+        }
+
+        // flush により未 drain の全フレームを drain し、
+        // すべての callback が発火したことを保証する
+        encoder.flush().unwrap();
+        drop(encoder);
+
+        let got = first_cb_after.load(Ordering::SeqCst);
+        assert!(
+            got >= 3,
+            "expected first callback after >= 3 encodes (n_output_delay+1), got {}",
+            got
+        );
     }
 
     #[test]
