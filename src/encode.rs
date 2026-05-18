@@ -452,8 +452,7 @@ struct EncoderState {
     h_encoder: *mut c_void,
     width: u32,
     height: u32,
-    buffer_format: sys::NV_ENC_BUFFER_FORMAT,
-    buffer_format_enum: BufferFormat,
+    buffer_format: BufferFormat,
     framerate_den: u64,
     frame_count: u64,
     init_params: sys::NV_ENC_INITIALIZE_PARAMS,
@@ -515,7 +514,6 @@ impl EncoderState {
                 Ok((encoder_api, h_encoder))
             })?;
 
-            let buffer_format_sys = config.buffer_format.to_sys();
             let pitch = config.buffer_format.bytes_per_row(config.width)?;
             let n_encoder_buffer = config.frame_interval_p as usize + 3;
             let n_output_delay = n_encoder_buffer - 1;
@@ -527,8 +525,7 @@ impl EncoderState {
                 h_encoder,
                 width: config.width,
                 height: config.height,
-                buffer_format: buffer_format_sys,
-                buffer_format_enum: config.buffer_format,
+                buffer_format: config.buffer_format,
                 framerate_den: config.framerate_den as u64,
                 frame_count: 0,
                 init_params: std::mem::zeroed(),
@@ -750,7 +747,7 @@ impl EncoderState {
             }
             if params.width.is_some() || params.height.is_some() {
                 if params.width.is_some() {
-                    self.pitch = self.buffer_format_enum.bytes_per_row(self.width)?;
+                    self.pitch = self.buffer_format.bytes_per_row(self.width)?;
                 }
 
                 self.cleanup_buffer_pool();
@@ -925,9 +922,7 @@ impl EncoderState {
 
     /// バッファプールを初期化する
     fn init_buffer_pool(&mut self) -> Result<(), Error> {
-        let frame_size = self
-            .buffer_format_enum
-            .frame_size(self.width, self.height)?;
+        let frame_size = self.buffer_format.frame_size(self.width, self.height)?;
 
         for i in 0..self.n_encoder_buffer {
             // デバイスメモリの確保
@@ -945,7 +940,7 @@ impl EncoderState {
             register_resource.width = self.width;
             register_resource.height = self.height;
             register_resource.pitch = self.pitch;
-            register_resource.bufferFormat = self.buffer_format;
+            register_resource.bufferFormat = self.buffer_format.to_sys();
             register_resource.bufferUsage = sys::_NV_ENC_BUFFER_USAGE_NV_ENC_INPUT_IMAGE;
 
             let status = self
@@ -1076,9 +1071,7 @@ impl EncoderState {
         options: &EncodeOptions,
     ) -> Result<(), Error> {
         unsafe {
-            let expected_size = self
-                .buffer_format_enum
-                .frame_size(self.width, self.height)?;
+            let expected_size = self.buffer_format.frame_size(self.width, self.height)?;
             if data.len() != expected_size {
                 return Err(Error::new_custom("encode", "invalid frame data size"));
             }
@@ -1109,7 +1102,7 @@ impl EncoderState {
             pic_params.inputPitch = self.pitch;
             pic_params.inputBuffer = mapped;
             pic_params.outputBitstream = self.bitstream_buffers[bfr_idx];
-            pic_params.bufferFmt = self.buffer_format;
+            pic_params.bufferFmt = self.buffer_format.to_sys();
             pic_params.pictureStruct = sys::_NV_ENC_PIC_STRUCT_NV_ENC_PIC_STRUCT_FRAME;
             pic_params.inputTimeStamp = self.frame_count * self.framerate_den;
             pic_params.encodePicFlags = options.to_pic_flags();
