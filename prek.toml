@@ -37,7 +37,7 @@ hooks = [
   {
     id = "cargo-test",
     name = "cargo test (Windows/Linux only)",
-    entry = "sh -c 'case \"$(uname -s)\" in Darwin) echo \"Skipped on macOS\"; exit 0;; *) cargo test --workspace;; esac'",
+    entry = "sh -c 'case \"$(uname -s)\" in Darwin) echo \"Skipped on macOS\"; exit 0;; *) cargo test --workspace -- --test-threads=1;; esac'",
     language = "system",
     types = ["rust"],
     pass_filenames = false,

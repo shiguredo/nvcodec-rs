@@ -448,8 +448,8 @@ impl EncodeOptions {
 struct EncoderState {
     lib: CudaLibrary,
     ctx: sys::CUcontext,
-    encoder: sys::NV_ENCODE_API_FUNCTION_LIST,
-    h_encoder: *mut c_void,
+    encoder_api: sys::NV_ENCODE_API_FUNCTION_LIST,
+    encoder: *mut c_void,
     width: u32,
     height: u32,
     buffer_format: BufferFormat,
@@ -490,7 +490,7 @@ impl EncoderState {
             });
 
             // NVENC 操作のために CUDA context をアクティブ化し、エンコードセッションを開く
-            let (encoder_api, h_encoder) = lib.with_context(ctx, || {
+            let (encoder_api, encoder) = lib.with_context(ctx, || {
                 // NVENC API をロード
                 let mut encoder_api: sys::NV_ENCODE_API_FUNCTION_LIST = std::mem::zeroed();
                 encoder_api.version = sys::NV_ENCODE_API_FUNCTION_LIST_VER;
@@ -504,14 +504,14 @@ impl EncoderState {
                 open_session_params.device = ctx.cast();
                 open_session_params.apiVersion = sys::NVENCAPI_VERSION;
 
-                let mut h_encoder = ptr::null_mut();
+                let mut encoder = ptr::null_mut();
                 let status = encoder_api
                     .nvEncOpenEncodeSessionEx
-                    .map(|f| f(&mut open_session_params, &mut h_encoder))
+                    .map(|f| f(&mut open_session_params, &mut encoder))
                     .unwrap_or(sys::_NVENCSTATUS_NV_ENC_ERR_INVALID_PTR);
                 Error::check_nvenc(status, "nvEncOpenEncodeSessionEx")?;
 
-                Ok((encoder_api, h_encoder))
+                Ok((encoder_api, encoder))
             })?;
 
             let pitch = config.buffer_format.bytes_per_row(config.width)?;
@@ -521,8 +521,8 @@ impl EncoderState {
             let mut state = Self {
                 lib: lib.clone(),
                 ctx,
-                encoder: encoder_api,
-                h_encoder,
+                encoder_api,
+                encoder,
                 width: config.width,
                 height: config.height,
                 buffer_format: config.buffer_format,
@@ -591,10 +591,10 @@ impl EncoderState {
                 open_session_params.device = ctx.cast();
                 open_session_params.apiVersion = sys::NVENCAPI_VERSION;
 
-                let mut h_encoder = ptr::null_mut();
+                let mut encoder = ptr::null_mut();
                 let status = encoder_api
                     .nvEncOpenEncodeSessionEx
-                    .map(|f| f(&mut open_session_params, &mut h_encoder))
+                    .map(|f| f(&mut open_session_params, &mut encoder))
                     .unwrap_or(sys::_NVENCSTATUS_NV_ENC_ERR_INVALID_PTR);
                 Error::check_nvenc(status, "nvEncOpenEncodeSessionEx")?;
 
@@ -602,7 +602,7 @@ impl EncoderState {
                 let destroy_fn = encoder_api.nvEncDestroyEncoder;
                 let _ = ReleaseGuard::new(move || {
                     if let Some(f) = destroy_fn {
-                        f(h_encoder);
+                        f(encoder);
                     }
                 });
 
@@ -615,7 +615,7 @@ impl EncoderState {
                     let mut caps_val: i32 = 0;
                     let status = encoder_api
                         .nvEncGetEncodeCaps
-                        .map(|f| f(h_encoder, codec_guid, &mut caps_param, &mut caps_val))
+                        .map(|f| f(encoder, codec_guid, &mut caps_param, &mut caps_val))
                         .unwrap_or(sys::_NVENCSTATUS_NV_ENC_ERR_INVALID_PTR);
                     Error::check_nvenc(status, "nvEncGetEncodeCaps")?;
                     Ok(caps_val)
@@ -724,9 +724,9 @@ impl EncoderState {
             }
 
             let status = self
-                .encoder
+                .encoder_api
                 .nvEncReconfigureEncoder
-                .map(|f| f(self.h_encoder, &mut reconfig_params))
+                .map(|f| f(self.encoder, &mut reconfig_params))
                 .unwrap_or(sys::_NVENCSTATUS_NV_ENC_ERR_INVALID_PTR);
             Error::check_nvenc(status, "nvEncReconfigureEncoder")?;
 
@@ -799,11 +799,11 @@ impl EncoderState {
             preset_config.presetCfg.version = sys::NV_ENC_CONFIG_VER;
 
             let status = self
-                .encoder
+                .encoder_api
                 .nvEncGetEncodePresetConfigEx
                 .map(|f| {
                     f(
-                        self.h_encoder,
+                        self.encoder,
                         codec_guid,
                         config.preset.to_sys(),
                         config.tuning_info.to_sys(),
@@ -868,9 +868,9 @@ impl EncoderState {
             init_params.encodeConfig = &mut encode_config;
 
             let status = self
-                .encoder
+                .encoder_api
                 .nvEncInitializeEncoder
-                .map(|f| f(self.h_encoder, &mut init_params))
+                .map(|f| f(self.encoder, &mut init_params))
                 .unwrap_or(sys::_NVENCSTATUS_NV_ENC_ERR_INVALID_PTR);
             Error::check_nvenc(status, "nvEncInitializeEncoder")?;
 
@@ -906,9 +906,9 @@ impl EncoderState {
             seq_params.outSPSPPSPayloadSize = &mut out_size;
 
             let status = self
-                .encoder
+                .encoder_api
                 .nvEncGetSequenceParams
-                .map(|f| f(self.h_encoder, &mut seq_params))
+                .map(|f| f(self.encoder, &mut seq_params))
                 .unwrap_or(sys::_NVENCSTATUS_NV_ENC_ERR_INVALID_PTR);
 
             Error::check_nvenc(status, "nvEncGetSequenceParams")?;
@@ -944,9 +944,9 @@ impl EncoderState {
             register_resource.bufferUsage = sys::_NV_ENC_BUFFER_USAGE_NV_ENC_INPUT_IMAGE;
 
             let status = self
-                .encoder
+                .encoder_api
                 .nvEncRegisterResource
-                .map(|f| unsafe { f(self.h_encoder, &mut register_resource) })
+                .map(|f| unsafe { f(self.encoder, &mut register_resource) })
                 .unwrap_or(sys::_NVENCSTATUS_NV_ENC_ERR_INVALID_PTR);
             Error::check_nvenc(status, "nvEncRegisterResource")?;
 
@@ -958,9 +958,9 @@ impl EncoderState {
             create_bs.version = sys::NV_ENC_CREATE_BITSTREAM_BUFFER_VER;
 
             let status = self
-                .encoder
+                .encoder_api
                 .nvEncCreateBitstreamBuffer
-                .map(|f| unsafe { f(self.h_encoder, &mut create_bs) })
+                .map(|f| unsafe { f(self.encoder, &mut create_bs) })
                 .unwrap_or(sys::_NVENCSTATUS_NV_ENC_ERR_INVALID_PTR);
             Error::check_nvenc(status, "nvEncCreateBitstreamBuffer")?;
 
@@ -981,18 +981,18 @@ impl EncoderState {
             for i in 0..self.n_encoder_buffer {
                 if let Some(mapped) = self.mapped_inputs[i].take() {
                     let _ = self
-                        .encoder
+                        .encoder_api
                         .nvEncUnmapInputResource
-                        .map(|f| unsafe { f(self.h_encoder, mapped) });
+                        .map(|f| unsafe { f(self.encoder, mapped) });
                 }
                 let _ = self
-                    .encoder
+                    .encoder_api
                     .nvEncUnregisterResource
-                    .map(|f| unsafe { f(self.h_encoder, self.registered_resources[i]) });
+                    .map(|f| unsafe { f(self.encoder, self.registered_resources[i]) });
                 let _ = self
-                    .encoder
+                    .encoder_api
                     .nvEncDestroyBitstreamBuffer
-                    .map(|f| unsafe { f(self.h_encoder, self.bitstream_buffers[i]) });
+                    .map(|f| unsafe { f(self.encoder, self.bitstream_buffers[i]) });
                 let _ = self.lib.cu_mem_free(self.device_inputs[i]);
             }
             Ok(())
@@ -1010,9 +1010,9 @@ impl EncoderState {
             map_input_resource.registeredResource = self.registered_resources[bfr_idx];
 
             let status = self
-                .encoder
+                .encoder_api
                 .nvEncMapInputResource
-                .map(|f| f(self.h_encoder, &mut map_input_resource))
+                .map(|f| f(self.encoder, &mut map_input_resource))
                 .unwrap_or(sys::_NVENCSTATUS_NV_ENC_ERR_INVALID_PTR);
             Error::check_nvenc(status, "nvEncMapInputResource")?;
 
@@ -1033,24 +1033,24 @@ impl EncoderState {
         Self::unmap_resource_inner_static(
             &mut self.mapped_inputs,
             bfr_idx,
-            &self.encoder,
-            self.h_encoder,
+            &self.encoder_api,
+            self.encoder,
         );
     }
 
     fn unmap_resource_inner_static(
         mapped_inputs: &mut [Option<sys::NV_ENC_INPUT_PTR>],
         bfr_idx: usize,
-        encoder: &sys::NV_ENCODE_API_FUNCTION_LIST,
-        h_encoder: *mut c_void,
+        encoder_api: &sys::NV_ENCODE_API_FUNCTION_LIST,
+        encoder: *mut c_void,
     ) {
         unsafe {
             let Some(mapped) = mapped_inputs[bfr_idx].take() else {
                 return;
             };
-            let _ = encoder
+            let _ = encoder_api
                 .nvEncUnmapInputResource
-                .map(|f| f(h_encoder, mapped));
+                .map(|f| f(encoder, mapped));
         }
     }
 
@@ -1088,10 +1088,10 @@ impl EncoderState {
 
             // エラー時に自動で unmap するガード
             let mapped_inputs = &mut self.mapped_inputs;
-            let h_encoder = self.h_encoder;
-            let encoder = &self.encoder;
+            let encoder = self.encoder;
+            let encoder_api = &self.encoder_api;
             let unmap_guard = ReleaseGuard::new(|| {
-                Self::unmap_resource_inner_static(mapped_inputs, bfr_idx, encoder, h_encoder);
+                Self::unmap_resource_inner_static(mapped_inputs, bfr_idx, encoder_api, encoder);
             });
 
             // エンコード
@@ -1111,9 +1111,9 @@ impl EncoderState {
             self.frame_count += 1;
 
             let status = self
-                .encoder
+                .encoder_api
                 .nvEncEncodePicture
-                .map(|f| f(self.h_encoder, &mut pic_params))
+                .map(|f| f(self.encoder, &mut pic_params))
                 .unwrap_or(sys::_NVENCSTATUS_NV_ENC_ERR_INVALID_PTR);
 
             Error::check_nvenc(status, "nvEncEncodePicture")?;
@@ -1137,19 +1137,19 @@ impl EncoderState {
                 lock_bitstream.outputBitstream = self.bitstream_buffers[bfr_idx];
 
                 let status = self
-                    .encoder
+                    .encoder_api
                     .nvEncLockBitstream
-                    .map(|f| f(self.h_encoder, &mut lock_bitstream))
+                    .map(|f| f(self.encoder, &mut lock_bitstream))
                     .unwrap_or(sys::_NVENCSTATUS_NV_ENC_ERR_INVALID_PTR);
                 Error::check_nvenc(status, "nvEncLockBitstream")?;
 
                 // どの分岐でも必ず unlock するためのガード
-                let unlock_fn = self.encoder.nvEncUnlockBitstream;
-                let h_encoder = self.h_encoder;
+                let unlock_fn = self.encoder_api.nvEncUnlockBitstream;
+                let encoder = self.encoder;
                 let output_bitstream = lock_bitstream.outputBitstream;
                 let _unlock_guard = ReleaseGuard::new(move || {
                     if let Some(f) = unlock_fn {
-                        let _ = f(h_encoder, output_bitstream);
+                        let _ = f(encoder, output_bitstream);
                     }
                 });
 
@@ -1192,9 +1192,9 @@ impl EncoderState {
             pic_params.inputTimeStamp = self.frame_count;
 
             let status = self
-                .encoder
+                .encoder_api
                 .nvEncEncodePicture
-                .map(|f| f(self.h_encoder, &mut pic_params))
+                .map(|f| f(self.encoder, &mut pic_params))
                 .unwrap_or(sys::_NVENCSTATUS_NV_ENC_ERR_INVALID_PTR);
             Error::check_nvenc(status, "nvEncEncodePicture")?;
 
@@ -1209,8 +1209,8 @@ impl Drop for EncoderState {
             self.cleanup_buffer_pool();
 
             let _ = self.lib.with_context(self.ctx, || {
-                if let Some(destroy_fn) = self.encoder.nvEncDestroyEncoder {
-                    destroy_fn(self.h_encoder);
+                if let Some(destroy_fn) = self.encoder_api.nvEncDestroyEncoder {
+                    destroy_fn(self.encoder);
                 }
                 Ok(())
             });
