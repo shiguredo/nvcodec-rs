@@ -68,7 +68,7 @@ DOCS_RS=1 cargo doc --no-deps
 use std::sync::mpsc;
 use shiguredo_nvcodec::{
     BufferFormat, CodecConfig, EncodeOptions, EncodedFrame, Encoder, EncoderConfig, Error,
-    H264EncoderConfig, Preset, TuningInfo, RateControlMode,
+    FnEncodeHandler, H264EncoderConfig, Preset, TuningInfo, RateControlMode,
 };
 
 let config = EncoderConfig {
@@ -93,9 +93,9 @@ let config = EncoderConfig {
 };
 
 let (tx, rx) = mpsc::sync_channel(4);
-let encoder = Encoder::new(config, move |frame: Result<EncodedFrame<()>, Error>| {
+let encoder = Encoder::new(config, FnEncodeHandler::new(move |frame: Result<EncodedFrame<()>, Error>| {
     let _ = tx.send(frame);
-})?;
+}))?;
 
 // NV12 フレームデータをエンコード
 let options = EncodeOptions {
@@ -127,7 +127,7 @@ for frame in rx.try_iter() {
 
 ```rust
 use std::sync::mpsc;
-use shiguredo_nvcodec::{DecodedFrame, Decoder, DecoderCodec, DecoderConfig, Error, SurfaceFormat};
+use shiguredo_nvcodec::{DecodedFrame, Decoder, DecoderCodec, DecoderConfig, Error, FnDecodeHandler, SurfaceFormat};
 
 let config = DecoderConfig {
     codec: DecoderCodec::H264,
@@ -138,9 +138,9 @@ let config = DecoderConfig {
 };
 
 let (tx, rx) = mpsc::sync_channel(4);
-let decoder = Decoder::new(config, move |frame: Result<DecodedFrame<()>, Error>| {
+let decoder = Decoder::new(config, FnDecodeHandler::new(move |frame: Result<DecodedFrame<()>, Error>| {
     let _ = tx.send(frame);
-})?;
+}))?;
 
 // エンコード済みデータをデコード
 decoder.decode(&encoded_data, ())?;
@@ -256,7 +256,9 @@ let config = EncoderConfig {
     max_encode_height: Some(2160),
     // ...
 };
-let mut encoder = Encoder::new(config)?;
+let mut encoder = Encoder::new(config, FnEncodeHandler::new(move |_frame| {
+    // エンコード結果の処理
+}))?;
 
 // 動的に解像度を変更
 encoder.reconfigure(ReconfigureParams {
@@ -275,9 +277,9 @@ encoder.reconfigure(ReconfigureParams {
 ```rust
 // 解像度が変わっても同じデコーダーで継続可能
 let (tx, rx) = mpsc::sync_channel(4);
-let decoder = Decoder::new(config, move |frame: Result<DecodedFrame<u32>, Error>| {
+let decoder = Decoder::new(config, FnDecodeHandler::new(move |frame: Result<DecodedFrame<u32>, Error>| {
     let _ = tx.send(frame);
-})?;
+}))?;
 
 decoder.decode(&data_1080p, 0)?;
 let frame = rx.recv()??;

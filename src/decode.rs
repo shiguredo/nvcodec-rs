@@ -304,29 +304,68 @@ enum Job<T> {
     Terminate,
 }
 
+/// デコード結果を通知するためのハンドラー
+///
+/// デコード処理が完了するたびに [`DecodeHandler::on_decoded`] が呼ばれる。
+pub trait DecodeHandler: Send + 'static {
+    /// ユーザーデータ型
+    type UserData: Send + 'static;
+    /// エラー型
+    type Error: From<crate::Error> + Send + 'static;
+    /// デコード完了時に呼ばれる
+    fn on_decoded(&mut self, result: Result<DecodedFrame<Self::UserData>, Self::Error>);
+}
+
+/// `FnMut` クロージャを [`DecodeHandler`] にするラッパー
+pub struct FnDecodeHandler<T, E = crate::Error> {
+    f: Box<dyn FnMut(Result<DecodedFrame<T>, E>) + Send + 'static>,
+}
+
+impl<T, E> FnDecodeHandler<T, E> {
+    /// `FnMut` クロージャから [`FnDecodeHandler`] を生成する
+    pub fn new<F>(f: F) -> Self
+    where
+        F: FnMut(Result<DecodedFrame<T>, E>) + Send + 'static,
+    {
+        Self { f: Box::new(f) }
+    }
+}
+
+impl<T, E> DecodeHandler for FnDecodeHandler<T, E>
+where
+    T: Send + 'static,
+    E: From<crate::Error> + Send + 'static,
+{
+    type UserData = T;
+    type Error = E;
+    fn on_decoded(&mut self, result: Result<DecodedFrame<T>, E>) {
+        (self.f)(result);
+    }
+}
+
 /// デコーダー
 ///
 /// 内部で専用のワーカースレッドを起動し、非同期でデコードを行う。
-/// デコードが完了すると、コンストラクタで渡したコールバックがワーカースレッド上で即座に呼び出される。
-pub struct Decoder<T> {
-    job_tx: SyncSender<Job<T>>,
+/// デコードが完了すると、コンストラクタで渡したハンドラがワーカースレッド上で即座に呼び出される。
+pub struct Decoder<H: DecodeHandler> {
+    job_tx: SyncSender<Job<H::UserData>>,
     worker: Option<JoinHandle<()>>,
 }
 
-impl<T: Send + 'static> Decoder<T> {
+impl<H: DecodeHandler> Decoder<H> {
     /// デコーダーを生成し、内部ワーカースレッドを起動する
-    pub fn new<F>(config: DecoderConfig, mut callback: F) -> Result<Self, Error>
+    pub fn new(config: DecoderConfig, handler: H) -> Result<Self, Error>
     where
-        F: FnMut(Result<DecodedFrame<T>, Error>) + Send + 'static,
+        H: DecodeHandler,
     {
-        let (job_tx, job_rx) = mpsc::sync_channel::<Job<T>>(4);
+        let (job_tx, job_rx) = mpsc::sync_channel::<Job<H::UserData>>(4);
 
         let state = DecoderState::new(config)?;
 
         let worker = std::thread::Builder::new()
             .name("nvcodec-decoder".into())
             .spawn(move || {
-                run_worker(state, &mut callback, job_rx);
+                run_worker(state, handler, job_rx);
             })
             .map_err(|_e| Error::new_custom("Decoder::new", "failed to spawn decoder thread"))?;
 
@@ -340,7 +379,7 @@ impl<T: Send + 'static> Decoder<T> {
     ///
     /// フレームデータとユーザーデータをワーカースレッドに送信し、即座に戻る。
     /// デコードが完了すると、コンストラクタで渡したコールバックが呼び出される。
-    pub fn decode(&self, data: &[u8], user_data: T) -> Result<(), Error> {
+    pub fn decode(&self, data: &[u8], user_data: H::UserData) -> Result<(), Error> {
         self.job_tx
             .send(Job::Decode {
                 data: data.to_vec(),
@@ -364,7 +403,7 @@ impl<T: Send + 'static> Decoder<T> {
     }
 }
 
-impl<T> Drop for Decoder<T> {
+impl<H: DecodeHandler> Drop for Decoder<H> {
     fn drop(&mut self) {
         let _ = self.job_tx.send(Job::Terminate);
         if let Some(worker) = self.worker.take() {
@@ -373,13 +412,13 @@ impl<T> Drop for Decoder<T> {
     }
 }
 
-impl<T> std::fmt::Debug for Decoder<T> {
+impl<H: DecodeHandler> std::fmt::Debug for Decoder<H> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Decoder").finish_non_exhaustive()
     }
 }
 
-unsafe impl<T: Send> Send for Decoder<T> {}
+unsafe impl<H: DecodeHandler> Send for Decoder<H> {}
 
 /// 指定コーデックのデコーダのケーパビリティをクエリする
 pub fn query_decoder_caps(codec: DecoderCodec, device_id: i32) -> Result<DecoderCaps, Error> {
@@ -661,28 +700,27 @@ impl<T> DecodedFrame<T> {
     }
 }
 
-fn run_worker<F, T>(mut state: Box<DecoderState>, callback: &mut F, job_rx: Receiver<Job<T>>)
+fn run_worker<H>(mut state: Box<DecoderState>, mut handler: H, job_rx: Receiver<Job<H::UserData>>)
 where
-    F: FnMut(Result<DecodedFrame<T>, Error>) + Send + 'static,
-    T: Send + 'static,
+    H: DecodeHandler,
 {
-    let mut pending_user_data: VecDeque<T> = VecDeque::new();
+    let mut pending_user_data: VecDeque<H::UserData> = VecDeque::new();
 
     loop {
         match job_rx.recv() {
             Ok(Job::Decode { data, user_data }) => {
                 if let Err(e) = state.decode(&data) {
-                    callback(Err(e));
+                    handler.on_decoded(Err(e.into()));
                     continue;
                 }
 
                 pending_user_data.push_back(user_data);
-                drain_frames(&mut state, callback, &mut pending_user_data);
+                drain_frames(&mut state, &mut handler, &mut pending_user_data);
             }
             Ok(Job::Flush { done }) => {
                 let _ = state.send_eos();
 
-                drain_frames(&mut state, callback, &mut pending_user_data);
+                drain_frames(&mut state, &mut handler, &mut pending_user_data);
 
                 let _ = done.send(());
             }
@@ -690,7 +728,7 @@ where
                 // 残っている非同期処理を完了させる
                 let _ = state.send_eos();
 
-                drain_frames(&mut state, callback, &mut pending_user_data);
+                drain_frames(&mut state, &mut handler, &mut pending_user_data);
 
                 // state の Drop がここで走り、CUDA リソースが解放される
                 return;
@@ -699,13 +737,12 @@ where
     }
 }
 
-fn drain_frames<F, T>(
+fn drain_frames<H>(
     state: &mut DecoderState,
-    callback: &mut F,
-    pending_user_data: &mut VecDeque<T>,
+    handler: &mut H,
+    pending_user_data: &mut VecDeque<H::UserData>,
 ) where
-    F: FnMut(Result<DecodedFrame<T>, Error>) + Send + 'static,
-    T: Send + 'static,
+    H: DecodeHandler,
 {
     loop {
         match state.next_frame() {
@@ -715,7 +752,7 @@ fn drain_frames<F, T>(
             }
             Ok(Some(raw)) => {
                 if let Some(user_data) = pending_user_data.pop_front() {
-                    callback(Ok(DecodedFrame {
+                    handler.on_decoded(Ok(DecodedFrame {
                         width: raw.width,
                         height: raw.height,
                         pitch: raw.pitch,
@@ -725,7 +762,9 @@ fn drain_frames<F, T>(
                 } else {
                     // デコード結果が存在するのに対応するユーザーデータが存在しない
                     // これは通常あり得ないはずだけど、エラーを取りこぼさない為にエラーのコールバックを呼ぶ
-                    callback(Err(Error::new_custom("drain_frames", "missing user data")));
+                    handler.on_decoded(Err(
+                        Error::new_custom("drain_frames", "missing user data").into()
+                    ));
                     break;
                 }
             }
@@ -733,7 +772,7 @@ fn drain_frames<F, T>(
             // コールバックを呼ぶ
             Err(e) => {
                 pending_user_data.clear();
-                callback(Err(e));
+                handler.on_decoded(Err(e.into()));
                 break;
             }
         }
@@ -792,9 +831,12 @@ mod tests {
     fn init_h264_decoder() {
         let (_tx, _rx) = mpsc::sync_channel::<Result<DecodedFrame<()>, Error>>(4);
         let config = test_decoder_config(DecoderCodec::H264);
-        let _decoder = Decoder::new(config, move |_frame| {
-            let _ = _tx.send(_frame);
-        })
+        let _decoder = Decoder::new(
+            config,
+            FnDecodeHandler::new(move |_frame| {
+                let _ = _tx.send(_frame);
+            }),
+        )
         .expect("Failed to initialize h264 decoder");
         println!("h264 decoder initialized successfully");
     }
@@ -803,9 +845,12 @@ mod tests {
     fn init_h265_decoder() {
         let (_tx, _rx) = mpsc::sync_channel::<Result<DecodedFrame<()>, Error>>(4);
         let config = test_decoder_config(DecoderCodec::Hevc);
-        let _decoder = Decoder::new(config, move |_frame| {
-            let _ = _tx.send(_frame);
-        })
+        let _decoder = Decoder::new(
+            config,
+            FnDecodeHandler::new(move |_frame| {
+                let _ = _tx.send(_frame);
+            }),
+        )
         .expect("Failed to initialize h265 decoder");
         println!("h265 decoder initialized successfully");
     }
@@ -814,9 +859,12 @@ mod tests {
     fn init_av1_decoder() {
         let (_tx, _rx) = mpsc::sync_channel::<Result<DecodedFrame<()>, Error>>(4);
         let config = test_decoder_config(DecoderCodec::Av1);
-        let _decoder = Decoder::new(config, move |_frame| {
-            let _ = _tx.send(_frame);
-        })
+        let _decoder = Decoder::new(
+            config,
+            FnDecodeHandler::new(move |_frame| {
+                let _ = _tx.send(_frame);
+            }),
+        )
         .expect("Failed to initialize av1 decoder");
         println!("av1 decoder initialized successfully");
     }
@@ -825,9 +873,12 @@ mod tests {
     fn init_vp8_decoder() {
         let (_tx, _rx) = mpsc::sync_channel::<Result<DecodedFrame<()>, Error>>(4);
         let config = test_decoder_config(DecoderCodec::Vp8);
-        let _decoder = Decoder::new(config, move |_frame| {
-            let _ = _tx.send(_frame);
-        })
+        let _decoder = Decoder::new(
+            config,
+            FnDecodeHandler::new(move |_frame| {
+                let _ = _tx.send(_frame);
+            }),
+        )
         .expect("Failed to initialize vp8 decoder");
         println!("vp8 decoder initialized successfully");
     }
@@ -836,9 +887,12 @@ mod tests {
     fn init_vp9_decoder() {
         let (_tx, _rx) = mpsc::sync_channel::<Result<DecodedFrame<()>, Error>>(4);
         let config = test_decoder_config(DecoderCodec::Vp9);
-        let _decoder = Decoder::new(config, move |_frame| {
-            let _ = _tx.send(_frame);
-        })
+        let _decoder = Decoder::new(
+            config,
+            FnDecodeHandler::new(move |_frame| {
+                let _ = _tx.send(_frame);
+            }),
+        )
         .expect("Failed to initialize vp9 decoder");
         println!("vp9 decoder initialized successfully");
     }
@@ -847,15 +901,21 @@ mod tests {
     fn test_multiple_decoders() {
         let config = test_decoder_config(DecoderCodec::Hevc);
         let (_tx1, _rx1) = mpsc::sync_channel::<Result<DecodedFrame<()>, Error>>(4);
-        let _decoder1 = Decoder::new(config.clone(), move |_frame| {
-            let _ = _tx1.send(_frame);
-        })
+        let _decoder1 = Decoder::new(
+            config.clone(),
+            FnDecodeHandler::new(move |_frame| {
+                let _ = _tx1.send(_frame);
+            }),
+        )
         .expect("Failed to initialize first h265 decoder");
 
         let (_tx2, _rx2) = mpsc::sync_channel::<Result<DecodedFrame<()>, Error>>(4);
-        let _decoder2 = Decoder::new(config, move |_frame| {
-            let _ = _tx2.send(_frame);
-        })
+        let _decoder2 = Decoder::new(
+            config,
+            FnDecodeHandler::new(move |_frame| {
+                let _ = _tx2.send(_frame);
+            }),
+        )
         .expect("Failed to initialize second h265 decoder");
         println!("Multiple h265 decoders initialized successfully");
     }
@@ -902,9 +962,12 @@ mod tests {
 
         let config = test_decoder_config(DecoderCodec::Hevc);
         let (tx, rx) = mpsc::sync_channel::<Result<DecodedFrame<()>, Error>>(4);
-        let decoder = Decoder::new(config, move |frame| {
-            let _ = tx.send(frame);
-        })
+        let decoder = Decoder::new(
+            config,
+            FnDecodeHandler::new(move |frame| {
+                let _ = tx.send(frame);
+            }),
+        )
         .expect("Failed to create h265 decoder");
 
         // デコードを実行
@@ -960,9 +1023,12 @@ mod tests {
 
         let config = test_decoder_config(DecoderCodec::H264);
         let (tx, rx) = mpsc::sync_channel::<Result<DecodedFrame<()>, Error>>(4);
-        let decoder = Decoder::new(config, move |frame| {
-            let _ = tx.send(frame);
-        })
+        let decoder = Decoder::new(
+            config,
+            FnDecodeHandler::new(move |frame| {
+                let _ = tx.send(frame);
+            }),
+        )
         .expect("Failed to create h264 decoder");
 
         // デコードを実行
@@ -997,9 +1063,12 @@ mod tests {
 
         let config = test_decoder_config(DecoderCodec::Av1);
         let (tx, rx) = mpsc::sync_channel::<Result<DecodedFrame<()>, Error>>(4);
-        let decoder = Decoder::new(config, move |frame| {
-            let _ = tx.send(frame);
-        })
+        let decoder = Decoder::new(
+            config,
+            FnDecodeHandler::new(move |frame| {
+                let _ = tx.send(frame);
+            }),
+        )
         .expect("Failed to create av1 decoder");
 
         // デコードを実行
@@ -1057,9 +1126,12 @@ mod tests {
 
         let config = test_decoder_config(DecoderCodec::Vp8);
         let (tx, rx) = mpsc::sync_channel::<Result<DecodedFrame<()>, Error>>(4);
-        let decoder = Decoder::new(config, move |frame| {
-            let _ = tx.send(frame);
-        })
+        let decoder = Decoder::new(
+            config,
+            FnDecodeHandler::new(move |frame| {
+                let _ = tx.send(frame);
+            }),
+        )
         .expect("Failed to create vp8 decoder");
 
         // デコードを実行
@@ -1093,9 +1165,12 @@ mod tests {
 
         let config = test_decoder_config(DecoderCodec::Vp9);
         let (tx, rx) = mpsc::sync_channel::<Result<DecodedFrame<()>, Error>>(4);
-        let decoder = Decoder::new(config, move |frame| {
-            let _ = tx.send(frame);
-        })
+        let decoder = Decoder::new(
+            config,
+            FnDecodeHandler::new(move |frame| {
+                let _ = tx.send(frame);
+            }),
+        )
         .expect("Failed to create vp9 decoder");
 
         // デコードを実行
@@ -1125,9 +1200,12 @@ mod tests {
         let config = test_decoder_config(DecoderCodec::H264);
 
         let mut decoder = ManuallyDrop::new(
-            Decoder::new(config, move |frame| {
-                let _ = tx.send(frame);
-            })
+            Decoder::new(
+                config,
+                FnDecodeHandler::new(move |frame| {
+                    let _ = tx.send(frame);
+                }),
+            )
             .unwrap(),
         );
 
@@ -1152,9 +1230,12 @@ mod tests {
         let config = test_decoder_config(DecoderCodec::H264);
 
         let mut decoder = ManuallyDrop::new(
-            Decoder::new(config, move |frame| {
-                let _ = tx.send(frame);
-            })
+            Decoder::new(
+                config,
+                FnDecodeHandler::new(move |frame| {
+                    let _ = tx.send(frame);
+                }),
+            )
             .unwrap(),
         );
 

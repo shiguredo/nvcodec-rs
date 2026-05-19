@@ -1151,12 +1151,51 @@ impl Drop for EncoderState {
     }
 }
 
+/// エンコード結果を通知するためのハンドラー
+///
+/// エンコード処理が完了するたびに [`EncodeHandler::on_encoded`] が呼ばれる。
+pub trait EncodeHandler: Send + 'static {
+    /// ユーザーデータ型
+    type UserData: Send + 'static;
+    /// エラー型
+    type Error: From<crate::Error> + Send + 'static;
+    /// エンコード完了時に呼ばれる
+    fn on_encoded(&mut self, result: Result<EncodedFrame<Self::UserData>, Self::Error>);
+}
+
+/// `FnMut` クロージャを [`EncodeHandler`] にするラッパー
+pub struct FnEncodeHandler<T, E = crate::Error> {
+    f: Box<dyn FnMut(Result<EncodedFrame<T>, E>) + Send + 'static>,
+}
+
+impl<T, E> FnEncodeHandler<T, E> {
+    /// `FnMut` クロージャから [`FnEncodeHandler`] を生成する
+    pub fn new<F>(f: F) -> Self
+    where
+        F: FnMut(Result<EncodedFrame<T>, E>) + Send + 'static,
+    {
+        Self { f: Box::new(f) }
+    }
+}
+
+impl<T, E> EncodeHandler for FnEncodeHandler<T, E>
+where
+    T: Send + 'static,
+    E: From<crate::Error> + Send + 'static,
+{
+    type UserData = T;
+    type Error = E;
+    fn on_encoded(&mut self, result: Result<EncodedFrame<T>, E>) {
+        (self.f)(result);
+    }
+}
+
 /// エンコーダー
 ///
 /// 内部で専用のワーカースレッドを起動し、非同期でエンコードを行う。
-/// エンコードが完了すると、コンストラクタで渡したコールバックがワーカースレッド上で即座に呼び出される。
-pub struct Encoder<T> {
-    job_tx: Sender<Job<T>>,
+/// エンコードが完了すると、コンストラクタで渡したハンドラがワーカースレッド上で即座に呼び出される。
+pub struct Encoder<H: EncodeHandler> {
+    job_tx: Sender<Job<H::UserData>>,
     worker: Option<JoinHandle<()>>,
     drain_handle: Option<JoinHandle<()>>,
 }
@@ -1206,17 +1245,17 @@ enum Job<T> {
     },
 }
 
-impl<T: Send + 'static> Encoder<T> {
+impl<H: EncodeHandler> Encoder<H> {
     /// エンコーダーを生成する。
     ///
     /// 2 つの内部スレッドが起動される:
     /// - worker スレッド（`nvcodec-encoder`）: job の受信、フレーム送信、バッファ管理
     /// - drain スレッド（`nvcodec-drain`）: NVENC のエンコード待機とエンコード済みデータの取り出し
-    pub fn new<F>(config: EncoderConfig, mut callback: F) -> Result<Self, Error>
+    pub fn new(config: EncoderConfig, handler: H) -> Result<Self, Error>
     where
-        F: FnMut(Result<EncodedFrame<T>, Error>) + Send + 'static,
+        H: EncodeHandler,
     {
-        let (job_tx, job_rx) = mpsc::channel::<Job<T>>();
+        let (job_tx, job_rx) = mpsc::channel::<Job<H::UserData>>();
         let (drain_tx, drain_rx) = mpsc::channel::<DrainRequest>();
 
         let state = EncoderState::new(&config)?;
@@ -1226,7 +1265,7 @@ impl<T: Send + 'static> Encoder<T> {
         let drain_handle = std::thread::Builder::new()
             .name("nvcodec-drain".into())
             .spawn(move || {
-                drain_thread_loop::<T>(drain_rx, drain_job_tx);
+                drain_thread_loop::<H::UserData>(drain_rx, drain_job_tx);
             })
             .map_err(|_e| Error::new_custom("Encoder::new", "failed to spawn drain thread"))?;
 
@@ -1234,7 +1273,7 @@ impl<T: Send + 'static> Encoder<T> {
         let worker = std::thread::Builder::new()
             .name("nvcodec-encoder".into())
             .spawn(move || {
-                run_worker(state, &mut callback, job_rx, drain_tx);
+                run_worker(state, handler, job_rx, drain_tx);
             })
             .map_err(|_e| Error::new_custom("Encoder::new", "failed to spawn encoder thread"))?;
 
@@ -1249,7 +1288,12 @@ impl<T: Send + 'static> Encoder<T> {
     ///
     /// フレームデータとオプションをワーカースレッドに送信し、即座に戻る。
     /// エンコードが完了すると、コンストラクタで渡したコールバックが呼び出される。
-    pub fn encode(&self, data: &[u8], options: &EncodeOptions, user_data: T) -> Result<(), Error> {
+    pub fn encode(
+        &self,
+        data: &[u8],
+        options: &EncodeOptions,
+        user_data: H::UserData,
+    ) -> Result<(), Error> {
         self.job_tx
             .send(Job::Encode {
                 data: data.to_vec(),
@@ -1303,7 +1347,7 @@ impl<T: Send + 'static> Encoder<T> {
     }
 }
 
-impl<T> Drop for Encoder<T> {
+impl<H: EncodeHandler> Drop for Encoder<H> {
     fn drop(&mut self) {
         // worker スレッドに Terminate を送信して終了待機。
         // run_worker 内で全 in-flight フレームの drain が完了した後、
@@ -1322,13 +1366,13 @@ impl<T> Drop for Encoder<T> {
     }
 }
 
-impl<T> std::fmt::Debug for Encoder<T> {
+impl<H: EncodeHandler> std::fmt::Debug for Encoder<H> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Encoder").finish_non_exhaustive()
     }
 }
 
-unsafe impl<T: Send> Send for Encoder<T> {}
+unsafe impl<H: EncodeHandler> Send for Encoder<H> {}
 
 /// 指定コーデックのエンコーダのケーパビリティをクエリする
 pub fn query_encoder_caps(codec: EncoderCodec, device_id: i32) -> Result<EncoderCaps, Error> {
@@ -1499,19 +1543,18 @@ fn lock_and_copy_bitstream(
 ///                                       (DrainResult の返送)
 /// ```
 ///
-/// - worker スレッド: フレーム送信（encode_frame）、バッファ管理、callback 呼び出し
+/// - worker スレッド: フレーム送信（encode_frame）、バッファ管理、handler 呼び出し
 /// - drain スレッド: nvEncLockBitstream（ブロッキング）を実行し、結果を job_tx 経由で返送
-fn run_worker<F, T>(
+fn run_worker<H>(
     mut state: EncoderState,
-    callback: &mut F,
-    job_rx: Receiver<Job<T>>,
+    mut handler: H,
+    job_rx: Receiver<Job<H::UserData>>,
     drain_tx: Sender<DrainRequest>,
 ) where
-    F: FnMut(Result<EncodedFrame<T>, Error>) + Send + 'static,
-    T: Send + 'static,
+    H: EncodeHandler,
 {
     // user_data を保持するキュー。
-    let mut pending_user_data: VecDeque<T> = VecDeque::new();
+    let mut pending_user_data: VecDeque<H::UserData> = VecDeque::new();
     // drain リクエストを送信済みのフレーム数。
     // i_got <= i_in_flight <= i_to_send
     let mut i_in_flight = 0;
@@ -1519,7 +1562,7 @@ fn run_worker<F, T>(
     while let Ok(job) = job_rx.recv() {
         match job {
             Job::DrainResult { result } => {
-                consume_drain_result(&mut state, result, &mut pending_user_data, callback);
+                consume_drain_result(&mut state, result, &mut pending_user_data, &mut handler);
             }
             Job::Encode {
                 data,
@@ -1528,7 +1571,9 @@ fn run_worker<F, T>(
             } => {
                 // バッファが満杯の場合はエラー callback を実行する
                 if state.i_to_send - state.i_got >= state.n_encoder_buffer {
-                    callback(Err(Error::new_custom("encode", "encoder buffer is full")));
+                    handler.on_encoded(Err(
+                        Error::new_custom("encode", "encoder buffer is full").into()
+                    ));
                     continue;
                 }
 
@@ -1546,26 +1591,26 @@ fn run_worker<F, T>(
                             &drain_tx,
                             &state,
                             &mut i_in_flight,
-                            callback,
+                            &mut handler,
                         ) {
                             return;
                         }
                     }
                     Err(e) => {
-                        callback(Err(e));
+                        handler.on_encoded(Err(e.into()));
                     }
                 }
             }
             Job::Reconfigure { params, done } => {
                 // バッファプール再構築との競合を防ぐため、
                 // 全 in-flight フレームを drain してから reconfigure を実行する。
-                if !send_pending_drain_requests(&drain_tx, &state, &mut i_in_flight, callback) {
+                if !send_pending_drain_requests(&drain_tx, &state, &mut i_in_flight, &mut handler) {
                     return;
                 }
                 if !wait_all_drains(
                     &mut state,
                     &mut pending_user_data,
-                    callback,
+                    &mut handler,
                     &job_rx,
                     "reconfigure",
                 ) {
@@ -1575,13 +1620,13 @@ fn run_worker<F, T>(
             }
             Job::Flush { done } => {
                 // 全 in-flight フレームが drain されるまで待機する
-                if !send_pending_drain_requests(&drain_tx, &state, &mut i_in_flight, callback) {
+                if !send_pending_drain_requests(&drain_tx, &state, &mut i_in_flight, &mut handler) {
                     return;
                 }
                 if !wait_all_drains(
                     &mut state,
                     &mut pending_user_data,
-                    callback,
+                    &mut handler,
                     &job_rx,
                     "flush",
                 ) {
@@ -1599,13 +1644,13 @@ fn run_worker<F, T>(
                 let _ = state.send_eos();
 
                 // EOS 送信後に残っている全フレームを drain する。
-                if !send_pending_drain_requests(&drain_tx, &state, &mut i_in_flight, callback) {
+                if !send_pending_drain_requests(&drain_tx, &state, &mut i_in_flight, &mut handler) {
                     return;
                 }
                 if !wait_all_drains(
                     &mut state,
                     &mut pending_user_data,
-                    callback,
+                    &mut handler,
                     &job_rx,
                     "terminate",
                 ) {
@@ -1619,14 +1664,13 @@ fn run_worker<F, T>(
 }
 
 /// drain スレッドから受信した結果を消費し、後片付けして callback を呼び出す
-fn consume_drain_result<F, T>(
+fn consume_drain_result<H>(
     state: &mut EncoderState,
     result: Result<(Vec<u8>, u64, PictureType), Error>,
-    pending_user_data: &mut VecDeque<T>,
-    callback: &mut F,
+    pending_user_data: &mut VecDeque<H::UserData>,
+    handler: &mut H,
 ) where
-    F: FnMut(Result<EncodedFrame<T>, Error>) + Send + 'static,
-    T: Send + 'static,
+    H: EncodeHandler,
 {
     let bfr_idx = state.i_got % state.n_encoder_buffer;
 
@@ -1640,37 +1684,37 @@ fn consume_drain_result<F, T>(
             // pending_user_data は送信順に push されているため、
             // pop_front で対応する user_data が取得できる
             if let Some(user_data) = pending_user_data.pop_front() {
-                callback(Ok(EncodedFrame {
+                handler.on_encoded(Ok(EncodedFrame {
                     data,
                     timestamp,
                     picture_type,
                     user_data,
                 }));
             } else {
-                callback(Err(Error::new_custom(
+                handler.on_encoded(Err(Error::new_custom(
                     "consume_drain_result",
                     "missing user data",
-                )));
+                )
+                .into()));
             }
         }
         Err(e) => {
             // エラー発生時は全 pending データをクリアする。
             pending_user_data.clear();
-            callback(Err(e));
+            handler.on_encoded(Err(e.into()));
         }
     }
 }
 
 /// 未送信の drain リクエストをすべて送信する
-fn send_pending_drain_requests<F, T>(
+fn send_pending_drain_requests<H>(
     drain_tx: &Sender<DrainRequest>,
     state: &EncoderState,
     i_in_flight: &mut usize,
-    callback: &mut F,
+    handler: &mut H,
 ) -> bool
 where
-    F: FnMut(Result<EncodedFrame<T>, Error>) + Send + 'static,
-    T: Send + 'static,
+    H: EncodeHandler,
 {
     while *i_in_flight < state.i_to_send {
         let bfr_idx = *i_in_flight % state.n_encoder_buffer;
@@ -1683,10 +1727,11 @@ where
             output_bitstream: state.bitstream_buffers[bfr_idx],
         });
         if result.is_err() {
-            callback(Err(Error::new_custom(
+            handler.on_encoded(Err(Error::new_custom(
                 "send_pending_drain_requests",
                 "drain thread has terminated",
-            )));
+            )
+            .into()));
             return false;
         };
         *i_in_flight += 1;
@@ -1700,27 +1745,27 @@ where
 /// エラー callback を呼ぶ。
 /// job_rx が切断された場合は `false` を返す
 /// （呼び出し元の run_worker が return すべきことを示す）。
-fn wait_all_drains<F, T>(
+fn wait_all_drains<H>(
     state: &mut EncoderState,
-    pending_user_data: &mut VecDeque<T>,
-    callback: &mut F,
-    job_rx: &Receiver<Job<T>>,
+    pending_user_data: &mut VecDeque<H::UserData>,
+    handler: &mut H,
+    job_rx: &Receiver<Job<H::UserData>>,
     context: &'static str,
 ) -> bool
 where
-    F: FnMut(Result<EncodedFrame<T>, Error>) + Send + 'static,
-    T: Send + 'static,
+    H: EncodeHandler,
 {
     while state.i_got < state.i_to_send {
         match job_rx.recv() {
             Ok(Job::DrainResult { result }) => {
-                consume_drain_result(state, result, pending_user_data, callback);
+                consume_drain_result(state, result, pending_user_data, handler);
             }
             Ok(_) => {
-                callback(Err(Error::new_custom(
+                handler.on_encoded(Err(Error::new_custom(
                     context,
                     "unexpected message during drain",
-                )));
+                )
+                .into()));
             }
             Err(_) => return false,
         }
@@ -1761,9 +1806,12 @@ mod tests {
             profile: None,
             idr_period: None,
         }));
-        let _encoder = Encoder::new(config, move |frame| {
-            let _ = tx.send(frame);
-        })
+        let _encoder = Encoder::new(
+            config,
+            FnEncodeHandler::new(move |frame| {
+                let _ = tx.send(frame);
+            }),
+        )
         .expect("failed to initialize h264 encoder");
     }
 
@@ -1774,9 +1822,12 @@ mod tests {
             profile: None,
             idr_period: None,
         }));
-        let _encoder = Encoder::new(config, move |frame| {
-            let _ = tx.send(frame);
-        })
+        let _encoder = Encoder::new(
+            config,
+            FnEncodeHandler::new(move |frame| {
+                let _ = tx.send(frame);
+            }),
+        )
         .expect("failed to initialize h265 encoder");
     }
 
@@ -1787,9 +1838,12 @@ mod tests {
             profile: None,
             idr_period: None,
         }));
-        let _encoder = Encoder::new(config, move |frame| {
-            let _ = tx.send(frame);
-        })
+        let _encoder = Encoder::new(
+            config,
+            FnEncodeHandler::new(move |frame| {
+                let _ = tx.send(frame);
+            }),
+        )
         .expect("failed to initialize av1 encoder");
     }
 
@@ -1800,9 +1854,12 @@ mod tests {
             profile: None,
             idr_period: None,
         }));
-        let encoder = Encoder::new(config, move |frame| {
-            let _ = tx.send(frame);
-        })
+        let encoder = Encoder::new(
+            config,
+            FnEncodeHandler::new(move |frame| {
+                let _ = tx.send(frame);
+            }),
+        )
         .expect("failed to create h264 encoder");
 
         // SPS/PPS を取得
@@ -1826,9 +1883,12 @@ mod tests {
             profile: None,
             idr_period: None,
         }));
-        let encoder = Encoder::new(config, move |frame| {
-            let _ = tx.send(frame);
-        })
+        let encoder = Encoder::new(
+            config,
+            FnEncodeHandler::new(move |frame| {
+                let _ = tx.send(frame);
+            }),
+        )
         .expect("failed to create h265 encoder");
 
         // VPS/SPS/PPS を取得
@@ -1852,9 +1912,12 @@ mod tests {
             profile: None,
             idr_period: None,
         }));
-        let encoder = Encoder::new(config, move |frame| {
-            let _ = tx.send(frame);
-        })
+        let encoder = Encoder::new(
+            config,
+            FnEncodeHandler::new(move |frame| {
+                let _ = tx.send(frame);
+            }),
+        )
         .expect("failed to create av1 encoder");
 
         // Sequence Header OBU を取得
@@ -1881,9 +1944,12 @@ mod tests {
         let width = config.width;
         let height = config.height;
 
-        let encoder = Encoder::new(config, move |frame| {
-            let _ = tx.send(frame);
-        })
+        let encoder = Encoder::new(
+            config,
+            FnEncodeHandler::new(move |frame| {
+                let _ = tx.send(frame);
+            }),
+        )
         .expect("failed to create h264 encoder");
 
         // NV12 形式の黒フレームを準備
@@ -1937,9 +2003,12 @@ mod tests {
         let width = config.width;
         let height = config.height;
 
-        let encoder = Encoder::new(config, move |frame| {
-            let _ = tx.send(frame);
-        })
+        let encoder = Encoder::new(
+            config,
+            FnEncodeHandler::new(move |frame| {
+                let _ = tx.send(frame);
+            }),
+        )
         .expect("failed to create h265 encoder");
 
         // NV12 形式の黒フレームを準備
@@ -1993,9 +2062,12 @@ mod tests {
         let width = config.width;
         let height = config.height;
 
-        let encoder = Encoder::new(config, move |frame| {
-            let _ = tx.send(frame);
-        })
+        let encoder = Encoder::new(
+            config,
+            FnEncodeHandler::new(move |frame| {
+                let _ = tx.send(frame);
+            }),
+        )
         .expect("failed to create av1 encoder");
 
         // NV12 形式の黒フレームを準備
@@ -2051,9 +2123,12 @@ mod tests {
         let width = config.width;
         let height = config.height;
 
-        let encoder = Encoder::new(config, move |frame| {
-            let _ = tx.send(frame);
-        })
+        let encoder = Encoder::new(
+            config,
+            FnEncodeHandler::new(move |frame| {
+                let _ = tx.send(frame);
+            }),
+        )
         .expect("failed to create h264 encoder");
 
         // NV12 形式の黒フレームを準備
@@ -2103,9 +2178,12 @@ mod tests {
             idr_period: None,
         }));
 
-        let encoder = Encoder::new(config, move |frame| {
-            let _ = tx.send(frame);
-        })
+        let encoder = Encoder::new(
+            config,
+            FnEncodeHandler::new(move |frame| {
+                let _ = tx.send(frame);
+            }),
+        )
         .expect("failed to create h264 encoder");
 
         // フレームを送信せずに flush してもハングしないことを確認
@@ -2126,9 +2204,12 @@ mod tests {
         let width = config.width;
         let height = config.height;
 
-        let encoder = Encoder::new(config, move |frame| {
-            let _ = tx.send(frame);
-        })
+        let encoder = Encoder::new(
+            config,
+            FnEncodeHandler::new(move |frame| {
+                let _ = tx.send(frame);
+            }),
+        )
         .expect("failed to create h264 encoder");
 
         // フレームレートとビットレートを動的に変更
@@ -2222,9 +2303,12 @@ mod tests {
             720,
         );
 
-        let encoder = Encoder::new(config, move |frame| {
-            let _ = tx.send(frame);
-        })
+        let encoder = Encoder::new(
+            config,
+            FnEncodeHandler::new(move |frame| {
+                let _ = tx.send(frame);
+            }),
+        )
         .expect("failed to create h264 encoder");
 
         // 初期解像度でエンコード
@@ -2294,9 +2378,12 @@ mod tests {
             720,
         );
 
-        let encoder = Encoder::new(config, move |frame| {
-            let _ = tx.send(frame);
-        })
+        let encoder = Encoder::new(
+            config,
+            FnEncodeHandler::new(move |frame| {
+                let _ = tx.send(frame);
+            }),
+        )
         .expect("failed to create h264 encoder");
 
         // 初期解像度でエンコード
@@ -2366,9 +2453,12 @@ mod tests {
             480,
         );
 
-        let encoder = Encoder::new(config, move |frame| {
-            let _ = tx.send(frame);
-        })
+        let encoder = Encoder::new(
+            config,
+            FnEncodeHandler::new(move |frame| {
+                let _ = tx.send(frame);
+            }),
+        )
         .expect("failed to create h264 encoder");
 
         // 初期解像度でエンコード
@@ -2430,9 +2520,12 @@ mod tests {
             720,
         );
 
-        let encoder = Encoder::new(config, move |frame| {
-            let _ = tx.send(frame);
-        })
+        let encoder = Encoder::new(
+            config,
+            FnEncodeHandler::new(move |frame| {
+                let _ = tx.send(frame);
+            }),
+        )
         .expect("failed to create h264 encoder");
 
         // 初期解像度でエンコード
@@ -2494,9 +2587,12 @@ mod tests {
             720,
         );
 
-        let encoder = Encoder::new(config, move |frame| {
-            let _ = tx.send(frame);
-        })
+        let encoder = Encoder::new(
+            config,
+            FnEncodeHandler::new(move |frame| {
+                let _ = tx.send(frame);
+            }),
+        )
         .expect("failed to create h264 encoder");
 
         // 複数フレームをエンコード（in-flight フレーム有りの reconfigure をテスト）
@@ -2577,9 +2673,12 @@ mod tests {
         }));
 
         let mut encoder = ManuallyDrop::new(
-            Encoder::new(config, move |frame| {
-                let _ = tx.send(frame);
-            })
+            Encoder::new(
+                config,
+                FnEncodeHandler::new(move |frame| {
+                    let _ = tx.send(frame);
+                }),
+            )
             .unwrap(),
         );
 
@@ -2615,9 +2714,12 @@ mod tests {
         }));
 
         let mut encoder = ManuallyDrop::new(
-            Encoder::new(config, move |frame| {
-                let _ = tx.send(frame);
-            })
+            Encoder::new(
+                config,
+                FnEncodeHandler::new(move |frame| {
+                    let _ = tx.send(frame);
+                }),
+            )
             .unwrap(),
         );
 
@@ -2645,9 +2747,12 @@ mod tests {
         }));
 
         let mut encoder = ManuallyDrop::new(
-            Encoder::new(config, move |frame| {
-                let _ = tx.send(frame);
-            })
+            Encoder::new(
+                config,
+                FnEncodeHandler::new(move |frame| {
+                    let _ = tx.send(frame);
+                }),
+            )
             .unwrap(),
         );
 
@@ -2708,12 +2813,15 @@ mod tests {
 
         let ec = encode_count.clone();
         let fca = first_cb_after.clone();
-        let encoder = Encoder::new(config, move |frame| {
-            let count = ec.load(Ordering::SeqCst);
-            fca.compare_exchange(0, count, Ordering::SeqCst, Ordering::SeqCst)
-                .ok();
-            let _ = cb_tx.send(frame);
-        })
+        let encoder = Encoder::new(
+            config,
+            FnEncodeHandler::new(move |frame| {
+                let count = ec.load(Ordering::SeqCst);
+                fca.compare_exchange(0, count, Ordering::SeqCst, Ordering::SeqCst)
+                    .ok();
+                let _ = cb_tx.send(frame);
+            }),
+        )
         .expect("failed to create h264 encoder");
 
         let frame_data = create_black_frame(width, height);
@@ -2761,9 +2869,12 @@ mod tests {
         }));
 
         let mut encoder = ManuallyDrop::new(
-            Encoder::new(config, move |frame| {
-                let _ = tx.send(frame);
-            })
+            Encoder::new(
+                config,
+                FnEncodeHandler::new(move |frame| {
+                    let _ = tx.send(frame);
+                }),
+            )
             .unwrap(),
         );
 
