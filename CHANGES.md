@@ -11,67 +11,13 @@
 
 ## develop
 
-- [UPDATE] `EncoderState` の CUDA コンテキスト管理を `with_context` パターンに統一する
-  - `encode_frame`, `lock_and_copy_bitstream`, `send_eos`, `unmap_resource` でコンテキスト管理を自己完結させる
-  - `run_worker` と `drain_one_with_ctx` から手動の `cuCtxPushCurrent` / `cuCtxPopCurrent` を除去する
-  - `drain_one_with_ctx` を `drain_one` にリネームする
-  - これにより `.expect()` パニックの温床が消滅し、issue 0016 も自然解決する
-  - @melpon
-
-- [FIX] encode の drain を専用スレッドに分離し、callback の n_output_delay フレーム分の遅延を解消する
-  - `DrainRequest` / `DrainResult` による drain スレッドとの mpsc 通信を追加する
-  - worker スレッドの post-drain（n_output_delay による遅延制御）を廃止する
-  - バッファ満杯時はエラーコールバックを返す方式に変更する
-  - @melpon
-
-- [FIX] `encode_frame_inner` で mapped resource に RAII ガード（ReleaseGuard）を導入する
-  - エンコード失敗時に ReleaseGuard の drop で自動的に unmap されるようにする
-  - 成功時は cancel() でガードを解除し、後続の drain が unmap を担当する
-  - @melpon
-- [ADD] `EncodedFrame<T>` 構造体を追加する
-  - `user_data: T` フィールドを持ち、エンコード完了時に任意のユーザーデータを callback 経由で受け取れるようにする
-  - `into_parts()` メソッドでデータとユーザーデータに分解できる
-  - `user_data()` メソッドでユーザーデータの参照を取得できる
-  - @melpon
-
-  - `into_parts()` メソッドでデータとユーザーデータに分解できる
-  - `user_data()` メソッドでユーザーデータの参照を取得できる
-  - @melpon
-
-  - `Encoder::new()` に完了用のコールバックを渡すようにする
-  - `Encoder::next_frame()` は廃止
-  - @melpon
-
-  - `Decoder::new()` に完了用のコールバックを渡すようにする
-  - `Decoder::next_frame()` は廃止
-  - @melpon
-
-  - `query_encoder_caps()` 及び `query_decoder_caps()` にリネーム
-  - @melpon
-
-  - `reconfigure_inner` で `self.pitch` とバッファプール（`device_inputs` / `registered_resources` / `bitstream_buffers`）を解像度変更時に更新する
-  - `run_worker` の `Job::Reconfigure` 分岐で in-flight フレームを全て drain してから reconfigure を実行する
-  - `cleanup_buffer_pool` を idempotent 化（再呼び出し時にパニックしない）
-  - `Encoder::reconfigure` の doc コメントに解像度変更後の IDR フレーム送出要件を追記する
-  - @melpon
-
-  - Ok パスから `.expect()` を除去し、`pending_user_data` が空の場合はエラーコールバックで通知する
-  - Err パスで `pending_user_data` の状態にかかわらず必ずエラーを通知し、残存 user_data を破棄する
-  - @melpon
-
-
-- [UPDATE] `Encoder<T>::reconfigure` と `Encoder<T>::get_sequence_params` のレシーバを `&mut self` から `&self` に変更する
-  - 内部で `job_tx.send()` のみを使用するため可変借用は不要
-  - @melpon
-
-- [UPDATE] `EncoderState::expected_frame_size` フィールドを削除する
-  - フィールドは一度も読み取られることなく、毎回再計算されていた
-  - @melpon
+- [CHANGE] エンコード・デコードの結果を非同期コールバックで受け取るようにする
+  - `Encoder::new()` と `Decoder::new()` に完了用のコールバックを渡すようにする
+  - `Encoder::next_frame()` と `Decoder::next_frame()` は廃止
+  - `Encoder::query_caps()` と `Decoder::query_caps()` は `query_encoder_caps()` 及び `query_decoder_caps()` に変更
 
 ### misc
 
-- `EncoderState` と `DecoderState` の内部メソッドから不要な `pub` を削除する
-  - @melpon
 ## 2026.1.0
 
 **リリース日**: 2026-03-31
