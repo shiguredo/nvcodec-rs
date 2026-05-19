@@ -18,6 +18,12 @@
   - これにより `.expect()` パニックの温床が消滅し、issue 0016 も自然解決する
   - @melpon
 
+- [FIX] encode の drain を専用スレッドに分離し、callback の n_output_delay フレーム分の遅延を解消する
+  - `DrainRequest` / `DrainResult` による drain スレッドとの mpsc 通信を追加する
+  - worker スレッドの post-drain（n_output_delay による遅延制御）を廃止する
+  - バッファ満杯時はエラーコールバックを返す方式に変更する
+  - @melpon
+
 - [FIX] `encode_frame_inner` で mapped resource に RAII ガード（ReleaseGuard）を導入する
   - エンコード失敗時に ReleaseGuard の drop で自動的に unmap されるようにする
   - 成功時は cancel() でガードを解除し、後続の drain が unmap を担当する
