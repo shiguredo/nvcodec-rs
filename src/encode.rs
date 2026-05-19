@@ -1542,7 +1542,14 @@ fn run_worker<F, T>(
                         pending_user_data.push_back(user_data);
                         state.i_to_send += 1;
                         // 新たに送信したフレームの drain リクエストを送信
-                        send_pending_drain_requests(&drain_tx, &state, &mut i_in_flight);
+                        if !send_pending_drain_requests(
+                            &drain_tx,
+                            &state,
+                            &mut i_in_flight,
+                            callback,
+                        ) {
+                            return;
+                        }
                     }
                     Err(e) => {
                         callback(Err(e));
@@ -1552,7 +1559,9 @@ fn run_worker<F, T>(
             Job::Reconfigure { params, done } => {
                 // バッファプール再構築との競合を防ぐため、
                 // 全 in-flight フレームを drain してから reconfigure を実行する。
-                send_pending_drain_requests(&drain_tx, &state, &mut i_in_flight);
+                if !send_pending_drain_requests(&drain_tx, &state, &mut i_in_flight, callback) {
+                    return;
+                }
                 if !wait_all_drains(
                     &mut state,
                     &mut pending_user_data,
@@ -1566,7 +1575,9 @@ fn run_worker<F, T>(
             }
             Job::Flush { done } => {
                 // 全 in-flight フレームが drain されるまで待機する
-                send_pending_drain_requests(&drain_tx, &state, &mut i_in_flight);
+                if !send_pending_drain_requests(&drain_tx, &state, &mut i_in_flight, callback) {
+                    return;
+                }
                 if !wait_all_drains(
                     &mut state,
                     &mut pending_user_data,
@@ -1588,7 +1599,9 @@ fn run_worker<F, T>(
                 let _ = state.send_eos();
 
                 // EOS 送信後に残っている全フレームを drain する。
-                send_pending_drain_requests(&drain_tx, &state, &mut i_in_flight);
+                if !send_pending_drain_requests(&drain_tx, &state, &mut i_in_flight, callback) {
+                    return;
+                }
                 if !wait_all_drains(
                     &mut state,
                     &mut pending_user_data,
@@ -1649,14 +1662,19 @@ fn consume_drain_result<F, T>(
 }
 
 /// 未送信の drain リクエストをすべて送信する
-fn send_pending_drain_requests(
+fn send_pending_drain_requests<F, T>(
     drain_tx: &Sender<DrainRequest>,
     state: &EncoderState,
     i_in_flight: &mut usize,
-) {
+    callback: &mut F,
+) -> bool
+where
+    F: FnMut(Result<EncodedFrame<T>, Error>) + Send + 'static,
+    T: Send + 'static,
+{
     while *i_in_flight < state.i_to_send {
         let bfr_idx = *i_in_flight % state.n_encoder_buffer;
-        let _ = drain_tx.send(DrainRequest {
+        let result = drain_tx.send(DrainRequest {
             lib: state.lib.clone(),
             ctx: state.ctx,
             lock_fn: state.encoder_api.nvEncLockBitstream,
@@ -1664,8 +1682,16 @@ fn send_pending_drain_requests(
             encoder: state.encoder,
             output_bitstream: state.bitstream_buffers[bfr_idx],
         });
+        if result.is_err() {
+            callback(Err(Error::new_custom(
+                "send_pending_drain_requests",
+                "drain thread has terminated",
+            )));
+            return false;
+        };
         *i_in_flight += 1;
     }
+    true
 }
 
 /// 全 in-flight フレームの drain 完了を待機する
