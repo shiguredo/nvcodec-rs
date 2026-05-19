@@ -16,14 +16,14 @@ mod sys;
 
 pub use codec_info::*;
 pub use decode::{
-    DecodedFrame, Decoder, DecoderCaps, DecoderCodec, DecoderConfig, SurfaceFormat,
-    query_decoder_caps,
+    DecodeHandler, DecodedFrame, Decoder, DecoderCaps, DecoderCodec, DecoderConfig,
+    FnDecodeHandler, SurfaceFormat, query_decoder_caps,
 };
 pub use encode::{
-    Av1EncoderConfig, Av1Profile, BufferFormat, CodecConfig, EncodeOptions, EncodedFrame, Encoder,
-    EncoderCaps, EncoderCodec, EncoderConfig, H264EncoderConfig, H264Profile, HevcEncoderConfig,
-    HevcProfile, PictureType, Preset, RateControlMode, ReconfigureParams, TuningInfo,
-    query_encoder_caps,
+    Av1EncoderConfig, Av1Profile, BufferFormat, CodecConfig, EncodeHandler, EncodeOptions,
+    EncodedFrame, Encoder, EncoderCaps, EncoderCodec, EncoderConfig, FnEncodeHandler,
+    H264EncoderConfig, H264Profile, HevcEncoderConfig, HevcProfile, PictureType, Preset,
+    RateControlMode, ReconfigureParams, TuningInfo, query_encoder_caps,
 };
 pub use error::Error;
 

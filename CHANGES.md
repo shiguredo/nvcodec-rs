@@ -11,10 +11,14 @@
 
 ## develop
 
-- [CHANGE] エンコード・デコードの結果を非同期コールバックで受け取るようにする
-  - `Encoder::new()` と `Decoder::new()` に完了用のコールバックを渡すようにする
+- [CHANGE] エンコード・デコードの結果をトレイトベースのハンドラーを使って非同期で受け取るようにする
+  - `EncodeHandler` トレイトと `FnEncodeHandler` ラッパーを追加
+  - `DecodeHandler` トレイトと `FnDecodeHandler` ラッパーを追加
+  - `Encoder` を `Encoder<H: EncodeHandler>` に、`Decoder` を `Decoder<H: DecodeHandler>` に変更
+  - `Encoder::new()` と `Decoder::new()` に完了用コールバックを受け取るハンドラを渡すようにする
   - `Encoder::next_frame()` と `Decoder::next_frame()` は廃止
   - `Encoder::query_caps()` と `Decoder::query_caps()` は `query_encoder_caps()` 及び `query_decoder_caps()` に変更
+  - @melpon
 
 ### misc
 
