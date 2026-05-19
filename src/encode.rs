@@ -1,7 +1,7 @@
 use std::collections::VecDeque;
 use std::ffi::c_void;
 use std::ptr;
-use std::sync::mpsc::{self, Receiver, SyncSender};
+use std::sync::mpsc::{self, Receiver, Sender, SyncSender};
 use std::thread::JoinHandle;
 
 use crate::{CudaLibrary, Error, ReleaseGuard, sys};
@@ -460,7 +460,6 @@ struct EncoderState {
 
     // バッファプール
     n_encoder_buffer: usize,
-    n_output_delay: usize,
     device_inputs: Vec<sys::CUdeviceptr>,
     registered_resources: Vec<sys::NV_ENC_REGISTERED_PTR>,
     bitstream_buffers: Vec<sys::NV_ENC_OUTPUT_PTR>,
@@ -514,7 +513,6 @@ impl EncoderState {
             })?;
 
             let n_encoder_buffer = config.frame_interval_p as usize + 3;
-            let n_output_delay = n_encoder_buffer - 1;
 
             let mut state = Self {
                 lib: lib.clone(),
@@ -529,7 +527,6 @@ impl EncoderState {
                 init_params: std::mem::zeroed(),
                 encode_config: std::mem::zeroed(),
                 n_encoder_buffer,
-                n_output_delay,
                 device_inputs: Vec::with_capacity(n_encoder_buffer),
                 registered_resources: Vec::with_capacity(n_encoder_buffer),
                 bitstream_buffers: Vec::with_capacity(n_encoder_buffer),
@@ -1109,59 +1106,9 @@ impl EncoderState {
             Ok(())
         }
     }
+}
 
-    fn lock_and_copy_bitstream(
-        &self,
-        bfr_idx: usize,
-    ) -> Result<(Vec<u8>, u64, PictureType), Error> {
-        self.lib.with_context(self.ctx, || {
-            unsafe {
-                let mut lock_bitstream: sys::NV_ENC_LOCK_BITSTREAM = std::mem::zeroed();
-                lock_bitstream.version = sys::NV_ENC_LOCK_BITSTREAM_VER;
-                lock_bitstream.outputBitstream = self.bitstream_buffers[bfr_idx];
-
-                let status = self
-                    .encoder_api
-                    .nvEncLockBitstream
-                    .map(|f| f(self.encoder, &mut lock_bitstream))
-                    .unwrap_or(sys::_NVENCSTATUS_NV_ENC_ERR_INVALID_PTR);
-                Error::check_nvenc(status, "nvEncLockBitstream")?;
-
-                // どの分岐でも必ず unlock するためのガード
-                let unlock_fn = self.encoder_api.nvEncUnlockBitstream;
-                let encoder = self.encoder;
-                let output_bitstream = lock_bitstream.outputBitstream;
-                let _unlock_guard = ReleaseGuard::new(move || {
-                    if let Some(f) = unlock_fn {
-                        let _ = f(encoder, output_bitstream);
-                    }
-                });
-
-                // ビットストリームがロックされている間にエンコード済みデータをコピー
-                let ptr = lock_bitstream.bitstreamBufferPtr as *const u8;
-                let size = lock_bitstream.bitstreamSizeInBytes as usize;
-
-                if ptr.is_null() {
-                    return Err(Error::new_custom(
-                        "nvEncLockBitstream",
-                        "bitstreamBufferPtr is null",
-                    ));
-                }
-
-                let data = if size == 0 {
-                    Vec::new()
-                } else {
-                    std::slice::from_raw_parts(ptr, size).to_vec()
-                };
-
-                let timestamp = lock_bitstream.outputTimeStamp;
-                let picture_type = PictureType::new(lock_bitstream.pictureType);
-
-                Ok((data, timestamp, picture_type))
-            }
-        })
-    }
-
+impl EncoderState {
     /// エンコーダーを終了し、残りのフレームを取得する
     fn send_eos(&mut self) -> Result<(), Error> {
         let lib = self.lib.clone();
@@ -1209,10 +1156,39 @@ impl Drop for EncoderState {
 /// 内部で専用のワーカースレッドを起動し、非同期でエンコードを行う。
 /// エンコードが完了すると、コンストラクタで渡したコールバックがワーカースレッド上で即座に呼び出される。
 pub struct Encoder<T> {
-    job_tx: SyncSender<Job<T>>,
+    job_tx: Sender<Job<T>>,
     worker: Option<JoinHandle<()>>,
+    drain_handle: Option<JoinHandle<()>>,
 }
 
+/// drain スレッドへのリクエスト
+///
+/// worker スレッドから drain スレッドへ mpsc 経由で送信される。
+///
+/// `nvEncLockBitstream` を drain スレッドでブロッキング実行するために必要な
+/// コンテキストをすべて含んでいる。
+struct DrainRequest {
+    /// CUDA コンテキスト操作用のライブラリハンドル
+    lib: CudaLibrary,
+    /// CUDA コンテキスト
+    ctx: sys::CUcontext,
+    /// nvEncLockBitstream の関数ポインタ
+    lock_fn: sys::PNVENCLOCKBITSTREAM,
+    /// nvEncUnlockBitstream の関数ポインタ
+    unlock_fn: sys::PNVENCUNLOCKBITSTREAM,
+    /// NVENC エンコーダーハンドル
+    encoder: *mut c_void,
+    /// ロック対象のビットストリームバッファ
+    output_bitstream: sys::NV_ENC_OUTPUT_PTR,
+}
+
+unsafe impl Send for DrainRequest {}
+
+/// worker スレッドが受信するメッセージ
+///
+/// 外部 API（encode/flush/reconfigure）からのジョブと、
+/// drain スレッドからの完了通知（DrainResult）の両方が
+/// この単一チャネルに集約される。
 enum Job<T> {
     Encode {
         data: Vec<u8>,
@@ -1230,29 +1206,47 @@ enum Job<T> {
         done: SyncSender<()>,
     },
     Terminate,
+    DrainResult {
+        result: Result<(Vec<u8>, u64, PictureType), Error>,
+    },
 }
 
 impl<T: Send + 'static> Encoder<T> {
-    /// エンコーダーを生成し、内部ワーカースレッドを起動する
+    /// エンコーダーを生成する。
+    ///
+    /// 2 つの内部スレッドが起動される:
+    /// - worker スレッド（`nvcodec-encoder`）: job の受信、フレーム送信、バッファ管理
+    /// - drain スレッド（`nvcodec-drain`）: NVENC のエンコード待機とエンコード済みデータの取り出し
     pub fn new<F>(config: EncoderConfig, mut callback: F) -> Result<Self, Error>
     where
         F: FnMut(Result<EncodedFrame<T>, Error>) + Send + 'static,
     {
-        let n_encoder_buffer = config.frame_interval_p as usize + 3;
-        let (job_tx, job_rx) = mpsc::sync_channel::<Job<T>>(n_encoder_buffer);
+        let (job_tx, job_rx) = mpsc::channel::<Job<T>>();
+        let (drain_tx, drain_rx) = mpsc::channel::<DrainRequest>();
 
         let state = EncoderState::new(&config)?;
 
+        // drain スレッドを起動
+        let drain_job_tx = job_tx.clone();
+        let drain_handle = std::thread::Builder::new()
+            .name("nvcodec-drain".into())
+            .spawn(move || {
+                drain_thread_loop::<T>(drain_rx, drain_job_tx);
+            })
+            .map_err(|_e| Error::new_custom("Encoder::new", "failed to spawn drain thread"))?;
+
+        // ワーカースレッドを起動
         let worker = std::thread::Builder::new()
             .name("nvcodec-encoder".into())
             .spawn(move || {
-                run_worker(state, &mut callback, job_rx);
+                run_worker(state, &mut callback, job_rx, drain_tx);
             })
             .map_err(|_e| Error::new_custom("Encoder::new", "failed to spawn encoder thread"))?;
 
         Ok(Self {
             job_tx,
             worker: Some(worker),
+            drain_handle: Some(drain_handle),
         })
     }
 
@@ -1316,9 +1310,19 @@ impl<T: Send + 'static> Encoder<T> {
 
 impl<T> Drop for Encoder<T> {
     fn drop(&mut self) {
+        // worker スレッドに Terminate を送信して終了待機。
+        // run_worker 内で全 in-flight フレームの drain が完了した後、
+        // drain スレッドが終了する。
+        // それによって drain_tx が drop される。
         let _ = self.job_tx.send(Job::Terminate);
         if let Some(worker) = self.worker.take() {
             let _ = worker.join();
+        }
+
+        // drain スレッドの終了を待機。
+        // drain_tx の drop を検知することで drain スレッドは自動的に終了する。
+        if let Some(drain_handle) = self.drain_handle.take() {
+            let _ = drain_handle.join();
         }
     }
 }
@@ -1414,69 +1418,207 @@ impl<T> EncodedFrame<T> {
     }
 }
 
-fn run_worker<F, T>(mut state: EncoderState, callback: &mut F, job_rx: Receiver<Job<T>>)
-where
+/// drain スレッドのメインループ
+///
+/// worker スレッドから DrainRequest を受信し、
+/// `nvEncLockBitstream` をブロッキング実行する。
+/// 完了したら DrainResult を mpsc 経由で worker スレッドに送信する。
+///
+/// `nvEncLockBitstream` がブロッキングするため、この処理だけ drain スレッドで行う。
+/// こうすることで、worker スレッドはメインスレッドからのエンコード投入リクエストと
+/// drain スレッドからのエンコード完了処理を同時に受け付けられる
+fn drain_thread_loop<T: Send + 'static>(drain_rx: Receiver<DrainRequest>, job_tx: Sender<Job<T>>) {
+    while let Ok(req) = drain_rx.recv() {
+        let result = lock_and_copy_bitstream(
+            &req.lib,
+            req.ctx,
+            req.lock_fn,
+            req.unlock_fn,
+            req.encoder,
+            req.output_bitstream,
+        );
+        // drain スレッドは結果の成否にかかわらず worker に送信する。
+        // エラーハンドリングはここでは行わない。
+        let _ = job_tx.send(Job::DrainResult { result });
+    }
+}
+
+/// NVENC のビットストリームをロックし、エンコード済みデータをコピーする
+///
+/// 処理の流れ:
+/// 1. CUDA コンテキストを push
+/// 2. `nvEncLockBitstream` を呼び出しビットストリームをロック
+/// 3. ビットストリームからエンコード済みデータをコピー
+/// 4. `nvEncUnlockBitstream` を ReleaseGuard で自動呼び出し
+/// 5. CUDA コンテキストを pop
+///
+/// 引数:
+/// - `lib`: CUDA コンテキスト管理用
+/// - `ctx`: CUDA コンテキスト
+/// - `lock_fn`: nvEncLockBitstream の関数ポインタ
+/// - `unlock_fn`: nvEncUnlockBitstream の関数ポインタ
+/// - `encoder`: NVENC エンコーダーハンドル
+/// - `output_bitstream`: ロック対象のビットストリームバッファ
+///
+/// 戻り値: (エンコード済みデータ, タイムスタンプ, ピクチャータイプ)
+fn lock_and_copy_bitstream(
+    lib: &CudaLibrary,
+    ctx: sys::CUcontext,
+    lock_fn: sys::PNVENCLOCKBITSTREAM,
+    unlock_fn: sys::PNVENCUNLOCKBITSTREAM,
+    encoder: *mut c_void,
+    output_bitstream: sys::NV_ENC_OUTPUT_PTR,
+) -> Result<(Vec<u8>, u64, PictureType), Error> {
+    lib.with_context(ctx, || unsafe {
+        let mut lock_bitstream: sys::NV_ENC_LOCK_BITSTREAM = std::mem::zeroed();
+        lock_bitstream.version = sys::NV_ENC_LOCK_BITSTREAM_VER;
+        lock_bitstream.outputBitstream = output_bitstream;
+
+        let status = lock_fn
+            .map(|f| f(encoder, &mut lock_bitstream))
+            .unwrap_or(sys::_NVENCSTATUS_NV_ENC_ERR_INVALID_PTR);
+        Error::check_nvenc(status, "nvEncLockBitstream")?;
+
+        // どの分岐でも必ず unlock するためのガード
+        let output_bitstream = lock_bitstream.outputBitstream;
+        let _unlock_guard = ReleaseGuard::new(move || {
+            if let Some(f) = unlock_fn {
+                let _ = f(encoder, output_bitstream);
+            }
+        });
+
+        // ビットストリームがロックされている間にエンコード済みデータをコピー
+        let ptr = lock_bitstream.bitstreamBufferPtr as *const u8;
+        let size = lock_bitstream.bitstreamSizeInBytes as usize;
+
+        if ptr.is_null() {
+            return Err(Error::new_custom(
+                "nvEncLockBitstream",
+                "bitstreamBufferPtr is null",
+            ));
+        }
+
+        let data = std::slice::from_raw_parts(ptr, size).to_vec();
+
+        let timestamp = lock_bitstream.outputTimeStamp;
+        let picture_type = PictureType::new(lock_bitstream.pictureType);
+
+        Ok((data, timestamp, picture_type))
+    })
+}
+
+/// worker スレッドのメインループ
+///
+/// mpsc から Job<T> を受信し、エンコードリクエストの送信と状態管理を行う。
+/// nvEncLockBitstream の待機は専用の drain スレッドに委譲される。
+///
+/// # アーキテクチャ
+///
+/// ```text
+///                                      (DrainRequest の送信)
+/// [外部 API] --job_tx--> [worker スレッド] --drain_tx--> [drain スレッド]
+///                                         <- job_tx ---
+///                                       (DrainResult の返送)
+/// ```
+///
+/// - worker スレッド: フレーム送信（encode_frame）、バッファ管理、callback 呼び出し
+/// - drain スレッド: nvEncLockBitstream（ブロッキング）を実行し、結果を job_tx 経由で返送
+fn run_worker<F, T>(
+    mut state: EncoderState,
+    callback: &mut F,
+    job_rx: Receiver<Job<T>>,
+    drain_tx: Sender<DrainRequest>,
+) where
     F: FnMut(Result<EncodedFrame<T>, Error>) + Send + 'static,
     T: Send + 'static,
 {
+    // user_data を保持するキュー。
     let mut pending_user_data: VecDeque<T> = VecDeque::new();
+    // drain リクエストを送信済みのフレーム数。
+    // i_got <= i_in_flight <= i_to_send
+    let mut i_in_flight = 0;
 
-    loop {
-        match job_rx.recv() {
-            Ok(Job::Encode {
+    while let Ok(job) = job_rx.recv() {
+        match job {
+            Job::DrainResult { result } => {
+                handle_drain_result(&mut state, result, &mut pending_user_data, callback);
+            }
+            Job::Encode {
                 data,
                 options,
                 user_data,
-            }) => {
-                // バッファが満杯なら、古いフレームを drain して空ける
-                while state.i_to_send - state.i_got >= state.n_encoder_buffer {
-                    drain_one(&mut state, &mut pending_user_data, callback);
+            } => {
+                // バッファが満杯の場合はエラー callback を実行する
+                if state.i_to_send - state.i_got >= state.n_encoder_buffer {
+                    callback(Err(Error::new_custom("encode", "encoder buffer is full")));
+                    continue;
                 }
 
                 let bfr_idx = state.i_to_send % state.n_encoder_buffer;
-
                 let encode_result = state.encode_frame(bfr_idx, &data, &options);
 
                 match encode_result {
                     Ok(()) => {
+                        // user_data を pending キューに追加。
+                        // 後続の DrainResult で pop_front される。
                         pending_user_data.push_back(user_data);
                         state.i_to_send += 1;
-
-                        // 完了済みフレームを drain（delay window 制御）
-                        while state.i_got + state.n_output_delay < state.i_to_send {
-                            drain_one(&mut state, &mut pending_user_data, callback);
-                        }
+                        // 新たに送信したフレームの drain リクエストを送信
+                        flush_drain_requests(&drain_tx, &state, &mut i_in_flight);
                     }
                     Err(e) => {
                         callback(Err(e));
                     }
                 }
             }
-            Ok(Job::Reconfigure { params, done }) => {
-                // 全 in-flight フレームを drain してから reconfigure を実行する
-                // バッファプール再構築との競合を防ぐ
-                while state.i_got < state.i_to_send {
-                    drain_one(&mut state, &mut pending_user_data, callback);
+            Job::Reconfigure { params, done } => {
+                // バッファプール再構築との競合を防ぐため、
+                // 全 in-flight フレームを drain してから reconfigure を実行する。
+                flush_drain_requests(&drain_tx, &state, &mut i_in_flight);
+                if !wait_all_drains(
+                    &mut state,
+                    &mut pending_user_data,
+                    callback,
+                    &job_rx,
+                    "reconfigure",
+                ) {
+                    return;
                 }
                 let _ = done.send(state.reconfigure(params));
             }
-            Ok(Job::GetSequenceParams { done }) => {
-                let _ = done.send(state.get_sequence_params());
-            }
-            Ok(Job::Flush { done }) => {
-                // 保留中の全フレームを drain
-                while state.i_got < state.i_to_send {
-                    drain_one(&mut state, &mut pending_user_data, callback);
+            Job::Flush { done } => {
+                // 全 in-flight フレームが drain されるまで待機する
+                flush_drain_requests(&drain_tx, &state, &mut i_in_flight);
+                if !wait_all_drains(
+                    &mut state,
+                    &mut pending_user_data,
+                    callback,
+                    &job_rx,
+                    "flush",
+                ) {
+                    return;
                 }
                 let _ = done.send(());
             }
-            Ok(Job::Terminate) | Err(_) => {
-                // EOS 送信
+            Job::GetSequenceParams { done } => {
+                // GetSequenceParams は drain を必要としない。
+                // ノンブロッキングでシーケンスパラメータを返却する。
+                let _ = done.send(state.get_sequence_params());
+            }
+            Job::Terminate => {
+                // NVENC に EOS を送信し、エンコーダの内部パイプラインをフラッシュする。
                 let _ = state.send_eos();
 
-                // 残り全 drain
-                while state.i_got < state.i_to_send {
-                    drain_one(&mut state, &mut pending_user_data, callback);
+                // EOS 送信後に残っている全フレームを drain する。
+                flush_drain_requests(&drain_tx, &state, &mut i_in_flight);
+                if !wait_all_drains(
+                    &mut state,
+                    &mut pending_user_data,
+                    callback,
+                    &job_rx,
+                    "terminate",
+                ) {
+                    return;
                 }
 
                 return;
@@ -1485,17 +1627,27 @@ where
     }
 }
 
-fn drain_one<F, T>(state: &mut EncoderState, pending_user_data: &mut VecDeque<T>, callback: &mut F)
-where
+/// drain スレッドから受信した結果を処理する
+fn handle_drain_result<F, T>(
+    state: &mut EncoderState,
+    result: Result<(Vec<u8>, u64, PictureType), Error>,
+    pending_user_data: &mut VecDeque<T>,
+    callback: &mut F,
+) where
     F: FnMut(Result<EncodedFrame<T>, Error>) + Send + 'static,
     T: Send + 'static,
 {
     let bfr_idx = state.i_got % state.n_encoder_buffer;
 
-    let lock_result = state.lock_and_copy_bitstream(bfr_idx);
+    // drain が完了したので mapped resource を解放し、
+    // 次の encode_frame で再利用可能にする
+    state.unmap_resource(bfr_idx);
+    state.i_got += 1;
 
-    match lock_result {
+    match result {
         Ok((data, timestamp, picture_type)) => {
+            // pending_user_data は送信順に push されているため、
+            // pop_front で対応する user_data が取得できる
             if let Some(user_data) = pending_user_data.pop_front() {
                 callback(Ok(EncodedFrame {
                     data,
@@ -1504,19 +1656,73 @@ where
                     user_data,
                 }));
             } else {
-                callback(Err(Error::new_custom("drain_one", "missing user data")));
+                callback(Err(Error::new_custom(
+                    "handle_drain_result",
+                    "missing user data",
+                )));
             }
         }
         Err(e) => {
+            // エラー発生時は全 pending データをクリアする。
             pending_user_data.clear();
             callback(Err(e));
         }
     }
+}
 
-    // unmap してリソースを解放（次回の map_resource で再利用可能にする）
-    state.unmap_resource(bfr_idx);
+/// 未送信の drain リクエストをすべて送信する
+fn flush_drain_requests(
+    drain_tx: &Sender<DrainRequest>,
+    state: &EncoderState,
+    i_in_flight: &mut usize,
+) {
+    while *i_in_flight < state.i_to_send {
+        let bfr_idx = *i_in_flight % state.n_encoder_buffer;
+        // drain スレッドに DrainRequest を送信する
+        let _ = drain_tx.send(DrainRequest {
+            lib: state.lib.clone(),
+            ctx: state.ctx,
+            lock_fn: state.encoder_api.nvEncLockBitstream,
+            unlock_fn: state.encoder_api.nvEncUnlockBitstream,
+            encoder: state.encoder,
+            output_bitstream: state.bitstream_buffers[bfr_idx],
+        });
+        *i_in_flight += 1;
+    }
+}
 
-    state.i_got += 1;
+/// 全 in-flight フレームの drain 完了を待機する
+///
+/// drain 待機中に DrainResult 以外のメッセージが届いた場合は
+/// エラー callback を呼ぶ。
+/// job_rx が切断された場合は `false` を返す
+/// （呼び出し元の run_worker が return すべきことを示す）。
+fn wait_all_drains<F, T>(
+    state: &mut EncoderState,
+    pending_user_data: &mut VecDeque<T>,
+    callback: &mut F,
+    job_rx: &Receiver<Job<T>>,
+    context: &'static str,
+) -> bool
+where
+    F: FnMut(Result<EncodedFrame<T>, Error>) + Send + 'static,
+    T: Send + 'static,
+{
+    while state.i_got < state.i_to_send {
+        match job_rx.recv() {
+            Ok(Job::DrainResult { result }) => {
+                handle_drain_result(state, result, pending_user_data, callback);
+            }
+            Ok(_) => {
+                callback(Err(Error::new_custom(
+                    context,
+                    "unexpected message during drain",
+                )));
+            }
+            Err(_) => return false,
+        }
+    }
+    true
 }
 
 #[cfg(test)]
@@ -1832,6 +2038,8 @@ mod tests {
 
     #[test]
     fn test_encode_multiple_frames() {
+        use std::time::Duration;
+
         let (tx, rx) = mpsc::sync_channel::<Result<EncodedFrame<u32>, Error>>(8);
         let config = test_encoder_config(CodecConfig::H264(H264EncoderConfig {
             profile: None,
@@ -1851,7 +2059,10 @@ mod tests {
         let mut frame_data = vec![16u8; y_size + uv_size];
         frame_data[y_size..].fill(128);
 
-        // 5 フレーム連続でエンコード
+        // 5 フレームをエンコード。
+        // バッファ満杯を避けるため、30fps 相当のフレーム間隔（33ms）で送信する。
+        // これにより drain スレッドが encode() の間に drain を完了できる。
+        let frame_interval = Duration::from_millis(33);
         for i in 0..5 {
             encoder
                 .encode(
@@ -1864,6 +2075,7 @@ mod tests {
                     i,
                 )
                 .expect("failed to encode frame");
+            std::thread::sleep(frame_interval);
         }
 
         encoder.flush().expect("flush failed");
@@ -2449,33 +2661,30 @@ mod tests {
         }
     }
 
-    /// 現在の実装では n_output_delay フレーム分の遅延が callback に発生することを確認する
+    /// drain スレッドによって callback が遅延なく発火することを確認する
     ///
-    /// run_worker 内の post-drain（encode.rs:1445-1448）は
-    /// `i_got + n_output_delay < i_to_send` が成立するまで drain しない。
-    /// これにより、frame N の callback は必ず frame N + n_output_delay の
-    /// encode() 送信時まで遅延する。
+    /// worker スレッドはフレーム送信後に drain スレッドへ
+    /// drain リクエストを送信し、drain スレッドが nvEncLockBitstream を
+    /// ブロッキング実行する。encode() 呼び出し後に drain スレッドが
+    /// 処理を完了できるだけの時間があれば、callback は次の encode() を
+    /// 待たずに発火する。
     ///
-    /// 本テストでは frame_interval_p = 0（n_encoder_buffer=3, n_output_delay=2）とし、
+    /// 本テストでは frame_interval_p = 0（n_encoder_buffer = 3）とし、
     /// 30fps 相当のフレーム間隔（33ms）で encode() を 4 回呼び出す。
     /// 各 encode() の前に encode_count をインクリメントし、
-    /// 最初に発火した callback の時点で encode_count を first_cb_after に記録する。
+    /// 最初に発火した callback の時点での encode_count を
+    /// first_cb_after に記録する。
     ///
-    /// 期待値:
-    ///   現状の実装では first_cb_after >= 3（n_output_delay+1）
-    ///   drain スレッド化後は encode() 直後から drain が試行されるため
-    ///   本テストが FAIL する（first_cb_after が 1 や 2 になる）ことをもって
-    ///   遅延解消の証拠とする。
+    /// 期待値: first_cb_after < 3
+    ///   最初の callback が 3 回目の encode() を待たずに発火することを確認する。
+    ///   33ms の sleep で drain スレッドに十分な処理時間を与えているため、
+    ///   フレーム送信後すぐに callback が呼ばれれば 1 や 2 になる。
     #[test]
     fn test_callback_delayed_by_n_output_delay() {
         use std::sync::Arc;
         use std::sync::atomic::{AtomicUsize, Ordering};
         use std::time::Duration;
 
-        // n_encoder_buffer = frame_interval_p + 3 = 3
-        // n_output_delay   = n_encoder_buffer - 1 = 2
-        // したがって最初の callback は 3 回目（n_output_delay + 1）の
-        // encode() 呼び出し後まで発火しないはず
         let mut config = test_encoder_config(CodecConfig::H264(H264EncoderConfig {
             profile: None,
             idr_period: None,
@@ -2487,8 +2696,8 @@ mod tests {
         let n_encoder_buffer = config.frame_interval_p as usize + 3;
 
         // encode_count: encode() が呼ばれるたびにメインスレッドでインクリメント
-        // first_cb_after: 最初の callback 発火時点の encode_count を記録
-        //   compare_exchange により最初の callback だけが書き込む
+        // first_cb_after: 最初の callback 発火時点の encode_count を記録。
+        //   compare_exchange により最初の callback だけが書き込む。
         let encode_count = Arc::new(AtomicUsize::new(0));
         let first_cb_after = Arc::new(AtomicUsize::new(0));
         let (cb_tx, _cb_rx) =
@@ -2512,10 +2721,8 @@ mod tests {
         };
 
         // 30fps 相当のフレーム間隔で送信。
-        // sleep により drain スレッドが encode() の間に drain を完了できる
-        // 十分な時間を与える（現状の実装では drain そのものが遅延しているため
-        // sleep の有無にかかわらず callback は遅延するが、drain スレッド化後の
-        // 差分を明確にするために入れている）
+        // sleep により drain スレッドが encode() の間に
+        // nvEncLockBitstream を完了するための十分な時間を与える。
         let frame_interval = Duration::from_millis(33);
 
         for i in 0..4u32 {
@@ -2529,10 +2736,13 @@ mod tests {
         encoder.flush().unwrap();
         drop(encoder);
 
+        // 最初の callback 発火時点の encode_count が 3 未満であることを確認。
+        // drain スレッドが encode() の間に drain を完了できれば、
+        // callback は次の encode() を待たずに発火する。
         let got = first_cb_after.load(Ordering::SeqCst);
         assert!(
-            got >= 3,
-            "expected first callback after >= 3 encodes (n_output_delay+1), got {}",
+            got < 3,
+            "expected first callback before 3 encodes, got {}",
             got
         );
     }
