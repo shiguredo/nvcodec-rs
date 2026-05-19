@@ -1168,15 +1168,10 @@ pub struct Encoder<T> {
 /// `nvEncLockBitstream` を drain スレッドでブロッキング実行するために必要な
 /// コンテキストをすべて含んでいる。
 struct DrainRequest {
-    /// CUDA コンテキスト操作用のライブラリハンドル
     lib: CudaLibrary,
-    /// CUDA コンテキスト
     ctx: sys::CUcontext,
-    /// nvEncLockBitstream の関数ポインタ
     lock_fn: sys::PNVENCLOCKBITSTREAM,
-    /// nvEncUnlockBitstream の関数ポインタ
     unlock_fn: sys::PNVENCUNLOCKBITSTREAM,
-    /// NVENC エンコーダーハンドル
     encoder: *mut c_void,
     /// ロック対象のビットストリームバッファ
     output_bitstream: sys::NV_ENC_OUTPUT_PTR,
@@ -1444,23 +1439,6 @@ fn drain_thread_loop<T: Send + 'static>(drain_rx: Receiver<DrainRequest>, job_tx
 }
 
 /// NVENC のビットストリームをロックし、エンコード済みデータをコピーする
-///
-/// 処理の流れ:
-/// 1. CUDA コンテキストを push
-/// 2. `nvEncLockBitstream` を呼び出しビットストリームをロック
-/// 3. ビットストリームからエンコード済みデータをコピー
-/// 4. `nvEncUnlockBitstream` を ReleaseGuard で自動呼び出し
-/// 5. CUDA コンテキストを pop
-///
-/// 引数:
-/// - `lib`: CUDA コンテキスト管理用
-/// - `ctx`: CUDA コンテキスト
-/// - `lock_fn`: nvEncLockBitstream の関数ポインタ
-/// - `unlock_fn`: nvEncUnlockBitstream の関数ポインタ
-/// - `encoder`: NVENC エンコーダーハンドル
-/// - `output_bitstream`: ロック対象のビットストリームバッファ
-///
-/// 戻り値: (エンコード済みデータ, タイムスタンプ, ピクチャータイプ)
 fn lock_and_copy_bitstream(
     lib: &CudaLibrary,
     ctx: sys::CUcontext,
@@ -1541,7 +1519,7 @@ fn run_worker<F, T>(
     while let Ok(job) = job_rx.recv() {
         match job {
             Job::DrainResult { result } => {
-                handle_drain_result(&mut state, result, &mut pending_user_data, callback);
+                consume_drain_result(&mut state, result, &mut pending_user_data, callback);
             }
             Job::Encode {
                 data,
@@ -1564,7 +1542,7 @@ fn run_worker<F, T>(
                         pending_user_data.push_back(user_data);
                         state.i_to_send += 1;
                         // 新たに送信したフレームの drain リクエストを送信
-                        flush_drain_requests(&drain_tx, &state, &mut i_in_flight);
+                        send_pending_drain_requests(&drain_tx, &state, &mut i_in_flight);
                     }
                     Err(e) => {
                         callback(Err(e));
@@ -1574,7 +1552,7 @@ fn run_worker<F, T>(
             Job::Reconfigure { params, done } => {
                 // バッファプール再構築との競合を防ぐため、
                 // 全 in-flight フレームを drain してから reconfigure を実行する。
-                flush_drain_requests(&drain_tx, &state, &mut i_in_flight);
+                send_pending_drain_requests(&drain_tx, &state, &mut i_in_flight);
                 if !wait_all_drains(
                     &mut state,
                     &mut pending_user_data,
@@ -1588,7 +1566,7 @@ fn run_worker<F, T>(
             }
             Job::Flush { done } => {
                 // 全 in-flight フレームが drain されるまで待機する
-                flush_drain_requests(&drain_tx, &state, &mut i_in_flight);
+                send_pending_drain_requests(&drain_tx, &state, &mut i_in_flight);
                 if !wait_all_drains(
                     &mut state,
                     &mut pending_user_data,
@@ -1601,8 +1579,8 @@ fn run_worker<F, T>(
                 let _ = done.send(());
             }
             Job::GetSequenceParams { done } => {
-                // GetSequenceParams は drain を必要としない。
-                // ノンブロッキングでシーケンスパラメータを返却する。
+                // GetSequenceParams は drain を必要としないので、
+                // そのままシーケンスパラメータを返却する。
                 let _ = done.send(state.get_sequence_params());
             }
             Job::Terminate => {
@@ -1610,7 +1588,7 @@ fn run_worker<F, T>(
                 let _ = state.send_eos();
 
                 // EOS 送信後に残っている全フレームを drain する。
-                flush_drain_requests(&drain_tx, &state, &mut i_in_flight);
+                send_pending_drain_requests(&drain_tx, &state, &mut i_in_flight);
                 if !wait_all_drains(
                     &mut state,
                     &mut pending_user_data,
@@ -1627,8 +1605,8 @@ fn run_worker<F, T>(
     }
 }
 
-/// drain スレッドから受信した結果を処理する
-fn handle_drain_result<F, T>(
+/// drain スレッドから受信した結果を消費し、後片付けして callback を呼び出す
+fn consume_drain_result<F, T>(
     state: &mut EncoderState,
     result: Result<(Vec<u8>, u64, PictureType), Error>,
     pending_user_data: &mut VecDeque<T>,
@@ -1657,7 +1635,7 @@ fn handle_drain_result<F, T>(
                 }));
             } else {
                 callback(Err(Error::new_custom(
-                    "handle_drain_result",
+                    "consume_drain_result",
                     "missing user data",
                 )));
             }
@@ -1671,14 +1649,13 @@ fn handle_drain_result<F, T>(
 }
 
 /// 未送信の drain リクエストをすべて送信する
-fn flush_drain_requests(
+fn send_pending_drain_requests(
     drain_tx: &Sender<DrainRequest>,
     state: &EncoderState,
     i_in_flight: &mut usize,
 ) {
     while *i_in_flight < state.i_to_send {
         let bfr_idx = *i_in_flight % state.n_encoder_buffer;
-        // drain スレッドに DrainRequest を送信する
         let _ = drain_tx.send(DrainRequest {
             lib: state.lib.clone(),
             ctx: state.ctx,
@@ -1711,7 +1688,7 @@ where
     while state.i_got < state.i_to_send {
         match job_rx.recv() {
             Ok(Job::DrainResult { result }) => {
-                handle_drain_result(state, result, pending_user_data, callback);
+                consume_drain_result(state, result, pending_user_data, callback);
             }
             Ok(_) => {
                 callback(Err(Error::new_custom(
@@ -2680,7 +2657,7 @@ mod tests {
     ///   33ms の sleep で drain スレッドに十分な処理時間を与えているため、
     ///   フレーム送信後すぐに callback が呼ばれれば 1 や 2 になる。
     #[test]
-    fn test_callback_delayed_by_n_output_delay() {
+    fn test_drain_thread_callback_immediate() {
         use std::sync::Arc;
         use std::sync::atomic::{AtomicUsize, Ordering};
         use std::time::Duration;
