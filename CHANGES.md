@@ -18,6 +18,7 @@
   - `Encoder::new()` と `Decoder::new()` に完了用コールバックを受け取るハンドラを渡すようにする
   - `Encoder::next_frame()` と `Decoder::next_frame()` は廃止
   - `Encoder::query_caps()` と `Decoder::query_caps()` は `query_encoder_caps()` 及び `query_decoder_caps()` に変更
+  - @melpon
 
 ### misc
 

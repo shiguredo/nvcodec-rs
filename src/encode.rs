@@ -1251,10 +1251,7 @@ impl<H: EncodeHandler> Encoder<H> {
     /// 2 つの内部スレッドが起動される:
     /// - worker スレッド（`nvcodec-encoder`）: job の受信、フレーム送信、バッファ管理
     /// - drain スレッド（`nvcodec-drain`）: NVENC のエンコード待機とエンコード済みデータの取り出し
-    pub fn new(config: EncoderConfig, handler: H) -> Result<Self, Error>
-    where
-        H: EncodeHandler,
-    {
+    pub fn new(config: EncoderConfig, handler: H) -> Result<Self, Error> {
         let (job_tx, job_rx) = mpsc::channel::<Job<H::UserData>>();
         let (drain_tx, drain_rx) = mpsc::channel::<DrainRequest>();
 
@@ -1287,7 +1284,7 @@ impl<H: EncodeHandler> Encoder<H> {
     /// フレームをエンコードする
     ///
     /// フレームデータとオプションをワーカースレッドに送信し、即座に戻る。
-    /// エンコードが完了すると、コンストラクタで渡したコールバックが呼び出される。
+    /// エンコードが完了すると、コンストラクタで渡したコールバックハンドラが呼び出される。
     pub fn encode(
         &self,
         data: &[u8],
@@ -1305,7 +1302,7 @@ impl<H: EncodeHandler> Encoder<H> {
 
     /// 送信済みの未完了フレームがすべて完了するまで待機する
     ///
-    /// すべての pending フレームのコールバックが呼び出された後、このメソッドが戻る。
+    /// すべての pending フレームのコールバックハンドラが呼び出された後、このメソッドが戻る。
     /// flush 後も encode を継続できる。
     pub fn flush(&self) -> Result<(), Error> {
         let (tx, rx) = mpsc::sync_channel(0);
@@ -2769,24 +2766,24 @@ mod tests {
         }
     }
 
-    /// drain スレッドによって callback が遅延なく発火することを確認する
+    /// drain スレッドによってコールバックハンドラが遅延なく発火することを確認する
     ///
     /// worker スレッドはフレーム送信後に drain スレッドへ
     /// drain リクエストを送信し、drain スレッドが nvEncLockBitstream を
     /// ブロッキング実行する。encode() 呼び出し後に drain スレッドが
-    /// 処理を完了できるだけの時間があれば、callback は次の encode() を
+    /// 処理を完了できるだけの時間があれば、コールバックハンドラは次の encode() を
     /// 待たずに発火する。
     ///
     /// 本テストでは frame_interval_p = 0（n_encoder_buffer = 3）とし、
     /// 30fps 相当のフレーム間隔（33ms）で encode() を 4 回呼び出す。
     /// 各 encode() の前に encode_count をインクリメントし、
-    /// 最初に発火した callback の時点での encode_count を
+    /// 最初に発火したコールバックハンドラの時点での encode_count を
     /// first_cb_after に記録する。
     ///
     /// 期待値: first_cb_after < 3
-    ///   最初の callback が 3 回目の encode() を待たずに発火することを確認する。
+    ///   最初のコールバックハンドラが 3 回目の encode() を待たずに発火することを確認する。
     ///   33ms の sleep で drain スレッドに十分な処理時間を与えているため、
-    ///   フレーム送信後すぐに callback が呼ばれれば 1 や 2 になる。
+    ///   フレーム送信後すぐにコールバックハンドラが呼ばれれば 1 や 2 になる。
     #[test]
     fn test_drain_thread_callback_immediate() {
         use std::sync::Arc;
@@ -2804,8 +2801,8 @@ mod tests {
         let n_encoder_buffer = config.frame_interval_p as usize + 3;
 
         // encode_count: encode() が呼ばれるたびにメインスレッドでインクリメント
-        // first_cb_after: 最初の callback 発火時点の encode_count を記録。
-        //   compare_exchange により最初の callback だけが書き込む。
+        // first_cb_after: 最初のコールバックハンドラ発火時点の encode_count を記録。
+        //   compare_exchange により最初のコールバックハンドラだけが書き込む。
         let encode_count = Arc::new(AtomicUsize::new(0));
         let first_cb_after = Arc::new(AtomicUsize::new(0));
         let (cb_tx, _cb_rx) =
@@ -2843,13 +2840,13 @@ mod tests {
         }
 
         // flush により未 drain の全フレームを drain し、
-        // すべての callback が発火したことを保証する
+        // すべてのコールバックハンドラが発火したことを保証する
         encoder.flush().unwrap();
         drop(encoder);
 
-        // 最初の callback 発火時点の encode_count が 3 未満であることを確認。
+        // 最初のコールバックハンドラ発火時点の encode_count が 3 未満であることを確認。
         // drain スレッドが encode() の間に drain を完了できれば、
-        // callback は次の encode() を待たずに発火する。
+        // コールバックハンドラは次の encode() を待たずに発火する。
         let got = first_cb_after.load(Ordering::SeqCst);
         assert!(
             got < 3,

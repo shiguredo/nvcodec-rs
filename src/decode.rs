@@ -354,10 +354,7 @@ pub struct Decoder<H: DecodeHandler> {
 
 impl<H: DecodeHandler> Decoder<H> {
     /// デコーダーを生成し、内部ワーカースレッドを起動する
-    pub fn new(config: DecoderConfig, handler: H) -> Result<Self, Error>
-    where
-        H: DecodeHandler,
-    {
+    pub fn new(config: DecoderConfig, handler: H) -> Result<Self, Error> {
         let (job_tx, job_rx) = mpsc::sync_channel::<Job<H::UserData>>(4);
 
         let state = DecoderState::new(config)?;
@@ -378,7 +375,7 @@ impl<H: DecodeHandler> Decoder<H> {
     /// 圧縮された映像フレームをデコードする
     ///
     /// フレームデータとユーザーデータをワーカースレッドに送信し、即座に戻る。
-    /// デコードが完了すると、コンストラクタで渡したコールバックが呼び出される。
+    /// デコードが完了すると、コンストラクタで渡したコールバックハンドラが呼び出される。
     pub fn decode(&self, data: &[u8], user_data: H::UserData) -> Result<(), Error> {
         self.job_tx
             .send(Job::Decode {
@@ -390,7 +387,7 @@ impl<H: DecodeHandler> Decoder<H> {
 
     /// 送信済みの未完了フレームがすべて完了するまで待機する
     ///
-    /// すべての pending フレームのコールバックが呼び出された後、このメソッドが戻る。
+    /// すべての pending フレームのコールバックハンドラが呼び出された後、このメソッドが戻る。
     /// flush 後も decode を継続できる。
     pub fn flush(&self) -> Result<(), Error> {
         let (tx, rx) = mpsc::sync_channel(0);
@@ -761,7 +758,8 @@ fn drain_frames<H>(
                     }));
                 } else {
                     // デコード結果が存在するのに対応するユーザーデータが存在しない
-                    // これは通常あり得ないはずだけど、エラーを取りこぼさない為にエラーのコールバックを呼ぶ
+                    // これは通常あり得ないはずだけど、エラーを取りこぼさない為に
+                    // エラーのコールバックハンドラを呼ぶ
                     handler.on_decoded(Err(
                         Error::new_custom("drain_frames", "missing user data").into()
                     ));
@@ -769,7 +767,7 @@ fn drain_frames<H>(
                 }
             }
             // エラーが起きたら全てのユーザーデータを削除して
-            // コールバックを呼ぶ
+            // コールバックハンドラを呼ぶ
             Err(e) => {
                 pending_user_data.clear();
                 handler.on_decoded(Err(e.into()));
@@ -829,12 +827,12 @@ mod tests {
 
     #[test]
     fn init_h264_decoder() {
-        let (_tx, _rx) = mpsc::sync_channel::<Result<DecodedFrame<()>, Error>>(4);
+        let (tx, _rx) = mpsc::sync_channel::<Result<DecodedFrame<()>, Error>>(4);
         let config = test_decoder_config(DecoderCodec::H264);
         let _decoder = Decoder::new(
             config,
-            FnDecodeHandler::new(move |_frame| {
-                let _ = _tx.send(_frame);
+            FnDecodeHandler::new(move |frame| {
+                let _ = tx.send(frame);
             }),
         )
         .expect("Failed to initialize h264 decoder");
@@ -843,12 +841,12 @@ mod tests {
 
     #[test]
     fn init_h265_decoder() {
-        let (_tx, _rx) = mpsc::sync_channel::<Result<DecodedFrame<()>, Error>>(4);
+        let (tx, _rx) = mpsc::sync_channel::<Result<DecodedFrame<()>, Error>>(4);
         let config = test_decoder_config(DecoderCodec::Hevc);
         let _decoder = Decoder::new(
             config,
-            FnDecodeHandler::new(move |_frame| {
-                let _ = _tx.send(_frame);
+            FnDecodeHandler::new(move |frame| {
+                let _ = tx.send(frame);
             }),
         )
         .expect("Failed to initialize h265 decoder");
@@ -857,12 +855,12 @@ mod tests {
 
     #[test]
     fn init_av1_decoder() {
-        let (_tx, _rx) = mpsc::sync_channel::<Result<DecodedFrame<()>, Error>>(4);
+        let (tx, _rx) = mpsc::sync_channel::<Result<DecodedFrame<()>, Error>>(4);
         let config = test_decoder_config(DecoderCodec::Av1);
         let _decoder = Decoder::new(
             config,
-            FnDecodeHandler::new(move |_frame| {
-                let _ = _tx.send(_frame);
+            FnDecodeHandler::new(move |frame| {
+                let _ = tx.send(frame);
             }),
         )
         .expect("Failed to initialize av1 decoder");
@@ -871,12 +869,12 @@ mod tests {
 
     #[test]
     fn init_vp8_decoder() {
-        let (_tx, _rx) = mpsc::sync_channel::<Result<DecodedFrame<()>, Error>>(4);
+        let (tx, _rx) = mpsc::sync_channel::<Result<DecodedFrame<()>, Error>>(4);
         let config = test_decoder_config(DecoderCodec::Vp8);
         let _decoder = Decoder::new(
             config,
-            FnDecodeHandler::new(move |_frame| {
-                let _ = _tx.send(_frame);
+            FnDecodeHandler::new(move |frame| {
+                let _ = tx.send(frame);
             }),
         )
         .expect("Failed to initialize vp8 decoder");
@@ -885,12 +883,12 @@ mod tests {
 
     #[test]
     fn init_vp9_decoder() {
-        let (_tx, _rx) = mpsc::sync_channel::<Result<DecodedFrame<()>, Error>>(4);
+        let (tx, _rx) = mpsc::sync_channel::<Result<DecodedFrame<()>, Error>>(4);
         let config = test_decoder_config(DecoderCodec::Vp9);
         let _decoder = Decoder::new(
             config,
-            FnDecodeHandler::new(move |_frame| {
-                let _ = _tx.send(_frame);
+            FnDecodeHandler::new(move |frame| {
+                let _ = tx.send(frame);
             }),
         )
         .expect("Failed to initialize vp9 decoder");
@@ -900,20 +898,20 @@ mod tests {
     #[test]
     fn test_multiple_decoders() {
         let config = test_decoder_config(DecoderCodec::Hevc);
-        let (_tx1, _rx1) = mpsc::sync_channel::<Result<DecodedFrame<()>, Error>>(4);
+        let (tx1, _rx1) = mpsc::sync_channel::<Result<DecodedFrame<()>, Error>>(4);
         let _decoder1 = Decoder::new(
             config.clone(),
-            FnDecodeHandler::new(move |_frame| {
-                let _ = _tx1.send(_frame);
+            FnDecodeHandler::new(move |frame| {
+                let _ = tx1.send(frame);
             }),
         )
         .expect("Failed to initialize first h265 decoder");
 
-        let (_tx2, _rx2) = mpsc::sync_channel::<Result<DecodedFrame<()>, Error>>(4);
+        let (tx2, _rx2) = mpsc::sync_channel::<Result<DecodedFrame<()>, Error>>(4);
         let _decoder2 = Decoder::new(
             config,
-            FnDecodeHandler::new(move |_frame| {
-                let _ = _tx2.send(_frame);
+            FnDecodeHandler::new(move |frame| {
+                let _ = tx2.send(frame);
             }),
         )
         .expect("Failed to initialize second h265 decoder");
