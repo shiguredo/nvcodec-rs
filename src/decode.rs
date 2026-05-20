@@ -1249,4 +1249,20 @@ mod tests {
             ManuallyDrop::drop(&mut decoder);
         }
     }
+
+    #[test]
+    fn test_query_decoder_caps_h264() {
+        let caps = query_decoder_caps(DecoderCodec::H264, 0)
+            .expect("query_decoder_caps for H264 should succeed");
+        assert!(
+            caps.max_width > 0,
+            "max_width should be positive: {}",
+            caps.max_width
+        );
+        assert!(
+            caps.max_height > 0,
+            "max_height should be positive: {}",
+            caps.max_height
+        );
+    }
 }

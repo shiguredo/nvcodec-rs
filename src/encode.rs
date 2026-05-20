@@ -594,7 +594,7 @@ impl EncoderState {
 
                 // セッションを確実に閉じるためのガード
                 let destroy_fn = encoder_api.nvEncDestroyEncoder;
-                let _ = ReleaseGuard::new(move || {
+                let _encoder_guard = ReleaseGuard::new(move || {
                     if let Some(f) = destroy_fn {
                         f(encoder);
                     }
@@ -2886,5 +2886,21 @@ mod tests {
         unsafe {
             ManuallyDrop::drop(&mut encoder);
         }
+    }
+
+    #[test]
+    fn test_query_encoder_caps_h264() {
+        let caps = query_encoder_caps(EncoderCodec::H264, 0)
+            .expect("query_encoder_caps for H264 should succeed");
+        assert!(
+            caps.width_max > 0,
+            "width_max should be positive: {}",
+            caps.width_max
+        );
+        assert!(
+            caps.height_max > 0,
+            "height_max should be positive: {}",
+            caps.height_max
+        );
     }
 }
