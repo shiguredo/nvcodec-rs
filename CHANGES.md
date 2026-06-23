@@ -11,6 +11,10 @@
 
 ## develop
 
+## 2026.2.0
+
+**リリース日**: 2026-06-23
+
 - [CHANGE] エンコード・デコードの結果をトレイトベースのハンドラーを使って非同期で受け取るようにする
   - `EncodeHandler` トレイトと `FnEncodeHandler` ラッパーを追加
   - `DecodeHandler` トレイトと `FnDecodeHandler` ラッパーを追加
@@ -19,8 +23,6 @@
   - `Encoder::next_frame()` と `Decoder::next_frame()` は廃止
   - `Encoder::query_caps()` と `Decoder::query_caps()` は `query_encoder_caps()` 及び `query_decoder_caps()` に変更
   - @melpon
-
-### misc
 
 ## 2026.1.0
 
