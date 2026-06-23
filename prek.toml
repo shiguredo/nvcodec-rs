@@ -27,8 +27,12 @@ hooks = [
   },
   {
     id = "cargo-clippy",
-    name = "cargo clippy (Windows/Linux only)",
-    entry = "sh -c 'case \"$(uname -s)\" in Darwin) echo \"Skipped on macOS\"; exit 0;; *) cargo clippy --workspace --all-targets -- -D warnings;; esac'",
+    name = "cargo clippy",
+    # macOS では Apple Container 上の Linux コンテナで Rosetta 2 を使わず x86_64 ターゲットの clippy を実行する
+    # 事前に `make container-build` でイメージ (nvcodec-rs-check) を用意しておくこと
+    # ソースは bind mount するので Rust ファイルの編集はコンテナ再ビルドなしで反映される
+    # ホストの target/ と衝突しないようコンテナ内では CARGO_TARGET_DIR=/tmp/cargo-target を使う
+    entry = "sh -c 'case \"$(uname -s)\" in Darwin) container run --rm -v \"$(pwd):/workspace\" -w /workspace -e CARGO_TARGET_DIR=/tmp/cargo-target nvcodec-rs-check cargo clippy --workspace --all-targets -- -D warnings;; *) cargo clippy --workspace --all-targets -- -D warnings;; esac'",
     language = "system",
     types = ["rust"],
     pass_filenames = false,
@@ -36,8 +40,10 @@ hooks = [
   },
   {
     id = "cargo-test",
-    name = "cargo test (Windows/Linux only)",
-    entry = "sh -c 'case \"$(uname -s)\" in Darwin) echo \"Skipped on macOS\"; exit 0;; *) cargo test --workspace;; esac'",
+    name = "cargo test (Linux x86_64 only)",
+    # devcontainer は arm64 ホストから x86_64-unknown-linux-gnu にクロスビルドするため
+    # 生成バイナリをホストで実行できない。Linux x86_64 ホストでのみテストを実行する。
+    entry = "sh -c 'case \"$(uname -sm)\" in Darwin*) echo \"Skipped on macOS\"; exit 0;; \"Linux x86_64\") cargo test --workspace -- --test-threads=1;; *) echo \"Skipped on $(uname -sm)\"; exit 0;; esac'",
     language = "system",
     types = ["rust"],
     pass_filenames = false,

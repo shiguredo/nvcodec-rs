@@ -1,22 +1,15 @@
 [package]
 name = "shiguredo_nvcodec"
-version = "2026.1.0"
+version = "2026.2.0"
 edition = "2024"
 rust-version = "1.88"
-authors = ["Shiguredo Inc."]
-license = "Apache-2.0"
 description = "Rust bindings for NVIDIA Video Codec SDK"
+readme = "README.md"
 homepage = "https://github.com/shiguredo/nvcodec-rs"
 repository = "https://github.com/shiguredo/nvcodec-rs"
-readme = "README.md"
+license = "Apache-2.0"
 build = "build.rs"
-include = ["/src/**", "/build.rs", "/third_party/**", "LICENSE", "README.md"]
-
-[dependencies]
-
-[build-dependencies]
-bindgen = "0.72"
-shiguredo_toml = "2026.1"
+include = ["/build.rs", "/src/**", "/third_party/**", "LICENSE", "README.md"]
 
 # NVIDIA Video Codec SDK 用の外部ライブラリビルド用メタデータ
 # (この内容は build.rs の中からのみ参照される)
@@ -33,5 +26,11 @@ shiguredo_toml = "2026.1"
 #
 # なお、bindgen はマクロ（#define）による定数や一部の static 変数の自動変換には対応していないため、
 # それらは build.rs の中で直接定義しているので、必要応じて build.rs も更新すること。
-[package.metadata.external-dependencies]
-nvcodec = { version = "13.0.19" }
+[package.metadata.external-dependencies.nvcodec]
+version = "13.0.19"
+
+[dependencies]
+
+[build-dependencies]
+bindgen = "0.72"
+shiguredo_toml = "2026.2"

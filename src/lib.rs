@@ -15,11 +15,15 @@ mod error;
 mod sys;
 
 pub use codec_info::*;
-pub use decode::{DecodedFrame, Decoder, DecoderCaps, DecoderCodec, DecoderConfig, SurfaceFormat};
+pub use decode::{
+    DecodeHandler, DecodedFrame, Decoder, DecoderCaps, DecoderCodec, DecoderConfig,
+    FnDecodeHandler, SurfaceFormat, query_decoder_caps,
+};
 pub use encode::{
-    Av1EncoderConfig, Av1Profile, BufferFormat, CodecConfig, EncodeOptions, EncodedFrame, Encoder,
-    EncoderCaps, EncoderCodec, EncoderConfig, H264EncoderConfig, H264Profile, HevcEncoderConfig,
-    HevcProfile, PictureType, Preset, RateControlMode, ReconfigureParams, TuningInfo,
+    Av1EncoderConfig, Av1Profile, BufferFormat, CodecConfig, EncodeHandler, EncodeOptions,
+    EncodedFrame, Encoder, EncoderCaps, EncoderCodec, EncoderConfig, FnEncodeHandler,
+    H264EncoderConfig, H264Profile, HevcEncoderConfig, HevcProfile, PictureType, Preset,
+    RateControlMode, ReconfigureParams, TuningInfo, query_encoder_caps,
 };
 pub use error::Error;
 
@@ -629,26 +633,14 @@ impl CudaLibrary {
     }
 
     /// CUDA context を push して、クロージャを実行し、自動的に pop する
-    ///
-    /// クロージャが panic しても pop は必ず実行される（CUDA コンテキストスタックの整合性を保つため）
     fn with_context<F, R>(&self, ctx: sys::CUcontext, f: F) -> Result<R, Error>
     where
         F: FnOnce() -> Result<R, Error>,
     {
         self.cu_ctx_push_current(ctx)?;
-
-        // panic 時にも必ず pop するためのガード（panic 時は戻り値を検査できないので握り潰す）
-        let pop_guard = crate::ReleaseGuard::new(|| {
-            let mut popped_ctx = std::ptr::null_mut();
-            let _ = self.cu_ctx_pop_current(&mut popped_ctx);
-        });
-
         let result = f();
-
-        // 正常パスではガードをキャンセルし、明示的に pop してエラーを検査する
-        pop_guard.cancel();
         let mut popped_ctx = std::ptr::null_mut();
-        self.cu_ctx_pop_current(&mut popped_ctx)?;
+        let _ = self.cu_ctx_pop_current(&mut popped_ctx);
 
         result
     }

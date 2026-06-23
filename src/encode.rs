@@ -1,6 +1,8 @@
 use std::collections::VecDeque;
 use std::ffi::c_void;
 use std::ptr;
+use std::sync::mpsc::{self, Receiver, Sender, SyncSender};
+use std::thread::JoinHandle;
 
 use crate::{CudaLibrary, Error, ReleaseGuard, sys};
 
@@ -443,33 +445,40 @@ impl EncodeOptions {
     }
 }
 
-/// エンコーダー
-pub struct Encoder {
+struct EncoderState {
     lib: CudaLibrary,
     ctx: sys::CUcontext,
-    encoder: sys::NV_ENCODE_API_FUNCTION_LIST,
-    h_encoder: *mut c_void,
+    encoder_api: sys::NV_ENCODE_API_FUNCTION_LIST,
+    encoder: *mut c_void,
     width: u32,
     height: u32,
-    buffer_format: sys::NV_ENC_BUFFER_FORMAT,
-    buffer_format_enum: BufferFormat,
-    expected_frame_size: usize,
-    encoded_frames: VecDeque<EncodedFrame>,
+    buffer_format: BufferFormat,
     framerate_den: u64,
     frame_count: u64,
     init_params: sys::NV_ENC_INITIALIZE_PARAMS,
     encode_config: sys::NV_ENC_CONFIG,
+
+    // バッファプール
+    n_encoder_buffer: usize,
+    device_inputs: Vec<sys::CUdeviceptr>,
+    registered_resources: Vec<sys::NV_ENC_REGISTERED_PTR>,
+    bitstream_buffers: Vec<sys::NV_ENC_OUTPUT_PTR>,
+
+    // パイプライン状態
+    i_to_send: usize,
+    i_got: usize,
+    mapped_inputs: Vec<Option<sys::NV_ENC_INPUT_PTR>>,
 }
 
-impl Encoder {
-    /// 指定されたコーデック設定でエンコーダーインスタンスを生成する
-    pub fn new(config: EncoderConfig) -> Result<Self, Error> {
+unsafe impl Send for EncoderState {}
+
+impl EncoderState {
+    fn new(config: &EncoderConfig) -> Result<Self, Error> {
         unsafe {
             let lib = CudaLibrary::load()?;
 
-            let mut ctx = ptr::null_mut();
-
             // CUDA context の初期化
+            let mut ctx = ptr::null_mut();
             let ctx_flags = 0; // デフォルトのコンテキストフラグ
             lib.cu_ctx_create(&mut ctx, ctx_flags, config.device_id)?;
 
@@ -479,11 +488,10 @@ impl Encoder {
             });
 
             // NVENC 操作のために CUDA context をアクティブ化し、エンコードセッションを開く
-            let (encoder_api, h_encoder) = lib.with_context(ctx, || {
+            let (encoder_api, encoder) = lib.with_context(ctx, || {
                 // NVENC API をロード
                 let mut encoder_api: sys::NV_ENCODE_API_FUNCTION_LIST = std::mem::zeroed();
                 encoder_api.version = sys::NV_ENCODE_API_FUNCTION_LIST_VER;
-
                 lib.nvenc_create_api_instance(&mut encoder_api)?;
 
                 // エンコードセッションを開く
@@ -494,47 +502,54 @@ impl Encoder {
                 open_session_params.device = ctx.cast();
                 open_session_params.apiVersion = sys::NVENCAPI_VERSION;
 
-                let mut h_encoder = ptr::null_mut();
+                let mut encoder = ptr::null_mut();
                 let status = encoder_api
                     .nvEncOpenEncodeSessionEx
-                    .map(|f| f(&mut open_session_params, &mut h_encoder))
+                    .map(|f| f(&mut open_session_params, &mut encoder))
                     .unwrap_or(sys::_NVENCSTATUS_NV_ENC_ERR_INVALID_PTR);
                 Error::check_nvenc(status, "nvEncOpenEncodeSessionEx")?;
 
-                Ok((encoder_api, h_encoder))
+                Ok((encoder_api, encoder))
             })?;
 
-            // ここまで成功したらクリーンアップをキャンセル（あとは Drop に任せる）
-            ctx_guard.cancel();
+            let n_encoder_buffer = config.frame_interval_p as usize + 3;
 
-            let mut encoder = Self {
+            let mut state = Self {
                 lib: lib.clone(),
                 ctx,
-                encoder: encoder_api,
-                h_encoder,
+                encoder_api,
+                encoder,
                 width: config.width,
                 height: config.height,
-                buffer_format: config.buffer_format.to_sys(),
-                buffer_format_enum: config.buffer_format,
-                expected_frame_size: config
-                    .buffer_format
-                    .frame_size(config.width, config.height)?,
-                encoded_frames: VecDeque::new(),
+                buffer_format: config.buffer_format,
                 framerate_den: config.framerate_den as u64,
                 frame_count: 0,
                 init_params: std::mem::zeroed(),
                 encode_config: std::mem::zeroed(),
+                n_encoder_buffer,
+                device_inputs: Vec::with_capacity(n_encoder_buffer),
+                registered_resources: Vec::with_capacity(n_encoder_buffer),
+                bitstream_buffers: Vec::with_capacity(n_encoder_buffer),
+                i_to_send: 0,
+                i_got: 0,
+                mapped_inputs: vec![None; n_encoder_buffer],
             };
 
             // デフォルトパラメータでエンコーダーを初期化
-            lib.with_context(ctx, || encoder.initialize_encoder(&config))?;
+            lib.with_context(ctx, || {
+                state.initialize_encoder(config)?;
+                state.init_buffer_pool()?;
+                Ok(())
+            })?;
 
-            Ok(encoder)
+            ctx_guard.cancel();
+
+            Ok(state)
         }
     }
 
     /// 指定コーデックのエンコーダのケーパビリティをクエリする
-    pub fn query_caps(codec: EncoderCodec, device_id: i32) -> Result<EncoderCaps, Error> {
+    fn query_caps(codec: EncoderCodec, device_id: i32) -> Result<EncoderCaps, Error> {
         let codec_guid = match codec {
             EncoderCodec::H264 => sys::NV_ENC_CODEC_H264_GUID,
             EncoderCodec::Hevc => sys::NV_ENC_CODEC_HEVC_GUID,
@@ -543,7 +558,6 @@ impl Encoder {
         Self::query_caps_with_codec(device_id, codec_guid)
     }
 
-    /// 指定コーデックのエンコーダのケーパビリティをクエリする
     fn query_caps_with_codec(device_id: i32, codec_guid: sys::GUID) -> Result<EncoderCaps, Error> {
         unsafe {
             let lib = CudaLibrary::load()?;
@@ -571,18 +585,18 @@ impl Encoder {
                 open_session_params.device = ctx.cast();
                 open_session_params.apiVersion = sys::NVENCAPI_VERSION;
 
-                let mut h_encoder = ptr::null_mut();
+                let mut encoder = ptr::null_mut();
                 let status = encoder_api
                     .nvEncOpenEncodeSessionEx
-                    .map(|f| f(&mut open_session_params, &mut h_encoder))
+                    .map(|f| f(&mut open_session_params, &mut encoder))
                     .unwrap_or(sys::_NVENCSTATUS_NV_ENC_ERR_INVALID_PTR);
                 Error::check_nvenc(status, "nvEncOpenEncodeSessionEx")?;
 
                 // セッションを確実に閉じるためのガード
                 let destroy_fn = encoder_api.nvEncDestroyEncoder;
-                let session_guard = ReleaseGuard::new(move || {
+                let _encoder_guard = ReleaseGuard::new(move || {
                     if let Some(f) = destroy_fn {
-                        f(h_encoder);
+                        f(encoder);
                     }
                 });
 
@@ -595,7 +609,7 @@ impl Encoder {
                     let mut caps_val: i32 = 0;
                     let status = encoder_api
                         .nvEncGetEncodeCaps
-                        .map(|f| f(h_encoder, codec_guid, &mut caps_param, &mut caps_val))
+                        .map(|f| f(encoder, codec_guid, &mut caps_param, &mut caps_val))
                         .unwrap_or(sys::_NVENCSTATUS_NV_ENC_ERR_INVALID_PTR);
                     Error::check_nvenc(status, "nvEncGetEncodeCaps")?;
                     Ok(caps_val)
@@ -632,9 +646,6 @@ impl Encoder {
                     )? != 0,
                 };
 
-                // セッションガードがスコープアウト時にエンコーダを破棄する
-                drop(session_guard);
-
                 Ok(caps)
             })?;
 
@@ -649,7 +660,7 @@ impl Encoder {
     ///
     /// ビットレートやフレームレートを動的に変更する。
     /// エンコーダの初期化時に設定された値を基準に、指定されたパラメータのみを上書きする。
-    pub fn reconfigure(&mut self, params: ReconfigureParams) -> Result<(), Error> {
+    fn reconfigure(&mut self, params: ReconfigureParams) -> Result<(), Error> {
         self.lib
             .clone()
             .with_context(self.ctx, || self.reconfigure_inner(params))
@@ -707,9 +718,9 @@ impl Encoder {
             }
 
             let status = self
-                .encoder
+                .encoder_api
                 .nvEncReconfigureEncoder
-                .map(|f| f(self.h_encoder, &mut reconfig_params))
+                .map(|f| f(self.encoder, &mut reconfig_params))
                 .unwrap_or(sys::_NVENCSTATUS_NV_ENC_ERR_INVALID_PTR);
             Error::check_nvenc(status, "nvEncReconfigureEncoder")?;
 
@@ -725,9 +736,8 @@ impl Encoder {
                 self.height = height;
             }
             if params.width.is_some() || params.height.is_some() {
-                self.expected_frame_size = self
-                    .buffer_format_enum
-                    .frame_size(self.width, self.height)?;
+                self.cleanup_buffer_pool();
+                self.init_buffer_pool()?;
             }
             if let Some(fps_den) = params.framerate_den {
                 self.framerate_den = fps_den as u64;
@@ -770,11 +780,11 @@ impl Encoder {
             preset_config.presetCfg.version = sys::NV_ENC_CONFIG_VER;
 
             let status = self
-                .encoder
+                .encoder_api
                 .nvEncGetEncodePresetConfigEx
                 .map(|f| {
                     f(
-                        self.h_encoder,
+                        self.encoder,
                         codec_guid,
                         config.preset.to_sys(),
                         config.tuning_info.to_sys(),
@@ -799,7 +809,6 @@ impl Encoder {
             init_params.frameRateDen = config.framerate_den;
             init_params.enablePTD = 1;
 
-            init_params.encodeConfig = &mut encode_config;
             init_params.maxEncodeWidth = config.max_encode_width.unwrap_or(config.width);
             init_params.maxEncodeHeight = config.max_encode_height.unwrap_or(config.height);
             init_params.tuningInfo = config.tuning_info.to_sys();
@@ -824,7 +833,6 @@ impl Encoder {
                     encode_config.rcParams.maxBitRate = bitrate;
                 }
 
-                // コーデック固有の設定
                 match &config.codec {
                     CodecConfig::H264(_) => {
                         encode_config.encodeCodecConfig.h264Config.idrPeriod = idr_period;
@@ -838,11 +846,12 @@ impl Encoder {
                 }
             }
 
-            // エンコーダーを初期化
+            init_params.encodeConfig = &mut encode_config;
+
             let status = self
-                .encoder
+                .encoder_api
                 .nvEncInitializeEncoder
-                .map(|f| f(self.h_encoder, &mut init_params))
+                .map(|f| f(self.encoder, &mut init_params))
                 .unwrap_or(sys::_NVENCSTATUS_NV_ENC_ERR_INVALID_PTR);
             Error::check_nvenc(status, "nvEncInitializeEncoder")?;
 
@@ -860,7 +869,7 @@ impl Encoder {
     /// シーケンスパラメータ（SPS/PPS または Sequence Header OBU）を取得する
     ///
     /// H.264/HEVC の場合は SPS/PPS、AV1 の場合は Sequence Header OBU を取得します。
-    pub fn get_sequence_params(&mut self) -> Result<Vec<u8>, Error> {
+    fn get_sequence_params(&self) -> Result<Vec<u8>, Error> {
         self.lib
             .with_context(self.ctx, || self.get_sequence_params_inner())
     }
@@ -878,9 +887,9 @@ impl Encoder {
             seq_params.outSPSPPSPayloadSize = &mut out_size;
 
             let status = self
-                .encoder
+                .encoder_api
                 .nvEncGetSequenceParams
-                .map(|f| f(self.h_encoder, &mut seq_params))
+                .map(|f| f(self.encoder, &mut seq_params))
                 .unwrap_or(sys::_NVENCSTATUS_NV_ENC_ERR_INVALID_PTR);
 
             Error::check_nvenc(status, "nvEncGetSequenceParams")?;
@@ -892,243 +901,221 @@ impl Encoder {
         }
     }
 
-    /// フレームデータをエンコードする
-    pub fn encode(&mut self, frame_data: &[u8], options: &EncodeOptions) -> Result<(), Error> {
-        let expected_size = self.expected_frame_size;
+    /// バッファプールを初期化する
+    fn init_buffer_pool(&mut self) -> Result<(), Error> {
+        let frame_size = self.buffer_format.frame_size(self.width, self.height)?;
 
-        if frame_data.len() != expected_size {
-            return Err(Error::new_custom("encode", "invalid frame data size"));
+        for i in 0..self.n_encoder_buffer {
+            // デバイスメモリの確保
+            let mut device_ptr: sys::CUdeviceptr = 0;
+            self.lib.cu_mem_alloc(&mut device_ptr, frame_size)?;
+            self.device_inputs.push(device_ptr);
+
+            // リソース登録
+            let mut register_resource: sys::NV_ENC_REGISTER_RESOURCE =
+                unsafe { std::mem::zeroed() };
+            register_resource.version = sys::NV_ENC_REGISTER_RESOURCE_VER;
+            register_resource.resourceType =
+                sys::_NV_ENC_INPUT_RESOURCE_TYPE_NV_ENC_INPUT_RESOURCE_TYPE_CUDADEVICEPTR;
+            register_resource.resourceToRegister = device_ptr as *mut c_void;
+            register_resource.width = self.width;
+            register_resource.height = self.height;
+            register_resource.pitch = self.buffer_format.bytes_per_row(self.width)?;
+            register_resource.bufferFormat = self.buffer_format.to_sys();
+            register_resource.bufferUsage = sys::_NV_ENC_BUFFER_USAGE_NV_ENC_INPUT_IMAGE;
+
+            let status = self
+                .encoder_api
+                .nvEncRegisterResource
+                .map(|f| unsafe { f(self.encoder, &mut register_resource) })
+                .unwrap_or(sys::_NVENCSTATUS_NV_ENC_ERR_INVALID_PTR);
+            Error::check_nvenc(status, "nvEncRegisterResource")?;
+
+            self.registered_resources
+                .push(register_resource.registeredResource);
+
+            // ビットストリームバッファの作成
+            let mut create_bs: sys::NV_ENC_CREATE_BITSTREAM_BUFFER = unsafe { std::mem::zeroed() };
+            create_bs.version = sys::NV_ENC_CREATE_BITSTREAM_BUFFER_VER;
+
+            let status = self
+                .encoder_api
+                .nvEncCreateBitstreamBuffer
+                .map(|f| unsafe { f(self.encoder, &mut create_bs) })
+                .unwrap_or(sys::_NVENCSTATUS_NV_ENC_ERR_INVALID_PTR);
+            Error::check_nvenc(status, "nvEncCreateBitstreamBuffer")?;
+
+            self.bitstream_buffers.push(create_bs.bitstreamBuffer);
+
+            // mapped_inputs は事前に vec![None; n_encoder_buffer] で初期化済み
+            debug_assert!(self.mapped_inputs[i].is_none());
         }
-
-        self.lib
-            .clone()
-            .with_context(self.ctx, || self.encode_inner(frame_data, options))
-    }
-
-    fn encode_inner(&mut self, frame_data: &[u8], options: &EncodeOptions) -> Result<(), Error> {
-        // 入力データをデバイスにコピー
-        let (device_input, _device_guard) = self.copy_input_data_to_device(frame_data)?;
-
-        // CUDA デバイスメモリを入力リソースとして登録
-        let (registered_resource, _registered_guard) =
-            self.register_input_resource(device_input)?;
-
-        // 登録したリソースをマップ
-        let (mapped_resource, _mapped_guard) = self.map_input_resource(registered_resource)?;
-
-        // 出力ビットストリームバッファを割り当て
-        let (output_buffer, _bitstream_guard) = self.create_output_bitstream_buffer()?;
-
-        // ピクチャをエンコード
-        self.encode_picture(mapped_resource, output_buffer, options)?;
-
-        // ビットストリームをロックしてエンコード済みデータをコピー
-        let encoded_frame = self.lock_and_copy_bitstream(output_buffer)?;
-
-        // エンコード済みフレームを保存
-        self.encoded_frames.push_back(encoded_frame);
 
         Ok(())
     }
 
-    fn copy_input_data_to_device(
-        &mut self,
-        frame_data: &[u8],
-    ) -> Result<(sys::CUdeviceptr, ReleaseGuard<impl FnOnce() + use<>>), Error> {
-        let mut device_input: sys::CUdeviceptr = 0;
-        self.lib.cu_mem_alloc(&mut device_input, frame_data.len())?;
-
-        let lib = self.lib.clone();
-        let device_guard = ReleaseGuard::new(move || {
-            let _ = lib.cu_mem_free(device_input);
-        });
-
-        self.lib
-            .cu_memcpy_h_to_d(device_input, frame_data.as_ptr().cast(), frame_data.len())?;
-
-        Ok((device_input, device_guard))
-    }
-
-    fn register_input_resource(
-        &mut self,
-        device_input: sys::CUdeviceptr,
-    ) -> Result<
-        (
-            sys::NV_ENC_REGISTERED_PTR,
-            ReleaseGuard<impl FnOnce() + use<>>,
-        ),
-        Error,
-    > {
-        unsafe {
-            let mut register_resource: sys::NV_ENC_REGISTER_RESOURCE = std::mem::zeroed();
-            register_resource.version = sys::NV_ENC_REGISTER_RESOURCE_VER;
-            register_resource.resourceType =
-                sys::_NV_ENC_INPUT_RESOURCE_TYPE_NV_ENC_INPUT_RESOURCE_TYPE_CUDADEVICEPTR;
-            register_resource.resourceToRegister = device_input as *mut c_void;
-            register_resource.width = self.width;
-            register_resource.height = self.height;
-            register_resource.pitch = self.buffer_format_enum.bytes_per_row(self.width)?;
-            register_resource.bufferFormat = self.buffer_format;
-            register_resource.bufferUsage = sys::_NV_ENC_BUFFER_USAGE_NV_ENC_INPUT_IMAGE;
-
-            let status = self
-                .encoder
-                .nvEncRegisterResource
-                .map(|f| f(self.h_encoder, &mut register_resource))
-                .unwrap_or(sys::_NVENCSTATUS_NV_ENC_ERR_INVALID_PTR);
-            Error::check_nvenc(status, "nvEncRegisterResource")?;
-
-            let registered_resource = register_resource.registeredResource;
-
-            let unregister = self.encoder.nvEncUnregisterResource;
-            let h_encoder = self.h_encoder;
-            let registered_guard = ReleaseGuard::new(move || {
-                unregister.map(|f| f(h_encoder, registered_resource));
-            });
-
-            Ok((registered_resource, registered_guard))
+    fn cleanup_buffer_pool(&mut self) {
+        if self.device_inputs.is_empty() {
+            return; // 既にクリーンアップ済み
         }
+        let _ = self.lib.with_context(self.ctx, || {
+            for i in 0..self.n_encoder_buffer {
+                if let Some(mapped) = self.mapped_inputs[i].take() {
+                    let _ = self
+                        .encoder_api
+                        .nvEncUnmapInputResource
+                        .map(|f| unsafe { f(self.encoder, mapped) });
+                }
+                let _ = self
+                    .encoder_api
+                    .nvEncUnregisterResource
+                    .map(|f| unsafe { f(self.encoder, self.registered_resources[i]) });
+                let _ = self
+                    .encoder_api
+                    .nvEncDestroyBitstreamBuffer
+                    .map(|f| unsafe { f(self.encoder, self.bitstream_buffers[i]) });
+                let _ = self.lib.cu_mem_free(self.device_inputs[i]);
+            }
+            Ok(())
+        });
+        self.device_inputs.clear();
+        self.registered_resources.clear();
+        self.bitstream_buffers.clear();
+        self.mapped_inputs.fill(None);
     }
 
-    fn map_input_resource(
-        &mut self,
-        registered_resource: sys::NV_ENC_REGISTERED_PTR,
-    ) -> Result<(sys::NV_ENC_INPUT_PTR, ReleaseGuard<impl FnOnce() + use<>>), Error> {
+    fn map_resource(&mut self, bfr_idx: usize) -> Result<sys::NV_ENC_INPUT_PTR, Error> {
         unsafe {
             let mut map_input_resource: sys::NV_ENC_MAP_INPUT_RESOURCE = std::mem::zeroed();
             map_input_resource.version = sys::NV_ENC_MAP_INPUT_RESOURCE_VER;
-            map_input_resource.registeredResource = registered_resource;
+            map_input_resource.registeredResource = self.registered_resources[bfr_idx];
 
             let status = self
-                .encoder
+                .encoder_api
                 .nvEncMapInputResource
-                .map(|f| f(self.h_encoder, &mut map_input_resource))
+                .map(|f| f(self.encoder, &mut map_input_resource))
                 .unwrap_or(sys::_NVENCSTATUS_NV_ENC_ERR_INVALID_PTR);
             Error::check_nvenc(status, "nvEncMapInputResource")?;
 
-            let mapped_resource = map_input_resource.mappedResource;
-
-            let unmap = self.encoder.nvEncUnmapInputResource;
-            let h_encoder = self.h_encoder;
-            let mapped_guard = ReleaseGuard::new(move || {
-                unmap.map(|f| f(h_encoder, mapped_resource));
-            });
-
-            Ok((mapped_resource, mapped_guard))
+            self.mapped_inputs[bfr_idx] = Some(map_input_resource.mappedResource);
+            Ok(map_input_resource.mappedResource)
         }
     }
 
-    fn create_output_bitstream_buffer(
-        &mut self,
-    ) -> Result<(sys::NV_ENC_OUTPUT_PTR, ReleaseGuard<impl FnOnce() + use<>>), Error> {
+    fn unmap_resource(&mut self, bfr_idx: usize) {
+        let lib = self.lib.clone();
+        let _ = lib.with_context(self.ctx, || {
+            self.unmap_resource_inner(bfr_idx);
+            Ok(())
+        });
+    }
+
+    fn unmap_resource_inner(&mut self, bfr_idx: usize) {
+        Self::unmap_resource_inner_static(
+            &mut self.mapped_inputs,
+            bfr_idx,
+            &self.encoder_api,
+            self.encoder,
+        );
+    }
+
+    fn unmap_resource_inner_static(
+        mapped_inputs: &mut [Option<sys::NV_ENC_INPUT_PTR>],
+        bfr_idx: usize,
+        encoder_api: &sys::NV_ENCODE_API_FUNCTION_LIST,
+        encoder: *mut c_void,
+    ) {
         unsafe {
-            let mut create_bitstream: sys::NV_ENC_CREATE_BITSTREAM_BUFFER = std::mem::zeroed();
-            create_bitstream.version = sys::NV_ENC_CREATE_BITSTREAM_BUFFER_VER;
-
-            let status = self
-                .encoder
-                .nvEncCreateBitstreamBuffer
-                .map(|f| f(self.h_encoder, &mut create_bitstream))
-                .unwrap_or(sys::_NVENCSTATUS_NV_ENC_ERR_INVALID_PTR);
-            Error::check_nvenc(status, "nvEncCreateBitstreamBuffer")?;
-
-            let output_buffer = create_bitstream.bitstreamBuffer;
-
-            let destroy = self.encoder.nvEncDestroyBitstreamBuffer;
-            let h_encoder = self.h_encoder;
-            let bitstream_guard = ReleaseGuard::new(move || {
-                destroy.map(|f| f(h_encoder, output_buffer));
-            });
-
-            Ok((output_buffer, bitstream_guard))
+            let Some(mapped) = mapped_inputs[bfr_idx].take() else {
+                return;
+            };
+            let _ = encoder_api
+                .nvEncUnmapInputResource
+                .map(|f| f(encoder, mapped));
         }
     }
 
-    fn encode_picture(
+    fn encode_frame(
         &mut self,
-        mapped_resource: sys::NV_ENC_INPUT_PTR,
-        output_buffer: sys::NV_ENC_OUTPUT_PTR,
+        bfr_idx: usize,
+        data: &[u8],
+        options: &EncodeOptions,
+    ) -> Result<(), Error> {
+        let lib = self.lib.clone();
+        lib.with_context(self.ctx, || self.encode_frame_inner(bfr_idx, data, options))
+    }
+
+    fn encode_frame_inner(
+        &mut self,
+        bfr_idx: usize,
+        data: &[u8],
         options: &EncodeOptions,
     ) -> Result<(), Error> {
         unsafe {
+            let expected_size = self.buffer_format.frame_size(self.width, self.height)?;
+            if data.len() != expected_size {
+                return Err(Error::new_custom("encode", "invalid frame data size"));
+            }
+
+            // デバイスメモリにコピー
+            self.lib.cu_memcpy_h_to_d(
+                self.device_inputs[bfr_idx],
+                data.as_ptr().cast(),
+                data.len(),
+            )?;
+
+            // リソースマップ
+            let mapped = self.map_resource(bfr_idx)?;
+
+            // エラー時に自動で unmap するガード
+            let mapped_inputs = &mut self.mapped_inputs;
+            let encoder = self.encoder;
+            let encoder_api = &self.encoder_api;
+            let unmap_guard = ReleaseGuard::new(|| {
+                Self::unmap_resource_inner_static(mapped_inputs, bfr_idx, encoder_api, encoder);
+            });
+
+            // エンコード
             let mut pic_params: sys::NV_ENC_PIC_PARAMS = std::mem::zeroed();
             pic_params.version = sys::NV_ENC_PIC_PARAMS_VER;
             pic_params.inputWidth = self.width;
             pic_params.inputHeight = self.height;
-            pic_params.inputPitch = self.buffer_format_enum.bytes_per_row(self.width)?;
-            pic_params.inputBuffer = mapped_resource;
-            pic_params.outputBitstream = output_buffer;
-            pic_params.bufferFmt = self.buffer_format;
+            pic_params.inputPitch = self.buffer_format.bytes_per_row(self.width)?;
+            pic_params.inputBuffer = mapped;
+            pic_params.outputBitstream = self.bitstream_buffers[bfr_idx];
+            pic_params.bufferFmt = self.buffer_format.to_sys();
             pic_params.pictureStruct = sys::_NV_ENC_PIC_STRUCT_NV_ENC_PIC_STRUCT_FRAME;
             pic_params.inputTimeStamp = self.frame_count * self.framerate_den;
             pic_params.encodePicFlags = options.to_pic_flags();
+            pic_params.frameIdx = self.i_to_send as u32;
 
             self.frame_count += 1;
 
             let status = self
-                .encoder
+                .encoder_api
                 .nvEncEncodePicture
-                .map(|f| f(self.h_encoder, &mut pic_params))
+                .map(|f| f(self.encoder, &mut pic_params))
                 .unwrap_or(sys::_NVENCSTATUS_NV_ENC_ERR_INVALID_PTR);
+
             Error::check_nvenc(status, "nvEncEncodePicture")?;
+
+            // エンコード成功時はリソースを mapped 状態に保つ
+            // （後続の drain で unmap_resource が担当する）
+            unmap_guard.cancel();
 
             Ok(())
         }
     }
+}
 
-    fn lock_and_copy_bitstream(
-        &mut self,
-        output_buffer: sys::NV_ENC_OUTPUT_PTR,
-    ) -> Result<EncodedFrame, Error> {
-        unsafe {
-            let mut lock_bitstream: sys::NV_ENC_LOCK_BITSTREAM = std::mem::zeroed();
-            lock_bitstream.version = sys::NV_ENC_LOCK_BITSTREAM_VER;
-            lock_bitstream.outputBitstream = output_buffer;
-
-            let status = self
-                .encoder
-                .nvEncLockBitstream
-                .map(|f| f(self.h_encoder, &mut lock_bitstream))
-                .unwrap_or(sys::_NVENCSTATUS_NV_ENC_ERR_INVALID_PTR);
-            Error::check_nvenc(status, "nvEncLockBitstream")?;
-
-            // どの分岐でも必ず unlock するためのガード
-            let unlock_fn = self.encoder.nvEncUnlockBitstream;
-            let h_encoder = self.h_encoder;
-            let output_bitstream = lock_bitstream.outputBitstream;
-            let _unlock_guard = crate::ReleaseGuard::new(move || {
-                if let Some(f) = unlock_fn {
-                    let _ = f(h_encoder, output_bitstream);
-                }
-            });
-
-            // ビットストリームがロックされている間にエンコード済みデータをコピー
-            let ptr = lock_bitstream.bitstreamBufferPtr as *const u8;
-            let size = lock_bitstream.bitstreamSizeInBytes as usize;
-            let encoded_data = if ptr.is_null() {
-                return Err(Error::new_custom(
-                    "nvEncLockBitstream",
-                    "bitstreamBufferPtr is null",
-                ));
-            } else if size == 0 {
-                Vec::new()
-            } else {
-                std::slice::from_raw_parts(ptr, size).to_vec()
-            };
-
-            let timestamp = lock_bitstream.outputTimeStamp;
-            let picture_type = PictureType::new(lock_bitstream.pictureType);
-
-            Ok(EncodedFrame {
-                data: encoded_data,
-                timestamp,
-                picture_type,
-            })
-        }
+impl EncoderState {
+    /// エンコーダーを終了し、残りのフレームを取得する
+    fn send_eos(&mut self) -> Result<(), Error> {
+        let lib = self.lib.clone();
+        lib.with_context(self.ctx, || self.send_eos_inner())
     }
 
-    /// エンコーダーを終了し、残りのフレームを取得する
-    pub fn finish(&mut self) -> Result<(), Error> {
+    fn send_eos_inner(&mut self) -> Result<(), Error> {
         unsafe {
             let mut pic_params: sys::NV_ENC_PIC_PARAMS = std::mem::zeroed();
             pic_params.version = sys::NV_ENC_PIC_PARAMS_VER;
@@ -1136,28 +1123,25 @@ impl Encoder {
             pic_params.inputTimeStamp = self.frame_count;
 
             let status = self
-                .encoder
+                .encoder_api
                 .nvEncEncodePicture
-                .map(|f| f(self.h_encoder, &mut pic_params))
+                .map(|f| f(self.encoder, &mut pic_params))
                 .unwrap_or(sys::_NVENCSTATUS_NV_ENC_ERR_INVALID_PTR);
             Error::check_nvenc(status, "nvEncEncodePicture")?;
 
             Ok(())
         }
     }
-
-    /// 次のエンコード済みフレームを取得する
-    pub fn next_frame(&mut self) -> Option<EncodedFrame> {
-        self.encoded_frames.pop_front()
-    }
 }
 
-impl Drop for Encoder {
+impl Drop for EncoderState {
     fn drop(&mut self) {
         unsafe {
+            self.cleanup_buffer_pool();
+
             let _ = self.lib.with_context(self.ctx, || {
-                if let Some(destroy_fn) = self.encoder.nvEncDestroyEncoder {
-                    destroy_fn(self.h_encoder);
+                if let Some(destroy_fn) = self.encoder_api.nvEncDestroyEncoder {
+                    destroy_fn(self.encoder);
                 }
                 Ok(())
             });
@@ -1167,20 +1151,230 @@ impl Drop for Encoder {
     }
 }
 
-impl std::fmt::Debug for Encoder {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("Encoder")
-            .field("ctx", &format_args!("{:p}", self.ctx))
-            .field("h_encoder", &format_args!("{:p}", self.h_encoder))
-            .field("width", &self.width)
-            .field("height", &self.height)
-            .field("buffer_format", &self.buffer_format)
-            .field("frame_count", &self.frame_count)
-            .finish()
+/// エンコード結果を通知するためのハンドラー
+///
+/// エンコード処理が完了するたびに [`EncodeHandler::on_encoded`] が呼ばれる。
+pub trait EncodeHandler: Send + 'static {
+    /// ユーザーデータ型
+    type UserData: Send + 'static;
+    /// エラー型
+    type Error: From<crate::Error> + Send + 'static;
+    /// エンコード完了時に呼ばれる
+    fn on_encoded(&mut self, result: Result<EncodedFrame<Self::UserData>, Self::Error>);
+}
+
+/// `FnMut` クロージャを [`EncodeHandler`] にするラッパー
+pub struct FnEncodeHandler<T, E = crate::Error> {
+    f: Box<dyn FnMut(Result<EncodedFrame<T>, E>) + Send + 'static>,
+}
+
+impl<T, E> FnEncodeHandler<T, E> {
+    /// `FnMut` クロージャから [`FnEncodeHandler`] を生成する
+    pub fn new<F>(f: F) -> Self
+    where
+        F: FnMut(Result<EncodedFrame<T>, E>) + Send + 'static,
+    {
+        Self { f: Box::new(f) }
     }
 }
 
-unsafe impl Send for Encoder {}
+impl<T, E> EncodeHandler for FnEncodeHandler<T, E>
+where
+    T: Send + 'static,
+    E: From<crate::Error> + Send + 'static,
+{
+    type UserData = T;
+    type Error = E;
+    fn on_encoded(&mut self, result: Result<EncodedFrame<T>, E>) {
+        (self.f)(result);
+    }
+}
+
+/// エンコーダー
+///
+/// 内部で専用のワーカースレッドを起動し、非同期でエンコードを行う。
+/// エンコードが完了すると、コンストラクタで渡したハンドラがワーカースレッド上で即座に呼び出される。
+pub struct Encoder<H: EncodeHandler> {
+    job_tx: Sender<Job<H::UserData>>,
+    worker: Option<JoinHandle<()>>,
+    drain_handle: Option<JoinHandle<()>>,
+}
+
+/// drain スレッドへのリクエスト
+///
+/// worker スレッドから drain スレッドへ mpsc 経由で送信される。
+///
+/// `nvEncLockBitstream` を drain スレッドでブロッキング実行するために必要な
+/// コンテキストをすべて含んでいる。
+struct DrainRequest {
+    lib: CudaLibrary,
+    ctx: sys::CUcontext,
+    lock_fn: sys::PNVENCLOCKBITSTREAM,
+    unlock_fn: sys::PNVENCUNLOCKBITSTREAM,
+    encoder: *mut c_void,
+    /// ロック対象のビットストリームバッファ
+    output_bitstream: sys::NV_ENC_OUTPUT_PTR,
+}
+
+unsafe impl Send for DrainRequest {}
+
+/// worker スレッドが受信するメッセージ
+///
+/// 外部 API（encode/flush/reconfigure）からのジョブと、
+/// drain スレッドからの完了通知（DrainResult）の両方が
+/// この単一チャネルに集約される。
+enum Job<T> {
+    Encode {
+        data: Vec<u8>,
+        options: EncodeOptions,
+        user_data: T,
+    },
+    Reconfigure {
+        params: ReconfigureParams,
+        done: SyncSender<Result<(), Error>>,
+    },
+    GetSequenceParams {
+        done: SyncSender<Result<Vec<u8>, Error>>,
+    },
+    Flush {
+        done: SyncSender<()>,
+    },
+    Terminate,
+    DrainResult {
+        result: Result<(Vec<u8>, u64, PictureType), Error>,
+    },
+}
+
+impl<H: EncodeHandler> Encoder<H> {
+    /// エンコーダーを生成する。
+    ///
+    /// 2 つの内部スレッドが起動される:
+    /// - worker スレッド（`nvcodec-encoder`）: job の受信、フレーム送信、バッファ管理
+    /// - drain スレッド（`nvcodec-drain`）: NVENC のエンコード待機とエンコード済みデータの取り出し
+    pub fn new(config: EncoderConfig, handler: H) -> Result<Self, Error> {
+        let (job_tx, job_rx) = mpsc::channel::<Job<H::UserData>>();
+        let (drain_tx, drain_rx) = mpsc::channel::<DrainRequest>();
+
+        let state = EncoderState::new(&config)?;
+
+        // drain スレッドを起動
+        let drain_job_tx = job_tx.clone();
+        let drain_handle = std::thread::Builder::new()
+            .name("nvcodec-drain".into())
+            .spawn(move || {
+                drain_thread_loop::<H::UserData>(drain_rx, drain_job_tx);
+            })
+            .map_err(|_e| Error::new_custom("Encoder::new", "failed to spawn drain thread"))?;
+
+        // ワーカースレッドを起動
+        let worker = std::thread::Builder::new()
+            .name("nvcodec-encoder".into())
+            .spawn(move || {
+                run_worker(state, handler, job_rx, drain_tx);
+            })
+            .map_err(|_e| Error::new_custom("Encoder::new", "failed to spawn encoder thread"))?;
+
+        Ok(Self {
+            job_tx,
+            worker: Some(worker),
+            drain_handle: Some(drain_handle),
+        })
+    }
+
+    /// フレームをエンコードする
+    ///
+    /// フレームデータとオプションをワーカースレッドに送信し、即座に戻る。
+    /// エンコードが完了すると、コンストラクタで渡したコールバックハンドラが呼び出される。
+    pub fn encode(
+        &self,
+        data: &[u8],
+        options: &EncodeOptions,
+        user_data: H::UserData,
+    ) -> Result<(), Error> {
+        self.job_tx
+            .send(Job::Encode {
+                data: data.to_vec(),
+                options: options.clone(),
+                user_data,
+            })
+            .map_err(|_| Error::new_custom("encode", "encoder worker thread has terminated"))
+    }
+
+    /// 送信済みの未完了フレームがすべて完了するまで待機する
+    ///
+    /// すべての pending フレームのコールバックハンドラが呼び出された後、このメソッドが戻る。
+    /// flush 後も encode を継続できる。
+    pub fn flush(&self) -> Result<(), Error> {
+        let (tx, rx) = mpsc::sync_channel(0);
+        self.job_tx
+            .send(Job::Flush { done: tx })
+            .map_err(|_| Error::new_custom("flush", "send failed"))?;
+        rx.recv()
+            .map_err(|_| Error::new_custom("flush", "recv failed"))?;
+        Ok(())
+    }
+
+    /// エンコーダパラメータを再構成する
+    ///
+    /// ビットレートやフレームレート、解像度を動的に変更する。
+    /// エンコーダの初期化時に設定された値を基準に、指定されたパラメータのみを上書きする。
+    ///
+    /// 解像度を変更した直後の最初のエンコードフレームには、呼び出し元が
+    /// `EncodeOptions { force_idr: true, output_spspps: true, .. }` を指定する必要がある。
+    /// これを怠ると新しい解像度の SPS/PPS がビットストリームに出力されず、デコーダーが再生不能になる。
+    pub fn reconfigure(&self, params: ReconfigureParams) -> Result<(), Error> {
+        let (tx, rx) = mpsc::sync_channel(0);
+        self.job_tx
+            .send(Job::Reconfigure { params, done: tx })
+            .map_err(|_| Error::new_custom("reconfigure", "send failed"))?;
+        rx.recv()
+            .map_err(|_| Error::new_custom("reconfigure", "recv failed"))?
+    }
+
+    /// シーケンスパラメータ（SPS/PPS または Sequence Header OBU）を取得する
+    ///
+    /// H.264/HEVC の場合は SPS/PPS、AV1 の場合は Sequence Header OBU を取得します。
+    pub fn get_sequence_params(&self) -> Result<Vec<u8>, Error> {
+        let (tx, rx) = mpsc::sync_channel(0);
+        self.job_tx
+            .send(Job::GetSequenceParams { done: tx })
+            .map_err(|_| Error::new_custom("get_sequence_params", "send failed"))?;
+        rx.recv()
+            .map_err(|_| Error::new_custom("get_sequence_params", "recv failed"))?
+    }
+}
+
+impl<H: EncodeHandler> Drop for Encoder<H> {
+    fn drop(&mut self) {
+        // worker スレッドに Terminate を送信して終了待機。
+        // run_worker 内で全 in-flight フレームの drain が完了した後、
+        // drain スレッドが終了する。
+        // それによって drain_tx が drop される。
+        let _ = self.job_tx.send(Job::Terminate);
+        if let Some(worker) = self.worker.take() {
+            let _ = worker.join();
+        }
+
+        // drain スレッドの終了を待機。
+        // drain_tx の drop を検知することで drain スレッドは自動的に終了する。
+        if let Some(drain_handle) = self.drain_handle.take() {
+            let _ = drain_handle.join();
+        }
+    }
+}
+
+impl<H: EncodeHandler> std::fmt::Debug for Encoder<H> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Encoder").finish_non_exhaustive()
+    }
+}
+
+unsafe impl<H: EncodeHandler> Send for Encoder<H> {}
+
+/// 指定コーデックのエンコーダのケーパビリティをクエリする
+pub fn query_encoder_caps(codec: EncoderCodec, device_id: i32) -> Result<EncoderCaps, Error> {
+    EncoderState::query_caps(codec, device_id)
+}
 
 /// ピクチャータイプ
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -1226,21 +1420,17 @@ impl PictureType {
 
 /// エンコード済みフレーム
 #[derive(Debug, Clone)]
-pub struct EncodedFrame {
+pub struct EncodedFrame<T> {
     data: Vec<u8>,
     timestamp: u64,
     picture_type: PictureType,
+    user_data: T,
 }
 
-impl EncodedFrame {
+impl<T> EncodedFrame<T> {
     /// エンコードされたデータを取得する
     pub fn data(&self) -> &[u8] {
         &self.data
-    }
-
-    /// エンコードされたデータを取得する（所有権を移動）
-    pub fn into_data(self) -> Vec<u8> {
-        self.data
     }
 
     /// タイムスタンプを取得する
@@ -1252,11 +1442,338 @@ impl EncodedFrame {
     pub fn picture_type(&self) -> PictureType {
         self.picture_type
     }
+
+    /// ユーザーデータを取得する
+    pub fn user_data(&self) -> &T {
+        &self.user_data
+    }
+
+    /// エンコードされたデータとユーザーデータを取得する（所有権を移動）
+    pub fn into_parts(self) -> (Vec<u8>, T) {
+        (self.data, self.user_data)
+    }
+}
+
+/// drain スレッドのメインループ
+///
+/// worker スレッドから DrainRequest を受信し、
+/// `nvEncLockBitstream` をブロッキング実行する。
+/// 完了したら DrainResult を mpsc 経由で worker スレッドに送信する。
+///
+/// `nvEncLockBitstream` がブロッキングするため、この処理だけ drain スレッドで行う。
+/// こうすることで、worker スレッドはメインスレッドからのエンコード投入リクエストと
+/// drain スレッドからのエンコード完了処理を同時に受け付けられる
+fn drain_thread_loop<T: Send + 'static>(drain_rx: Receiver<DrainRequest>, job_tx: Sender<Job<T>>) {
+    while let Ok(req) = drain_rx.recv() {
+        let result = lock_and_copy_bitstream(
+            &req.lib,
+            req.ctx,
+            req.lock_fn,
+            req.unlock_fn,
+            req.encoder,
+            req.output_bitstream,
+        );
+        // drain スレッドは結果の成否にかかわらず worker に送信する。
+        // エラーハンドリングはここでは行わない。
+        let _ = job_tx.send(Job::DrainResult { result });
+    }
+}
+
+/// NVENC のビットストリームをロックし、エンコード済みデータをコピーする
+fn lock_and_copy_bitstream(
+    lib: &CudaLibrary,
+    ctx: sys::CUcontext,
+    lock_fn: sys::PNVENCLOCKBITSTREAM,
+    unlock_fn: sys::PNVENCUNLOCKBITSTREAM,
+    encoder: *mut c_void,
+    output_bitstream: sys::NV_ENC_OUTPUT_PTR,
+) -> Result<(Vec<u8>, u64, PictureType), Error> {
+    lib.with_context(ctx, || unsafe {
+        let mut lock_bitstream: sys::NV_ENC_LOCK_BITSTREAM = std::mem::zeroed();
+        lock_bitstream.version = sys::NV_ENC_LOCK_BITSTREAM_VER;
+        lock_bitstream.outputBitstream = output_bitstream;
+
+        let status = lock_fn
+            .map(|f| f(encoder, &mut lock_bitstream))
+            .unwrap_or(sys::_NVENCSTATUS_NV_ENC_ERR_INVALID_PTR);
+        Error::check_nvenc(status, "nvEncLockBitstream")?;
+
+        // どの分岐でも必ず unlock するためのガード
+        let output_bitstream = lock_bitstream.outputBitstream;
+        let _unlock_guard = ReleaseGuard::new(move || {
+            if let Some(f) = unlock_fn {
+                let _ = f(encoder, output_bitstream);
+            }
+        });
+
+        // ビットストリームがロックされている間にエンコード済みデータをコピー
+        let ptr = lock_bitstream.bitstreamBufferPtr as *const u8;
+        let size = lock_bitstream.bitstreamSizeInBytes as usize;
+
+        if ptr.is_null() {
+            return Err(Error::new_custom(
+                "nvEncLockBitstream",
+                "bitstreamBufferPtr is null",
+            ));
+        }
+
+        let data = std::slice::from_raw_parts(ptr, size).to_vec();
+
+        let timestamp = lock_bitstream.outputTimeStamp;
+        let picture_type = PictureType::new(lock_bitstream.pictureType);
+
+        Ok((data, timestamp, picture_type))
+    })
+}
+
+/// worker スレッドのメインループ
+///
+/// mpsc から Job<T> を受信し、エンコードリクエストの送信と状態管理を行う。
+/// nvEncLockBitstream の待機は専用の drain スレッドに委譲される。
+///
+/// # アーキテクチャ
+///
+/// ```text
+///                                      (DrainRequest の送信)
+/// [外部 API] --job_tx--> [worker スレッド] --drain_tx--> [drain スレッド]
+///                                         <- job_tx ---
+///                                       (DrainResult の返送)
+/// ```
+///
+/// - worker スレッド: フレーム送信（encode_frame）、バッファ管理、handler 呼び出し
+/// - drain スレッド: nvEncLockBitstream（ブロッキング）を実行し、結果を job_tx 経由で返送
+fn run_worker<H>(
+    mut state: EncoderState,
+    mut handler: H,
+    job_rx: Receiver<Job<H::UserData>>,
+    drain_tx: Sender<DrainRequest>,
+) where
+    H: EncodeHandler,
+{
+    // user_data を保持するキュー。
+    let mut pending_user_data: VecDeque<H::UserData> = VecDeque::new();
+    // drain リクエストを送信済みのフレーム数。
+    // i_got <= i_in_flight <= i_to_send
+    let mut i_in_flight = 0;
+
+    while let Ok(job) = job_rx.recv() {
+        match job {
+            Job::DrainResult { result } => {
+                consume_drain_result(&mut state, result, &mut pending_user_data, &mut handler);
+            }
+            Job::Encode {
+                data,
+                options,
+                user_data,
+            } => {
+                // バッファが満杯の場合はエラー callback を実行する
+                if state.i_to_send - state.i_got >= state.n_encoder_buffer {
+                    handler.on_encoded(Err(
+                        Error::new_custom("encode", "encoder buffer is full").into()
+                    ));
+                    continue;
+                }
+
+                let bfr_idx = state.i_to_send % state.n_encoder_buffer;
+                let encode_result = state.encode_frame(bfr_idx, &data, &options);
+
+                match encode_result {
+                    Ok(()) => {
+                        // user_data を pending キューに追加。
+                        // 後続の DrainResult で pop_front される。
+                        pending_user_data.push_back(user_data);
+                        state.i_to_send += 1;
+                        // 新たに送信したフレームの drain リクエストを送信
+                        if !send_pending_drain_requests(
+                            &drain_tx,
+                            &state,
+                            &mut i_in_flight,
+                            &mut handler,
+                        ) {
+                            return;
+                        }
+                    }
+                    Err(e) => {
+                        handler.on_encoded(Err(e.into()));
+                    }
+                }
+            }
+            Job::Reconfigure { params, done } => {
+                // バッファプール再構築との競合を防ぐため、
+                // 全 in-flight フレームを drain してから reconfigure を実行する。
+                if !send_pending_drain_requests(&drain_tx, &state, &mut i_in_flight, &mut handler) {
+                    return;
+                }
+                if !wait_all_drains(
+                    &mut state,
+                    &mut pending_user_data,
+                    &mut handler,
+                    &job_rx,
+                    "reconfigure",
+                ) {
+                    return;
+                }
+                let _ = done.send(state.reconfigure(params));
+            }
+            Job::Flush { done } => {
+                // 全 in-flight フレームが drain されるまで待機する
+                if !send_pending_drain_requests(&drain_tx, &state, &mut i_in_flight, &mut handler) {
+                    return;
+                }
+                if !wait_all_drains(
+                    &mut state,
+                    &mut pending_user_data,
+                    &mut handler,
+                    &job_rx,
+                    "flush",
+                ) {
+                    return;
+                }
+                let _ = done.send(());
+            }
+            Job::GetSequenceParams { done } => {
+                // GetSequenceParams は drain を必要としないので、
+                // そのままシーケンスパラメータを返却する。
+                let _ = done.send(state.get_sequence_params());
+            }
+            Job::Terminate => {
+                // NVENC に EOS を送信し、エンコーダの内部パイプラインをフラッシュする。
+                let _ = state.send_eos();
+
+                // EOS 送信後に残っている全フレームを drain する。
+                if !send_pending_drain_requests(&drain_tx, &state, &mut i_in_flight, &mut handler) {
+                    return;
+                }
+                if !wait_all_drains(
+                    &mut state,
+                    &mut pending_user_data,
+                    &mut handler,
+                    &job_rx,
+                    "terminate",
+                ) {
+                    return;
+                }
+
+                return;
+            }
+        }
+    }
+}
+
+/// drain スレッドから受信した結果を消費し、後片付けして callback を呼び出す
+fn consume_drain_result<H>(
+    state: &mut EncoderState,
+    result: Result<(Vec<u8>, u64, PictureType), Error>,
+    pending_user_data: &mut VecDeque<H::UserData>,
+    handler: &mut H,
+) where
+    H: EncodeHandler,
+{
+    let bfr_idx = state.i_got % state.n_encoder_buffer;
+
+    // drain が完了したので mapped resource を解放し、
+    // 次の encode_frame で再利用可能にする
+    state.unmap_resource(bfr_idx);
+    state.i_got += 1;
+
+    match result {
+        Ok((data, timestamp, picture_type)) => {
+            // pending_user_data は送信順に push されているため、
+            // pop_front で対応する user_data が取得できる
+            if let Some(user_data) = pending_user_data.pop_front() {
+                handler.on_encoded(Ok(EncodedFrame {
+                    data,
+                    timestamp,
+                    picture_type,
+                    user_data,
+                }));
+            } else {
+                handler.on_encoded(Err(Error::new_custom(
+                    "consume_drain_result",
+                    "missing user data",
+                )
+                .into()));
+            }
+        }
+        Err(e) => {
+            // エラー発生時は全 pending データをクリアする。
+            pending_user_data.clear();
+            handler.on_encoded(Err(e.into()));
+        }
+    }
+}
+
+/// 未送信の drain リクエストをすべて送信する
+fn send_pending_drain_requests<H>(
+    drain_tx: &Sender<DrainRequest>,
+    state: &EncoderState,
+    i_in_flight: &mut usize,
+    handler: &mut H,
+) -> bool
+where
+    H: EncodeHandler,
+{
+    while *i_in_flight < state.i_to_send {
+        let bfr_idx = *i_in_flight % state.n_encoder_buffer;
+        let result = drain_tx.send(DrainRequest {
+            lib: state.lib.clone(),
+            ctx: state.ctx,
+            lock_fn: state.encoder_api.nvEncLockBitstream,
+            unlock_fn: state.encoder_api.nvEncUnlockBitstream,
+            encoder: state.encoder,
+            output_bitstream: state.bitstream_buffers[bfr_idx],
+        });
+        if result.is_err() {
+            handler.on_encoded(Err(Error::new_custom(
+                "send_pending_drain_requests",
+                "drain thread has terminated",
+            )
+            .into()));
+            return false;
+        };
+        *i_in_flight += 1;
+    }
+    true
+}
+
+/// 全 in-flight フレームの drain 完了を待機する
+///
+/// drain 待機中に DrainResult 以外のメッセージが届いた場合は
+/// エラー callback を呼ぶ。
+/// job_rx が切断された場合は `false` を返す
+/// （呼び出し元の run_worker が return すべきことを示す）。
+fn wait_all_drains<H>(
+    state: &mut EncoderState,
+    pending_user_data: &mut VecDeque<H::UserData>,
+    handler: &mut H,
+    job_rx: &Receiver<Job<H::UserData>>,
+    context: &'static str,
+) -> bool
+where
+    H: EncodeHandler,
+{
+    while state.i_got < state.i_to_send {
+        match job_rx.recv() {
+            Ok(Job::DrainResult { result }) => {
+                consume_drain_result(state, result, pending_user_data, handler);
+            }
+            Ok(_) => {
+                handler.on_encoded(Err(Error::new_custom(
+                    context,
+                    "unexpected message during drain",
+                )
+                .into()));
+            }
+            Err(_) => return false,
+        }
+    }
+    true
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::mpsc;
 
     /// テスト用のエンコーダー設定を生成する
     fn test_encoder_config(codec: CodecConfig) -> EncoderConfig {
@@ -1281,41 +1798,66 @@ mod tests {
 
     #[test]
     fn init_h264_encoder() {
+        let (tx, _rx) = mpsc::sync_channel::<Result<EncodedFrame<()>, Error>>(4);
         let config = test_encoder_config(CodecConfig::H264(H264EncoderConfig {
             profile: None,
             idr_period: None,
         }));
-        let _encoder = Encoder::new(config).expect("failed to initialize h264 encoder");
-        println!("h264 encoder initialized successfully");
+        let _encoder = Encoder::new(
+            config,
+            FnEncodeHandler::new(move |frame| {
+                let _ = tx.send(frame);
+            }),
+        )
+        .expect("failed to initialize h264 encoder");
     }
 
     #[test]
     fn init_h265_encoder() {
+        let (tx, _rx) = mpsc::sync_channel::<Result<EncodedFrame<()>, Error>>(4);
         let config = test_encoder_config(CodecConfig::Hevc(HevcEncoderConfig {
             profile: None,
             idr_period: None,
         }));
-        let _encoder = Encoder::new(config).expect("failed to initialize h265 encoder");
-        println!("h265 encoder initialized successfully");
+        let _encoder = Encoder::new(
+            config,
+            FnEncodeHandler::new(move |frame| {
+                let _ = tx.send(frame);
+            }),
+        )
+        .expect("failed to initialize h265 encoder");
     }
 
     #[test]
     fn init_av1_encoder() {
+        let (tx, _rx) = mpsc::sync_channel::<Result<EncodedFrame<()>, Error>>(4);
         let config = test_encoder_config(CodecConfig::Av1(Av1EncoderConfig {
             profile: None,
             idr_period: None,
         }));
-        let _encoder = Encoder::new(config).expect("failed to initialize av1 encoder");
-        println!("av1 encoder initialized successfully");
+        let _encoder = Encoder::new(
+            config,
+            FnEncodeHandler::new(move |frame| {
+                let _ = tx.send(frame);
+            }),
+        )
+        .expect("failed to initialize av1 encoder");
     }
 
     #[test]
     fn test_get_sequence_params_h264() {
+        let (tx, _rx) = mpsc::sync_channel::<Result<EncodedFrame<()>, Error>>(4);
         let config = test_encoder_config(CodecConfig::H264(H264EncoderConfig {
             profile: None,
             idr_period: None,
         }));
-        let mut encoder = Encoder::new(config).expect("failed to create h264 encoder");
+        let encoder = Encoder::new(
+            config,
+            FnEncodeHandler::new(move |frame| {
+                let _ = tx.send(frame);
+            }),
+        )
+        .expect("failed to create h264 encoder");
 
         // SPS/PPS を取得
         let seq_params = encoder
@@ -1333,11 +1875,18 @@ mod tests {
 
     #[test]
     fn test_get_sequence_params_h265() {
+        let (tx, _rx) = mpsc::sync_channel::<Result<EncodedFrame<()>, Error>>(4);
         let config = test_encoder_config(CodecConfig::Hevc(HevcEncoderConfig {
             profile: None,
             idr_period: None,
         }));
-        let mut encoder = Encoder::new(config).expect("failed to create h265 encoder");
+        let encoder = Encoder::new(
+            config,
+            FnEncodeHandler::new(move |frame| {
+                let _ = tx.send(frame);
+            }),
+        )
+        .expect("failed to create h265 encoder");
 
         // VPS/SPS/PPS を取得
         let seq_params = encoder
@@ -1355,11 +1904,18 @@ mod tests {
 
     #[test]
     fn test_get_sequence_params_av1() {
+        let (tx, _rx) = mpsc::sync_channel::<Result<EncodedFrame<()>, Error>>(4);
         let config = test_encoder_config(CodecConfig::Av1(Av1EncoderConfig {
             profile: None,
             idr_period: None,
         }));
-        let mut encoder = Encoder::new(config).expect("failed to create av1 encoder");
+        let encoder = Encoder::new(
+            config,
+            FnEncodeHandler::new(move |frame| {
+                let _ = tx.send(frame);
+            }),
+        )
+        .expect("failed to create av1 encoder");
 
         // Sequence Header OBU を取得
         let seq_params = encoder
@@ -1377,6 +1933,7 @@ mod tests {
 
     #[test]
     fn test_encode_h264_black_frame() {
+        let (tx, rx) = mpsc::sync_channel::<Result<EncodedFrame<u32>, Error>>(4);
         let config = test_encoder_config(CodecConfig::H264(H264EncoderConfig {
             profile: None,
             idr_period: None,
@@ -1384,7 +1941,13 @@ mod tests {
         let width = config.width;
         let height = config.height;
 
-        let mut encoder = Encoder::new(config).expect("failed to create h264 encoder");
+        let encoder = Encoder::new(
+            config,
+            FnEncodeHandler::new(move |frame| {
+                let _ = tx.send(frame);
+            }),
+        )
+        .expect("failed to create h264 encoder");
 
         // NV12 形式の黒フレームを準備
         // Y 成分は 16（黒）、UV 成分は 128（ニュートラル）
@@ -1403,41 +1966,33 @@ mod tests {
                     force_idr: false,
                     output_spspps: false,
                 },
+                42,
             )
             .expect("failed to encode black frame");
 
-        // エンコーダーを終了して残りのフレームをフラッシュ
-        encoder.finish().expect("failed to finish encoder");
+        // エンコード完了を待機
+        encoder.flush().expect("flush failed");
 
         // エンコード済みフレームを取得
-        let mut frames = Vec::new();
-        while let Some(frame) = encoder.next_frame() {
-            frames.push(frame);
-        }
+        let frames: Vec<_> = rx.try_iter().collect();
+        drop(encoder);
 
         // 少なくとも 1 フレームはエンコードされるはず
         assert!(!frames.is_empty(), "No encoded frames received");
 
         // 最初のフレームはキーフレーム（I or IDR）であることを確認
-        let first_frame = &frames[0];
+        let first = frames[0].as_ref().expect("First frame should be Ok");
+        assert_eq!(first.user_data, 42);
         assert!(
-            matches!(first_frame.picture_type, PictureType::I | PictureType::Idr),
+            matches!(first.picture_type(), PictureType::I | PictureType::Idr),
             "First frame should be a keyframe"
         );
-        assert!(
-            !first_frame.data.is_empty(),
-            "Encoded frame should have data"
-        );
-
-        println!(
-            "Successfully encoded black frame: {} frames, first frame size: {} bytes",
-            frames.len(),
-            first_frame.data.len()
-        );
+        assert!(!first.data().is_empty(), "Encoded frame should have data");
     }
 
     #[test]
     fn test_encode_h265_black_frame() {
+        let (tx, rx) = mpsc::sync_channel::<Result<EncodedFrame<u32>, Error>>(4);
         let config = test_encoder_config(CodecConfig::Hevc(HevcEncoderConfig {
             profile: None,
             idr_period: None,
@@ -1445,7 +2000,13 @@ mod tests {
         let width = config.width;
         let height = config.height;
 
-        let mut encoder = Encoder::new(config).expect("failed to create h265 encoder");
+        let encoder = Encoder::new(
+            config,
+            FnEncodeHandler::new(move |frame| {
+                let _ = tx.send(frame);
+            }),
+        )
+        .expect("failed to create h265 encoder");
 
         // NV12 形式の黒フレームを準備
         // Y 成分は 16（黒）、UV 成分は 128（ニュートラル）
@@ -1464,41 +2025,33 @@ mod tests {
                     force_idr: false,
                     output_spspps: false,
                 },
+                7,
             )
             .expect("failed to encode black frame");
 
-        // エンコーダーを終了して残りのフレームをフラッシュ
-        encoder.finish().expect("failed to finish encoder");
+        // エンコード完了を待機
+        encoder.flush().expect("flush failed");
 
         // エンコード済みフレームを取得
-        let mut frames = Vec::new();
-        while let Some(frame) = encoder.next_frame() {
-            frames.push(frame);
-        }
+        let frames: Vec<_> = rx.try_iter().collect();
+        drop(encoder);
 
         // 少なくとも 1 フレームはエンコードされるはず
         assert!(!frames.is_empty(), "No encoded frames received");
 
         // 最初のフレームはキーフレーム（I or IDR）であることを確認
-        let first_frame = &frames[0];
+        let first = frames[0].as_ref().expect("First frame should be Ok");
+        assert_eq!(first.user_data, 7);
         assert!(
-            matches!(first_frame.picture_type, PictureType::I | PictureType::Idr),
+            matches!(first.picture_type(), PictureType::I | PictureType::Idr),
             "First frame should be a keyframe"
         );
-        assert!(
-            !first_frame.data.is_empty(),
-            "Encoded frame should have data"
-        );
-
-        println!(
-            "Successfully encoded black frame: {} frames, first frame size: {} bytes",
-            frames.len(),
-            first_frame.data.len()
-        );
+        assert!(!first.data().is_empty(), "Encoded frame should have data");
     }
 
     #[test]
     fn test_encode_av1_black_frame() {
+        let (tx, rx) = mpsc::sync_channel::<Result<EncodedFrame<u32>, Error>>(4);
         let config = test_encoder_config(CodecConfig::Av1(Av1EncoderConfig {
             profile: None,
             idr_period: None,
@@ -1506,7 +2059,13 @@ mod tests {
         let width = config.width;
         let height = config.height;
 
-        let mut encoder = Encoder::new(config).expect("failed to create av1 encoder");
+        let encoder = Encoder::new(
+            config,
+            FnEncodeHandler::new(move |frame| {
+                let _ = tx.send(frame);
+            }),
+        )
+        .expect("failed to create av1 encoder");
 
         // NV12 形式の黒フレームを準備
         // Y 成分は 16（黒）、UV 成分は 128（ニュートラル）
@@ -1525,36 +2084,823 @@ mod tests {
                     force_idr: false,
                     output_spspps: false,
                 },
+                3,
             )
             .expect("failed to encode black frame");
 
-        // エンコーダーを終了して残りのフレームをフラッシュ
-        encoder.finish().expect("failed to finish encoder");
+        // エンコード完了を待機
+        encoder.flush().expect("flush failed");
 
         // エンコード済みフレームを取得
-        let mut frames = Vec::new();
-        while let Some(frame) = encoder.next_frame() {
-            frames.push(frame);
-        }
+        let frames: Vec<_> = rx.try_iter().collect();
+        drop(encoder);
 
         // 少なくとも 1 フレームはエンコードされるはず
         assert!(!frames.is_empty(), "No encoded frames received");
 
         // 最初のフレームはキーフレーム（I or IDR）であることを確認
-        let first_frame = &frames[0];
+        let first = frames[0].as_ref().expect("First frame should be Ok");
+        assert_eq!(first.user_data, 3);
         assert!(
-            matches!(first_frame.picture_type, PictureType::I | PictureType::Idr),
+            matches!(first.picture_type(), PictureType::I | PictureType::Idr),
             "First frame should be a keyframe"
         );
-        assert!(
-            !first_frame.data.is_empty(),
-            "Encoded frame should have data"
+        assert!(!first.data().is_empty(), "Encoded frame should have data");
+    }
+
+    #[test]
+    fn test_encode_multiple_frames() {
+        use std::time::Duration;
+
+        let (tx, rx) = mpsc::sync_channel::<Result<EncodedFrame<u32>, Error>>(8);
+        let config = test_encoder_config(CodecConfig::H264(H264EncoderConfig {
+            profile: None,
+            idr_period: None,
+        }));
+        let width = config.width;
+        let height = config.height;
+
+        let encoder = Encoder::new(
+            config,
+            FnEncodeHandler::new(move |frame| {
+                let _ = tx.send(frame);
+            }),
+        )
+        .expect("failed to create h264 encoder");
+
+        // NV12 形式の黒フレームを準備
+        let y_size = (width * height) as usize;
+        let uv_size = (width * height / 2) as usize;
+        let mut frame_data = vec![16u8; y_size + uv_size];
+        frame_data[y_size..].fill(128);
+
+        // 5 フレームをエンコード。
+        // バッファ満杯を避けるため、30fps 相当のフレーム間隔（33ms）で送信する。
+        // これにより drain スレッドが encode() の間に drain を完了できる。
+        let frame_interval = Duration::from_millis(33);
+        for i in 0..5 {
+            encoder
+                .encode(
+                    &frame_data,
+                    &EncodeOptions {
+                        force_intra: false,
+                        force_idr: false,
+                        output_spspps: false,
+                    },
+                    i,
+                )
+                .expect("failed to encode frame");
+            std::thread::sleep(frame_interval);
+        }
+
+        encoder.flush().expect("flush failed");
+        drop(encoder);
+
+        // 5 フレームすべてがエンコードされたことを確認
+        let frames: Vec<_> = rx.try_iter().collect();
+        assert_eq!(frames.len(), 5, "Should have 5 encoded frames");
+
+        for (i, frame) in frames.iter().enumerate() {
+            let frame = frame.as_ref().expect("Frame should be Ok");
+            assert_eq!(frame.user_data, i as u32);
+            assert!(!frame.data().is_empty(), "Frame should have data");
+        }
+    }
+
+    #[test]
+    fn test_flush_without_encode() {
+        let (tx, rx) = mpsc::sync_channel::<Result<EncodedFrame<()>, Error>>(4);
+        let config = test_encoder_config(CodecConfig::H264(H264EncoderConfig {
+            profile: None,
+            idr_period: None,
+        }));
+
+        let encoder = Encoder::new(
+            config,
+            FnEncodeHandler::new(move |frame| {
+                let _ = tx.send(frame);
+            }),
+        )
+        .expect("failed to create h264 encoder");
+
+        // フレームを送信せずに flush してもハングしないことを確認
+        encoder.flush().expect("flush failed");
+        drop(encoder);
+
+        let frames: Vec<_> = rx.try_iter().collect();
+        assert!(frames.is_empty(), "No frames expected");
+    }
+
+    #[test]
+    fn test_reconfigure_h264() {
+        let (tx, rx) = mpsc::sync_channel::<Result<EncodedFrame<u32>, Error>>(4);
+        let config = test_encoder_config(CodecConfig::H264(H264EncoderConfig {
+            profile: None,
+            idr_period: None,
+        }));
+        let width = config.width;
+        let height = config.height;
+
+        let encoder = Encoder::new(
+            config,
+            FnEncodeHandler::new(move |frame| {
+                let _ = tx.send(frame);
+            }),
+        )
+        .expect("failed to create h264 encoder");
+
+        // フレームレートとビットレートを動的に変更
+        encoder
+            .reconfigure(ReconfigureParams {
+                framerate_num: Some(60),
+                framerate_den: Some(1),
+                average_bitrate: Some(10_000_000),
+                ..Default::default()
+            })
+            .expect("failed to reconfigure encoder");
+
+        // NV12 形式の黒フレームを準備
+        let y_size = (width * height) as usize;
+        let uv_size = (width * height / 2) as usize;
+        let mut frame_data = vec![16u8; y_size + uv_size];
+        frame_data[y_size..].fill(128);
+
+        // 再構成後にエンコードできることを確認
+        encoder
+            .encode(
+                &frame_data,
+                &EncodeOptions {
+                    force_intra: false,
+                    force_idr: false,
+                    output_spspps: false,
+                },
+                1,
+            )
+            .expect("failed to encode frame after reconfigure");
+
+        encoder.flush().expect("flush failed");
+        drop(encoder);
+
+        let frames: Vec<_> = rx.try_iter().collect();
+        assert!(!frames.is_empty(), "No encoded frames received");
+
+        let first = frames[0].as_ref().expect("First frame should be Ok");
+        assert_eq!(first.user_data, 1);
+        assert!(!first.data().is_empty(), "Encoded frame should have data");
+    }
+
+    /// 解像度変更用のエンコーダー設定を生成する
+    /// max_encode_width / max_encode_height を初期解像度より大きく指定する
+    fn test_encoder_config_with_max_resolution(
+        codec: CodecConfig,
+        width: u32,
+        height: u32,
+        max_width: u32,
+        max_height: u32,
+    ) -> EncoderConfig {
+        EncoderConfig {
+            codec,
+            width,
+            height,
+            max_encode_width: Some(max_width),
+            max_encode_height: Some(max_height),
+            framerate_num: 30,
+            framerate_den: 1,
+            average_bitrate: Some(5_000_000),
+            preset: Preset::P4,
+            tuning_info: TuningInfo::LOW_LATENCY,
+            rate_control_mode: RateControlMode::Vbr,
+            gop_length: None,
+            frame_interval_p: 1,
+            buffer_format: BufferFormat::Nv12,
+            device_id: 0,
+        }
+    }
+
+    /// 指定された解像度の NV12 黒フレームを作成する
+    fn create_black_frame(width: u32, height: u32) -> Vec<u8> {
+        let y_size = (width * height) as usize;
+        let uv_size = (width * height / 2) as usize;
+        let mut frame = vec![16u8; y_size + uv_size];
+        frame[y_size..].fill(128);
+        frame
+    }
+
+    #[test]
+    fn test_reconfigure_resolution_upscale_h264() {
+        let (tx, rx) = mpsc::sync_channel::<Result<EncodedFrame<u32>, Error>>(8);
+        let config = test_encoder_config_with_max_resolution(
+            CodecConfig::H264(H264EncoderConfig {
+                profile: None,
+                idr_period: None,
+            }),
+            640,
+            480,
+            1280,
+            720,
         );
 
-        println!(
-            "Successfully encoded black frame: {} frames, first frame size: {} bytes",
+        let encoder = Encoder::new(
+            config,
+            FnEncodeHandler::new(move |frame| {
+                let _ = tx.send(frame);
+            }),
+        )
+        .expect("failed to create h264 encoder");
+
+        // 初期解像度でエンコード
+        let frame_640x480 = create_black_frame(640, 480);
+        encoder
+            .encode(
+                &frame_640x480,
+                &EncodeOptions {
+                    force_intra: false,
+                    force_idr: true,
+                    output_spspps: true,
+                },
+                1,
+            )
+            .expect("failed to encode frame at 640x480");
+
+        // 解像度を 1280x720 に拡大
+        encoder
+            .reconfigure(ReconfigureParams {
+                width: Some(1280),
+                height: Some(720),
+                ..Default::default()
+            })
+            .expect("failed to reconfigure to 1280x720");
+
+        // 新解像度でエンコード
+        let frame_1280x720 = create_black_frame(1280, 720);
+        encoder
+            .encode(
+                &frame_1280x720,
+                &EncodeOptions {
+                    force_intra: false,
+                    force_idr: true,
+                    output_spspps: true,
+                },
+                2,
+            )
+            .expect("failed to encode frame at 1280x720");
+
+        encoder.flush().expect("flush failed");
+        drop(encoder);
+
+        let frames: Vec<_> = rx.try_iter().collect();
+        assert!(
+            frames.len() >= 2,
+            "Expected at least 2 encoded frames, got {}",
+            frames.len()
+        );
+
+        for frame in &frames {
+            let frame = frame.as_ref().expect("Frame should be Ok");
+            assert!(!frame.data().is_empty(), "Frame should have data");
+        }
+    }
+
+    #[test]
+    fn test_reconfigure_resolution_downscale_h264() {
+        let (tx, rx) = mpsc::sync_channel::<Result<EncodedFrame<u32>, Error>>(8);
+        let config = test_encoder_config_with_max_resolution(
+            CodecConfig::H264(H264EncoderConfig {
+                profile: None,
+                idr_period: None,
+            }),
+            1280,
+            720,
+            1280,
+            720,
+        );
+
+        let encoder = Encoder::new(
+            config,
+            FnEncodeHandler::new(move |frame| {
+                let _ = tx.send(frame);
+            }),
+        )
+        .expect("failed to create h264 encoder");
+
+        // 初期解像度でエンコード
+        let frame_1280x720 = create_black_frame(1280, 720);
+        encoder
+            .encode(
+                &frame_1280x720,
+                &EncodeOptions {
+                    force_intra: false,
+                    force_idr: true,
+                    output_spspps: true,
+                },
+                1,
+            )
+            .expect("failed to encode frame at 1280x720");
+
+        // 解像度を 640x480 に縮小
+        encoder
+            .reconfigure(ReconfigureParams {
+                width: Some(640),
+                height: Some(480),
+                ..Default::default()
+            })
+            .expect("failed to reconfigure to 640x480");
+
+        // 新解像度でエンコード
+        let frame_640x480 = create_black_frame(640, 480);
+        encoder
+            .encode(
+                &frame_640x480,
+                &EncodeOptions {
+                    force_intra: false,
+                    force_idr: true,
+                    output_spspps: true,
+                },
+                2,
+            )
+            .expect("failed to encode frame at 640x480");
+
+        encoder.flush().expect("flush failed");
+        drop(encoder);
+
+        let frames: Vec<_> = rx.try_iter().collect();
+        assert!(
+            frames.len() >= 2,
+            "Expected at least 2 encoded frames, got {}",
+            frames.len()
+        );
+
+        for frame in &frames {
+            let frame = frame.as_ref().expect("Frame should be Ok");
+            assert!(!frame.data().is_empty(), "Frame should have data");
+        }
+    }
+
+    #[test]
+    fn test_reconfigure_width_only_h264() {
+        let (tx, rx) = mpsc::sync_channel::<Result<EncodedFrame<u32>, Error>>(8);
+        let config = test_encoder_config_with_max_resolution(
+            CodecConfig::H264(H264EncoderConfig {
+                profile: None,
+                idr_period: None,
+            }),
+            640,
+            480,
+            960,
+            480,
+        );
+
+        let encoder = Encoder::new(
+            config,
+            FnEncodeHandler::new(move |frame| {
+                let _ = tx.send(frame);
+            }),
+        )
+        .expect("failed to create h264 encoder");
+
+        // 初期解像度でエンコード
+        encoder
+            .encode(
+                &create_black_frame(640, 480),
+                &EncodeOptions {
+                    force_intra: false,
+                    force_idr: true,
+                    output_spspps: true,
+                },
+                1,
+            )
+            .expect("failed to encode frame at 640x480");
+
+        // 幅のみ変更
+        encoder
+            .reconfigure(ReconfigureParams {
+                width: Some(960),
+                ..Default::default()
+            })
+            .expect("failed to reconfigure width to 960");
+
+        // 新解像度でエンコード
+        encoder
+            .encode(
+                &create_black_frame(960, 480),
+                &EncodeOptions {
+                    force_intra: false,
+                    force_idr: true,
+                    output_spspps: true,
+                },
+                2,
+            )
+            .expect("failed to encode frame at 960x480");
+
+        encoder.flush().expect("flush failed");
+        drop(encoder);
+
+        let frames: Vec<_> = rx.try_iter().collect();
+        assert!(!frames.is_empty(), "No encoded frames received");
+        for frame in &frames {
+            let frame = frame.as_ref().expect("Frame should be Ok");
+            assert!(!frame.data().is_empty(), "Frame should have data");
+        }
+    }
+
+    #[test]
+    fn test_reconfigure_height_only_h264() {
+        let (tx, rx) = mpsc::sync_channel::<Result<EncodedFrame<u32>, Error>>(8);
+        let config = test_encoder_config_with_max_resolution(
+            CodecConfig::H264(H264EncoderConfig {
+                profile: None,
+                idr_period: None,
+            }),
+            640,
+            480,
+            640,
+            720,
+        );
+
+        let encoder = Encoder::new(
+            config,
+            FnEncodeHandler::new(move |frame| {
+                let _ = tx.send(frame);
+            }),
+        )
+        .expect("failed to create h264 encoder");
+
+        // 初期解像度でエンコード
+        encoder
+            .encode(
+                &create_black_frame(640, 480),
+                &EncodeOptions {
+                    force_intra: false,
+                    force_idr: true,
+                    output_spspps: true,
+                },
+                1,
+            )
+            .expect("failed to encode frame at 640x480");
+
+        // 高さのみ変更
+        encoder
+            .reconfigure(ReconfigureParams {
+                height: Some(720),
+                ..Default::default()
+            })
+            .expect("failed to reconfigure height to 720");
+
+        // 新解像度でエンコード
+        encoder
+            .encode(
+                &create_black_frame(640, 720),
+                &EncodeOptions {
+                    force_intra: false,
+                    force_idr: true,
+                    output_spspps: true,
+                },
+                2,
+            )
+            .expect("failed to encode frame at 640x720");
+
+        encoder.flush().expect("flush failed");
+        drop(encoder);
+
+        let frames: Vec<_> = rx.try_iter().collect();
+        assert!(!frames.is_empty(), "No encoded frames received");
+        for frame in &frames {
+            let frame = frame.as_ref().expect("Frame should be Ok");
+            assert!(!frame.data().is_empty(), "Frame should have data");
+        }
+    }
+
+    #[test]
+    fn test_reconfigure_during_encoding_h264() {
+        let (tx, rx) = mpsc::sync_channel::<Result<EncodedFrame<u32>, Error>>(8);
+        let config = test_encoder_config_with_max_resolution(
+            CodecConfig::H264(H264EncoderConfig {
+                profile: None,
+                idr_period: None,
+            }),
+            640,
+            480,
+            1280,
+            720,
+        );
+
+        let encoder = Encoder::new(
+            config,
+            FnEncodeHandler::new(move |frame| {
+                let _ = tx.send(frame);
+            }),
+        )
+        .expect("failed to create h264 encoder");
+
+        // 複数フレームをエンコード（in-flight フレーム有りの reconfigure をテスト）
+        let frame_640x480 = create_black_frame(640, 480);
+        for i in 0..3u32 {
+            encoder
+                .encode(
+                    &frame_640x480,
+                    &EncodeOptions {
+                        force_intra: false,
+                        force_idr: i == 0,
+                        output_spspps: i == 0,
+                    },
+                    i,
+                )
+                .expect("failed to encode frame");
+        }
+
+        // エンコード中に reconfigure を発行（パイプライン競合を検証）
+        encoder
+            .reconfigure(ReconfigureParams {
+                width: Some(1280),
+                height: Some(720),
+                ..Default::default()
+            })
+            .expect("failed to reconfigure during encoding");
+
+        // 新解像度でエンコード継続
+        let frame_1280x720 = create_black_frame(1280, 720);
+        for i in 3..5u32 {
+            encoder
+                .encode(
+                    &frame_1280x720,
+                    &EncodeOptions {
+                        force_intra: false,
+                        force_idr: true,
+                        output_spspps: true,
+                    },
+                    i,
+                )
+                .expect("failed to encode frame");
+        }
+
+        encoder.flush().expect("flush failed");
+        drop(encoder);
+
+        let frames: Vec<_> = rx.try_iter().collect();
+        assert_eq!(
             frames.len(),
-            first_frame.data.len()
+            5,
+            "Expected 5 encoded frames, got {}",
+            frames.len()
+        );
+
+        let user_data_values: Vec<u32> = frames
+            .iter()
+            .map(|f| f.as_ref().expect("Frame should be Ok").user_data)
+            .collect();
+
+        // 全 5 フレームの user_data が受信されていることを確認
+        for expected in 0..5u32 {
+            assert!(
+                user_data_values.contains(&expected),
+                "Missing frame with user_data={}",
+                expected
+            );
+        }
+    }
+
+    #[test]
+    fn test_encode_after_worker_terminated() {
+        use std::mem::ManuallyDrop;
+
+        let (tx, _rx) = mpsc::sync_channel::<Result<EncodedFrame<()>, Error>>(4);
+        let config = test_encoder_config(CodecConfig::H264(H264EncoderConfig {
+            profile: None,
+            idr_period: None,
+        }));
+
+        let mut encoder = ManuallyDrop::new(
+            Encoder::new(
+                config,
+                FnEncodeHandler::new(move |frame| {
+                    let _ = tx.send(frame);
+                }),
+            )
+            .unwrap(),
+        );
+
+        unsafe { ManuallyDrop::drop(&mut encoder) };
+
+        let result = encoder.encode(
+            &[],
+            &EncodeOptions {
+                force_intra: false,
+                force_idr: false,
+                output_spspps: false,
+            },
+            (),
+        );
+        assert_eq!(
+            result.unwrap_err().to_string(),
+            "encode() failed: encoder worker thread has terminated"
+        );
+
+        unsafe {
+            ManuallyDrop::drop(&mut encoder);
+        }
+    }
+
+    #[test]
+    fn test_flush_after_encoder_worker_terminated() {
+        use std::mem::ManuallyDrop;
+
+        let (tx, _rx) = mpsc::sync_channel::<Result<EncodedFrame<()>, Error>>(4);
+        let config = test_encoder_config(CodecConfig::H264(H264EncoderConfig {
+            profile: None,
+            idr_period: None,
+        }));
+
+        let mut encoder = ManuallyDrop::new(
+            Encoder::new(
+                config,
+                FnEncodeHandler::new(move |frame| {
+                    let _ = tx.send(frame);
+                }),
+            )
+            .unwrap(),
+        );
+
+        unsafe { ManuallyDrop::drop(&mut encoder) };
+
+        let result = encoder.flush();
+        assert_eq!(
+            result.unwrap_err().to_string(),
+            "flush() failed: send failed"
+        );
+
+        unsafe {
+            ManuallyDrop::drop(&mut encoder);
+        }
+    }
+
+    #[test]
+    fn test_reconfigure_after_encoder_worker_terminated() {
+        use std::mem::ManuallyDrop;
+
+        let (tx, _rx) = mpsc::sync_channel::<Result<EncodedFrame<()>, Error>>(4);
+        let config = test_encoder_config(CodecConfig::H264(H264EncoderConfig {
+            profile: None,
+            idr_period: None,
+        }));
+
+        let mut encoder = ManuallyDrop::new(
+            Encoder::new(
+                config,
+                FnEncodeHandler::new(move |frame| {
+                    let _ = tx.send(frame);
+                }),
+            )
+            .unwrap(),
+        );
+
+        unsafe { ManuallyDrop::drop(&mut encoder) };
+
+        let result = encoder.reconfigure(ReconfigureParams::default());
+        assert_eq!(
+            result.unwrap_err().to_string(),
+            "reconfigure() failed: send failed"
+        );
+
+        unsafe {
+            ManuallyDrop::drop(&mut encoder);
+        }
+    }
+
+    /// drain スレッドによってコールバックハンドラが遅延なく発火することを確認する
+    ///
+    /// worker スレッドはフレーム送信後に drain スレッドへ
+    /// drain リクエストを送信し、drain スレッドが nvEncLockBitstream を
+    /// ブロッキング実行する。encode() 呼び出し後に drain スレッドが
+    /// 処理を完了できるだけの時間があれば、コールバックハンドラは次の encode() を
+    /// 待たずに発火する。
+    ///
+    /// 本テストでは frame_interval_p = 0（n_encoder_buffer = 3）とし、
+    /// 30fps 相当のフレーム間隔（33ms）で encode() を 4 回呼び出す。
+    /// 各 encode() の前に encode_count をインクリメントし、
+    /// 最初に発火したコールバックハンドラの時点での encode_count を
+    /// first_cb_after に記録する。
+    ///
+    /// 期待値: first_cb_after < 3
+    ///   最初のコールバックハンドラが 3 回目の encode() を待たずに発火することを確認する。
+    ///   33ms の sleep で drain スレッドに十分な処理時間を与えているため、
+    ///   フレーム送信後すぐにコールバックハンドラが呼ばれれば 1 や 2 になる。
+    #[test]
+    fn test_drain_thread_callback_immediate() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::time::Duration;
+
+        let mut config = test_encoder_config(CodecConfig::H264(H264EncoderConfig {
+            profile: None,
+            idr_period: None,
+        }));
+        config.frame_interval_p = 0;
+
+        let width = config.width;
+        let height = config.height;
+        let n_encoder_buffer = config.frame_interval_p as usize + 3;
+
+        // encode_count: encode() が呼ばれるたびにメインスレッドでインクリメント
+        // first_cb_after: 最初のコールバックハンドラ発火時点の encode_count を記録。
+        //   compare_exchange により最初のコールバックハンドラだけが書き込む。
+        let encode_count = Arc::new(AtomicUsize::new(0));
+        let first_cb_after = Arc::new(AtomicUsize::new(0));
+        let (cb_tx, _cb_rx) =
+            mpsc::sync_channel::<Result<EncodedFrame<u32>, Error>>(n_encoder_buffer.max(8));
+
+        let ec = encode_count.clone();
+        let fca = first_cb_after.clone();
+        let encoder = Encoder::new(
+            config,
+            FnEncodeHandler::new(move |frame| {
+                let count = ec.load(Ordering::SeqCst);
+                fca.compare_exchange(0, count, Ordering::SeqCst, Ordering::SeqCst)
+                    .ok();
+                let _ = cb_tx.send(frame);
+            }),
+        )
+        .expect("failed to create h264 encoder");
+
+        let frame_data = create_black_frame(width, height);
+        let opts = EncodeOptions {
+            force_intra: false,
+            force_idr: false,
+            output_spspps: false,
+        };
+
+        // 30fps 相当のフレーム間隔で送信。
+        // sleep により drain スレッドが encode() の間に
+        // nvEncLockBitstream を完了するための十分な時間を与える。
+        let frame_interval = Duration::from_millis(33);
+
+        for i in 0..4u32 {
+            encode_count.fetch_add(1, Ordering::SeqCst);
+            encoder.encode(&frame_data, &opts, i).unwrap();
+            std::thread::sleep(frame_interval);
+        }
+
+        // flush により未 drain の全フレームを drain し、
+        // すべてのコールバックハンドラが発火したことを保証する
+        encoder.flush().unwrap();
+        drop(encoder);
+
+        // 最初のコールバックハンドラ発火時点の encode_count が 3 未満であることを確認。
+        // drain スレッドが encode() の間に drain を完了できれば、
+        // コールバックハンドラは次の encode() を待たずに発火する。
+        let got = first_cb_after.load(Ordering::SeqCst);
+        assert!(
+            got < 3,
+            "expected first callback before 3 encodes, got {}",
+            got
+        );
+    }
+
+    #[test]
+    fn test_get_sequence_params_after_encoder_worker_terminated() {
+        use std::mem::ManuallyDrop;
+
+        let (tx, _rx) = mpsc::sync_channel::<Result<EncodedFrame<()>, Error>>(4);
+        let config = test_encoder_config(CodecConfig::H264(H264EncoderConfig {
+            profile: None,
+            idr_period: None,
+        }));
+
+        let mut encoder = ManuallyDrop::new(
+            Encoder::new(
+                config,
+                FnEncodeHandler::new(move |frame| {
+                    let _ = tx.send(frame);
+                }),
+            )
+            .unwrap(),
+        );
+
+        unsafe { ManuallyDrop::drop(&mut encoder) };
+
+        let result = encoder.get_sequence_params();
+        assert_eq!(
+            result.unwrap_err().to_string(),
+            "get_sequence_params() failed: send failed"
+        );
+
+        unsafe {
+            ManuallyDrop::drop(&mut encoder);
+        }
+    }
+
+    #[test]
+    fn test_query_encoder_caps_h264() {
+        let caps = query_encoder_caps(EncoderCodec::H264, 0)
+            .expect("query_encoder_caps for H264 should succeed");
+        assert!(
+            caps.width_max > 0,
+            "width_max should be positive: {}",
+            caps.width_max
+        );
+        assert!(
+            caps.height_max > 0,
+            "height_max should be positive: {}",
+            caps.height_max
         );
     }
 }

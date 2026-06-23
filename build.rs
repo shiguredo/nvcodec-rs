@@ -10,6 +10,7 @@ fn main() {
     println!("cargo::rerun-if-changed=third_party/nvcodec/include/");
     println!("cargo::rerun-if-changed=third_party/cuda/include/");
     println!("cargo::rerun-if-env-changed=CUDA_INCLUDE_PATH");
+    println!("cargo::rerun-if-env-changed=DOCS_RS");
 
     // 各種変数やビルドディレクトリのセットアップ
     let out_dir = PathBuf::from(std::env::var_os("OUT_DIR").expect("infallible"));
@@ -658,6 +659,7 @@ pub const cudaVideoDeinterlaceMode_enum_cudaVideoDeinterlaceMode_Weave: u32 = 0;
 pub const cudaVideoDeinterlaceMode_enum_cudaVideoDeinterlaceMode_Adaptive: u32 = 2;
 pub const cudaVideoCreateFlags_enum_cudaVideoCreate_PreferCUVID: u32 = 2;
 pub const CUvideopacketflags_CUVID_PKT_ENDOFSTREAM: u32 = 1;
+pub const CUvideopacketflags_CUVID_PKT_ENDOFPICTURE: u32 = 8;
 
 // --- NVENC 構造体 ---
 #[repr(C)]
@@ -810,8 +812,8 @@ type PNVENCUNMAPINPUTRESOURCE = Option<unsafe extern "C" fn(*mut std::ffi::c_voi
 type PNVENCCREATEBISTREAMB = Option<unsafe extern "C" fn(*mut std::ffi::c_void, *mut NV_ENC_CREATE_BITSTREAM_BUFFER) -> u32>;
 type PNVENCDESTROYBISTREAMB = Option<unsafe extern "C" fn(*mut std::ffi::c_void, NV_ENC_OUTPUT_PTR) -> u32>;
 type PNVENCENCODEPICTURE = Option<unsafe extern "C" fn(*mut std::ffi::c_void, *mut NV_ENC_PIC_PARAMS) -> u32>;
-type PNVENCLOCKBITSTREAM = Option<unsafe extern "C" fn(*mut std::ffi::c_void, *mut NV_ENC_LOCK_BITSTREAM) -> u32>;
-type PNVENCUNLOCKBITSTREAM = Option<unsafe extern "C" fn(*mut std::ffi::c_void, NV_ENC_OUTPUT_PTR) -> u32>;
+pub type PNVENCLOCKBITSTREAM = Option<unsafe extern "C" fn(*mut std::ffi::c_void, *mut NV_ENC_LOCK_BITSTREAM) -> u32>;
+pub type PNVENCUNLOCKBITSTREAM = Option<unsafe extern "C" fn(*mut std::ffi::c_void, NV_ENC_OUTPUT_PTR) -> u32>;
 type PNVENCGETSEQUENCEPARAMS = Option<unsafe extern "C" fn(*mut std::ffi::c_void, *mut NV_ENC_SEQUENCE_PARAM_PAYLOAD) -> u32>;
 
 #[repr(C)]
