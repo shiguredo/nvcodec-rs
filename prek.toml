@@ -36,8 +36,10 @@ hooks = [
   },
   {
     id = "cargo-test",
-    name = "cargo test (Windows/Linux only)",
-    entry = "sh -c 'case \"$(uname -s)\" in Darwin) echo \"Skipped on macOS\"; exit 0;; *) cargo test --workspace -- --test-threads=1;; esac'",
+    name = "cargo test (Linux x86_64 only)",
+    # devcontainer は arm64 ホストから x86_64-unknown-linux-gnu にクロスビルドするため
+    # 生成バイナリをホストで実行できない。Linux x86_64 ホストでのみテストを実行する。
+    entry = "sh -c 'case \"$(uname -sm)\" in Darwin*) echo \"Skipped on macOS\"; exit 0;; \"Linux x86_64\") cargo test --workspace -- --test-threads=1;; *) echo \"Skipped on $(uname -sm)\"; exit 0;; esac'",
     language = "system",
     types = ["rust"],
     pass_filenames = false,
