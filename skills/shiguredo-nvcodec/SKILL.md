@@ -22,7 +22,7 @@ description: 時雨堂の NVIDIA Video Codec SDK バインディング shiguredo
 - crate 名: `shiguredo_nvcodec`
 - バージョン: 2026.2.0
 - Rust Edition: 2024
-- 最小 Rust バージョン: 1.88
+- 最小 Rust バージョン: 1.93
 - ライセンス: Apache-2.0
 - NVIDIA Video Codec SDK バージョン: 13.0.19
 
