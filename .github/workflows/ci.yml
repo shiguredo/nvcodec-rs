@@ -11,17 +11,22 @@ on:
 
 env:
   RUST_BACKTRACE: 1
-  CUDA_VERSION: "13.1.1"
 
 jobs:
   # CUDA ヘッダを使ったビルド確認 (GPU 不要)
+  # Ubuntu 26.04 の NVIDIA 公式リポジトリは CUDA 13 系のみのため、OS ごとに cuda_version を分ける
   ci-cuda:
     name: CI (CUDA)
     strategy:
       matrix:
-        os:
-          - ubuntu-24.04
-          - ubuntu-22.04
+        include:
+          # NVIDIA 公式 ubuntu2604 は 13.3.x のみ
+          - os: ubuntu-26.04
+            cuda_version: "13.3.1"
+          - os: ubuntu-24.04
+            cuda_version: "13.1.1"
+          - os: ubuntu-22.04
+            cuda_version: "13.1.1"
     runs-on: ${{ matrix.os }}
     timeout-minutes: 20
     steps:
@@ -29,7 +34,7 @@ jobs:
       - run: rustup update stable
       - uses: shiguredo/github-actions/.github/actions/setup-cuda-toolkit@main
         with:
-          cuda_version: ${{ env.CUDA_VERSION }}
+          cuda_version: ${{ matrix.cuda_version }}
           platform: ${{ matrix.os }}
       - uses: shiguredo/github-actions/.github/actions/rust-cache@main
         with:

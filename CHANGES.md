@@ -14,6 +14,11 @@
 - [CHANGE] MSRV (rust-version) を 1.93 に上げる
   - @voluntas
 
+### misc
+
+- [ADD] CI の CUDA ビルド確認に Ubuntu 26.04（CUDA 13.3.1）を追加する
+  - @voluntas
+
 ## 2026.2.0
 
 **リリース日**: 2026-06-23
