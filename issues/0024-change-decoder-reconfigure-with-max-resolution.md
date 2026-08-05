@@ -1,46 +1,121 @@
-# 0024-add-decoder-reconfigure-with-max-resolution
+# 0024-change-decoder-reconfigure-with-max-resolution
 
-Created: 2026-08-05
+- Created: 2026-08-05
+- Branch: feature/change-decoder-reconfigure-with-max-resolution
 
-## 背景
+## 目的
 
-issue 0006 で `handle_video_sequence_inner` にストリーム中の解像度変更対応が実装された。実装は「方法 1: デコーダーの再作成」で、`pfnSequenceCallback` で解像度変更を検出した際に既存のデコーダーを `cuvid_destroy_decoder` で破棄してから `cuvid_create_decoder` で新規作成する。
+Sora の WebRTC シミュキャスト録画のように 1 つの MP4 内でシーケンスヘッダ (SPS/PPS/VPS 等) が変わるたびに符号化解像度が変わるストリームで、シーケンス変更ごとに `cuvidCreateDecoder` を呼び直すコストを削減する。
 
-0006 の設計方針にはもう一つ「方法 2: cuvidReconfigureDecoder を使用」が挙げられていたが、`ulMaxWidth` / `ulMaxHeight` を事前に知る必要があるという理由で見送られた。
+現行の destroy+create 方式ではシーケンス変更ごとに NVDEC デコーダーの作成コストが乗り、デコード全体の処理時間が伸びる。NVDEC SDK が想定している `cuvidReconfigureDecoder` による in-place 再構成に切り替えて回避する。
 
-## 問題
+## 現状
 
-現在の破棄→再作成方式は正しく動作するものの、以下の課題がある。
+`handle_video_sequence_inner` (`src/decode.rs`) は `pfnSequenceCallback` で解像度変更を検出すると `cuvidDestroyDecoder` で既存デコーダーを破棄してから `cuvidCreateDecoder` で新規作成する (issue 0006 で「方法 1: デコーダーの再作成」として採用)。
 
-1. **キーフレーム毎の再作成コスト**
-   - WebRTC のシミュキャスト / 適応ビットレート録画のように、per-frame に近い頻度で符号化解像度が変わるストリームでは、キーフレーム到来のたびに `cuvidCreateDecoder` が呼ばれる
-   - GPU デコーダーの生成コストはフレーム毎の処理として看過できないオーバーヘッドが乗る想定
-2. **create 失敗時の復旧不能**（issue 0017 pending で言及済み）
-   - destroy-then-create の順序のため、新規 create が失敗すると既存デコーダーは既に破棄済みで復旧不能になる
-   - `cuvidReconfigureDecoder` は既存デコーダーを in-place で再構成するため、失敗しても既存デコーダーは温存される
+このため `CUVIDDECODECREATEINFO.ulMaxWidth` / `ulMaxHeight` は毎回そのシーケンスの `format.coded_width` / `coded_height` に上書きされ、`cuvidReconfigureDecoder` 用途としては機能していない。
 
-なお `CUVIDDECODECREATEINFO.ulMaxWidth` / `ulMaxHeight` は現在も `format.coded_width` / `coded_height`（初回フレームのサイズ）に固定されているため、方法 2 に切り替えるにはここも見直す必要がある。破棄→再作成方式ではフレーム毎に上限が更新されるため実害は出ていない。
+issue 0006 では「方法 2: `cuvidReconfigureDecoder` を使用」も検討されたが、`ulMaxWidth` / `ulMaxHeight` を事前に知ることが難しいという理由で見送られた。
 
-## 提案
+## 設計方針
 
-呼び出し側から最大解像度が渡された場合に限り、`cuvidReconfigureDecoder` による in-place 再構成に切り替える。渡されなかった場合は現状どおり破棄→再作成にフォールバックする（後方互換を保つ）。
+呼び出し側が最大解像度を知っている場合に限り、`cuvidReconfigureDecoder` による in-place 再構成に切り替える。知らない場合は現状どおりの destroy+create にフォールバックする。
 
-### 変更内容
+### API 追加とカテゴリ
 
-- `DecoderConfig` に `max_coded_width: Option<u32>` / `max_coded_height: Option<u32>` を追加する
-  - `None` の場合は現状の破棄→再作成方式で動作する
-  - `Some` の場合は `CUVIDDECODECREATEINFO.ulMaxWidth` / `ulMaxHeight` にその値を設定して初回作成し、2 回目以降の `pfnSequenceCallback` では `cuvidReconfigureDecoder` を呼ぶ
-- `handle_video_sequence_inner` を初回作成パスと再構成パスに分岐する
-- `cuvidReconfigureDecoder` に対応する Rust ラッパー (`cuvid_reconfigure_decoder`) を `CudaLibrary` に追加する
-- 再構成時にサイズが `ulMaxWidth` / `ulMaxHeight` を超えたらエラーを返す
+`DecoderConfig` に以下の pub フィールドを追加する。
+
+- `max_coded_width: Option<u32>`
+- `max_coded_height: Option<u32>`
+
+`DecoderConfig` は `#[derive(Debug, Clone)]` の pub struct で `Default` 実装を持たない (2026.1.0 で明示的に削除済み) ため、pub フィールドの追加は既存 struct literal 初期化コードを壊す **破壊的変更 (`[CHANGE]`)** に該当する。issue のタイトル prefix・Branch prefix・CHANGES.md エントリの分類はいずれも `change` に統一する。
+
+### encoder 側 (`max_encode_width` / `max_encode_height`) との命名と意味論の違い
+
+命名は SDK 側フィールドに寄せて非対称にする (encoder = `maxEncodeWidth`、decoder = `coded_width`)。意味論も次のように異なる。
+
+- encoder: `None` 時は `width` と同じ値で `maxEncodeWidth` を確定させる (常に `reconfigure()` 可能)
+- decoder: `None` 時は現状の destroy+create にフォールバック (reconfigure 経路を使わない)
+
+encoder は明示的に `reconfigure()` を呼び出す API、decoder は `pfnSequenceCallback` で自動追従する API という設計差から来る意図的な非対称であり、命名と意味論のどちらも揃えない。
+
+### `cuvidReconfigureDecoder` の適用条件
+
+`cuvidReconfigureDecoder` は SDK コメント上「for same codec」に限定される (`third_party/nvcodec/include/cuviddec.h` の `cuvidReconfigureDecoder` doc)。したがって以下の条件のいずれかを満たす場合は reconfigure ではなく destroy+create にフォールバックする。
+
+- `state.decoder` が `null` (初回コールバック。この場合は「フォールバック」ではなく「初回作成」)
+- `max_coded_width` / `max_coded_height` のいずれかが `None`
+- 直前 create/reconfigure 時に保存したコーデック情報 (reconfigure 適用可否判定用のベースライン) から `codec` / `chroma_format` / `bit_depth_luma_minus8` / `bit_depth_chroma_minus8` / `progressive_sequence` のいずれかが変化した
+
+判定用ベースラインは `DecoderState` に新規フィールドとして保存する。**Step 5 (下記) で codec / chroma / bit_depth / progressive の変化により destroy+create でデコーダーを作り直したときは、保存値も新しい `CUVIDEOFORMAT` の値で更新する** (更新しないと以降のコールバックで永久に destroy+create が続き reconfigure 経路に戻れなくなる)。Step 4 (`max_coded_*` = `None`) の destroy+create フォールバック経路では保存値は使われないため更新不要。
+
+### `handle_video_sequence_inner` の分岐
+
+`pfnSequenceCallback` (`handle_video_sequence_inner`) は以下の順で処理する。max 超過事前検証 (Step 2) は SDK 呼び出し (Step 3〜6) より前に置く。
+
+1. `format.display_area` の負値・境界を検証する (現行の「create → validate」順を「validate → create/reconfigure」順に修正。issue 0017 の「問題 2: `display_area` 検証位置」を destroy+create 経路も含めて解消する)
+2. **max 超過事前検証**: `max_coded_width` / `max_coded_height` が両方 `Some` かつ `format.coded_width > max_coded_width` または `format.coded_height > max_coded_height`: エラーを返す (SDK 呼び出し前。初回コールバックか 2 回目以降かによらず検証する)
+3. `state.decoder` が `null` (初回作成): `CUVIDDECODECREATEINFO.ulMaxWidth` / `ulMaxHeight` に `max_coded_width` / `max_coded_height` を渡して `cuvidCreateDecoder`。`None` の場合は現状どおり `format.coded_width` / `coded_height` を渡す。判定用ベースラインを `DecoderState` に保存する
+4. `state.decoder` が非 `null` かつ `max_coded_width` / `max_coded_height` のいずれかが `None`: **destroy+create フォールバック** (現状動作維持。`ulMaxWidth` / `ulMaxHeight` は `format.coded_width` / `coded_height`。この経路では判定用ベースラインは使わないので保存値更新も不要)
+5. `state.decoder` が非 `null` かつ `max_coded_*` が両方 `Some` かつ判定用ベースラインから `codec` / `chroma_format` / `bit_depth_luma_minus8` / `bit_depth_chroma_minus8` / `progressive_sequence` のいずれかが変化: **destroy+create フォールバック** (`ulMaxWidth` / `ulMaxHeight` には引き続き `max_coded_width` / `max_coded_height` を渡し、新しいコーデック情報で判定用ベースラインを更新して次回以降 reconfigure 経路に戻れるようにする)
+6. それ以外: **`cuvidReconfigureDecoder`** で in-place 再構成
+
+reconfigure / destroy+create のいずれのパスでも、成功後は現行 create パスと同じロジックで `state.width` / `state.height` / `state.surface_width` / `state.surface_height` を更新し、戻り値も同じく `Ok(format.min_num_decode_surfaces as i32)` を返す。
+
+### `CUVIDRECONFIGUREDECODERINFO` の設定値
+
+`cuvidReconfigureDecoder` に渡す `CUVIDRECONFIGUREDECODERINFO` は現行 `CUVIDDECODECREATEINFO` の初期化方針に揃える。
+
+- `ulWidth` / `ulHeight` = `format.coded_width` / `coded_height`
+- `ulTargetWidth` / `ulTargetHeight` = `format.coded_width` / `coded_height` (現行 create パスと同じ)
+- `ulNumDecodeSurfaces` = `format.min_num_decode_surfaces` (現行 create パスと同じ。初回作成時より値が増えるケースの挙動は SDK doc で明言されていないが、現行 destroy+create でもシーケンス変更コールバック毎に値を渡し直しており、reconfigure でも同じ扱いで問題ない前提)
+- `display_area` / `target_rect` = ゼロ埋め (現行 create パスと同じ。`std::mem::zeroed()` で構造体全体を 0 初期化するのに任せる)
+
+Step 1 で `format.display_area` を検証するのは、`state.width` / `state.height` の計算に使う `right - left` などが破綻しないことを保証するのが目的で、SDK に渡す `display_area` フィールドは Create / Reconfigure ともに現行と一致させる (ゼロ埋め)。
+
+`format.coded_width` / `coded_height` は `u32` だが `CUVIDRECONFIGUREDECODERINFO.ulWidth` / `ulHeight` は `unsigned int` (bindgen 生成後は `c_uint`) なので通常のキャストで問題ない。
+
+### 失敗時の状態遷移
+
+- `display_area` 検証失敗 (Step 1): SDK 呼び出しなしのため `state.decoder` は前デコーダー (あるいは初回コールバックなら null) のまま残る。エラーを利用者に通知する。**現行実装は「create → validate」順で失敗時に古いデコーダーが破棄済み状態で Err を返していた (issue 0017 問題 2)**。本 issue の Step 1 変更でこの半壊状態を回避する
+- max 超過事前検証エラー (Step 2): SDK 呼び出しなしのため `state.decoder` は前デコーダー (あるいは初回コールバックなら null) のまま残る。以降のフレームは古い解像度で処理される (あるいは null なのでデコード不能)。次回コールバックで再度チェックが走る
+- `cuvidCreateDecoder` 失敗 (Step 3/4/5 経路): `state.decoder` は null になる。復旧不能問題 (issue 0017 の「問題 1: 順序」) はこの経路に残る
+- `cuvidReconfigureDecoder` 失敗 (Step 6 経路): NVDEC SDK は失敗後のデコーダー状態を明示していない。安全側に倒し、`state.decoder` は変更せずエラーを利用者に通知する。以降のフレームは古い解像度で処理を続けるので実質的に無効になるが、次の解像度変化のコールバックで再度復旧を試みる余地は残る (`state.decoder` を null にせずに済む点だけがメリット)
+- どの経路でも、`handle_video_sequence_inner` が `Err` を返せば現行の `handle_video_sequence` が `frame_tx.send(Err(...))` で利用者に通知する挙動を維持する
+
+### `CudaLibrary` への追加
+
+`src/lib.rs` の `CudaLibrary::load` は全 nvcuvid 関数を `nvcuvid_lib.get(...)` で存在チェックしている。同じパターンで以下 2 点を追加する。
+
+- `CudaLibrary::load` 内 `cuvidDestroyDecoder` の存在チェック近傍に `cuvidReconfigureDecoder` の存在チェックを追加
+- `CudaLibrary::cuvid_reconfigure_decoder(&self, decoder, params) -> Result<(), Error>` メソッドを `cuvid_create_decoder` / `cuvid_destroy_decoder` の隣に追加。型は bindgen 生成の `sys::CUVIDRECONFIGUREDECODERINFO` を使う
+
+## 完了条件
+
+- `DecoderConfig` に `max_coded_width: Option<u32>` / `max_coded_height: Option<u32>` が追加され、既存の struct literal 初期化コード (`test_decoder_config`、`README.md`、`skills/shiguredo-nvcodec/SKILL.md` のコード例) がすべて明示的に更新されている
+- `Some(v)` を渡し、解像度のみが変化するストリームで、`pfnSequenceCallback` の 2 回目以降で `cuvidReconfigureDecoder` が呼ばれ `cuvidCreateDecoder` は呼ばれない挙動が確認できる
+- `Some(v)` を渡し、codec / chroma / bit depth / progressive のいずれかが変化した場合に destroy+create パスにフォールバックし、以降 reconfigure 経路に戻れる挙動が確認できる
+- `Some(v)` を渡し、`coded_width` / `coded_height` が `v` を超えたときに `handle_video_sequence` がエラーを利用者に通知することが確認できる (初回コールバック / 2 回目以降のいずれのケースでも)
+- `None` を渡した場合、2026.2.0 と同じ動作 (シーケンス変更ごとに destroy+create) を維持する
+- `display_area` 検証位置を先頭に移した結果、destroy+create 経路でも invalid `display_area` で失敗した場合に古いデコーダーが破棄されないことが確認できる
+- `CHANGES.md` に `[CHANGE]` エントリが追加されている
+- `README.md` と `skills/shiguredo-nvcodec/SKILL.md` の「動的解像度変更」節 (デコーダー / まとめ表) および `DecoderConfig` 表・コード例が新 API を反映している
+
+## 解決方法
 
 ### 変更対象ファイル
 
-- `src/decode.rs`: `handle_video_sequence_inner` の分岐、`DecoderConfig` 拡張
-- `src/lib.rs`: `cuvid_reconfigure_decoder` ラッパーとローダー登録の追加
-- `CHANGES.md`: 変更履歴を追加
+- `src/decode.rs` — `DecoderConfig` フィールド追加、`DecoderState` に判定用ベースライン (コーデック情報) 保存フィールド追加、`handle_video_sequence_inner` の分岐再構成 (`display_area` 検証・max 超過事前検証を先頭に移動、reconfigure / destroy+create の 6 ステップ分岐)、既存の struct literal 初期化コード (`test_decoder_config` 等) の更新
+- `src/lib.rs` — `CudaLibrary::load` に `cuvidReconfigureDecoder` の存在チェック追加、`cuvid_reconfigure_decoder` ラッパー追加
+- `README.md` — 「デコード」コード例の `DecoderConfig` struct literal に `max_coded_width` / `max_coded_height` を追記 (`None` を渡し従来動作を示す)
+- `skills/shiguredo-nvcodec/SKILL.md` — 「動的解像度変更」節 (デコーダー / まとめ表) と `DecoderConfig` 表に `max_coded_width` / `max_coded_height` を追記。デコーダーのコード例の `DecoderConfig` struct literal にも同フィールドを追記
+- `CHANGES.md` — 追記例:
+  - `- [CHANGE] DecoderConfig に max_coded_width / max_coded_height を追加してデコーダーの動的解像度変更を cuvidReconfigureDecoder で行えるようにする`
+  - `  - @担当者`
 
 ## 関連 issue
 
-- 0006（closed）方法 1 で実装されたデコーダーの動的解像度変更
-- 0017（pending）破棄→再作成の順序による復旧不能問題
+- 0006 (closed)
+- 0017 (pending): destroy-then-create 順序による復旧不能問題。本 issue マージ後の扱い:
+  - 「問題 2: `display_area` 検証位置」は本 issue の Step 1 で destroy+create 経路も含めて解消される
+  - 「問題 1: 順序」は依然として `max_coded_*` = `None` のフォールバック経路に残るため、0017 は pending を維持する
