@@ -107,6 +107,30 @@ struct DecoderState {
     // cuvidReconfigureDecoder の適用可否判定用のベースライン
     // 直近の create / reconfigure 時のコーデック情報を保存する
     reconfigure_baseline: ReconfigureBaseline,
+    // cuvidCreateDecoder 呼び出し時に確定した出力ジオメトリを保存する
+    //
+    // 以降の cuvidReconfigureDecoder では ulTargetWidth / ulTargetHeight と
+    // display_area を「作成時に確定した値」に固定して渡す必要がある
+    // (縮小方向の解像度変更で ulTargetWidth / ulTargetHeight を新しい coded サイズに
+    //  下げると、既に allocate 済みの出力サーフェスとの不整合により
+    //  cuvidDecodePicture が CUDA_ERROR_INVALID_VALUE を返すため)
+    create_geometry: DecoderCreateGeometry,
+}
+
+/// cuvidCreateDecoder 呼び出し時に確定した出力ジオメトリ
+///
+/// NVIDIA 公式サンプル (NvDecoder::ReconfigureDecoder) の挙動に合わせるため、
+/// 以降の cuvidReconfigureDecoder では target / display_area をここに保存した
+/// 「作成時の値」に固定して渡す
+struct DecoderCreateGeometry {
+    target_width: u32,
+    target_height: u32,
+    // display_area は CUVIDDECODECREATEINFO / CUVIDRECONFIGUREDECODERINFO とも
+    // c_short (i16) で表現されるため i16 で保持する
+    display_left: i16,
+    display_top: i16,
+    display_right: i16,
+    display_bottom: i16,
 }
 
 /// cuvidReconfigureDecoder の適用可否判定用のベースライン
@@ -264,6 +288,16 @@ impl DecoderState {
                 // 判定用ベースラインは初回のシーケンスコールバックで上書きされるため
                 // ここでの初期値は意味を持たない
                 reconfigure_baseline: ReconfigureBaseline::from_format(&std::mem::zeroed()),
+                // 作成時ジオメトリも初回 cuvidCreateDecoder 呼び出しで上書きされるため
+                // ここでの初期値は意味を持たない
+                create_geometry: DecoderCreateGeometry {
+                    target_width: 0,
+                    target_height: 0,
+                    display_left: 0,
+                    display_top: 0,
+                    display_right: 0,
+                    display_bottom: 0,
+                },
             });
 
             // 映像パーサーを作成する
@@ -523,13 +557,24 @@ fn handle_video_sequence_inner(
     } else {
         // それ以外は cuvidReconfigureDecoder で in-place に再構成する
         // パーサーと共有するコンテキストロックを使用する
+        //
+        // ulTargetWidth / ulTargetHeight と display_area は
+        // 作成時に確定した値 (state.create_geometry) をそのまま渡す
+        // (新しい coded サイズをここに渡すと、既に作成時サイズで allocate された
+        //  出力サーフェスとの不整合により cuvidDecodePicture が縮小時に
+        //  CUDA_ERROR_INVALID_VALUE を返す。NVIDIA 公式サンプル
+        //  NvDecoder::ReconfigureDecoder も同様に作成時サイズを維持している)
         state.lib.with_context(state.ctx, || {
             let mut reconfigure_info: sys::CUVIDRECONFIGUREDECODERINFO =
                 unsafe { std::mem::zeroed() };
             reconfigure_info.ulWidth = format.coded_width;
             reconfigure_info.ulHeight = format.coded_height;
-            reconfigure_info.ulTargetWidth = format.coded_width;
-            reconfigure_info.ulTargetHeight = format.coded_height;
+            reconfigure_info.ulTargetWidth = state.create_geometry.target_width;
+            reconfigure_info.ulTargetHeight = state.create_geometry.target_height;
+            reconfigure_info.display_area.left = state.create_geometry.display_left;
+            reconfigure_info.display_area.top = state.create_geometry.display_top;
+            reconfigure_info.display_area.right = state.create_geometry.display_right;
+            reconfigure_info.display_area.bottom = state.create_geometry.display_bottom;
             reconfigure_info.ulNumDecodeSurfaces = format.min_num_decode_surfaces as u32;
             state
                 .lib
@@ -568,6 +613,14 @@ fn create_decoder(state: &mut DecoderState, format: &sys::CUVIDEOFORMAT) -> Resu
     create_info.ulTargetWidth = format.coded_width as u64;
     create_info.ulTargetHeight = format.coded_height as u64;
 
+    // display_area は以降の cuvidReconfigureDecoder でも同じ値を再度渡す必要があるため
+    // ここで明示的に設定する (i32 → i16 のキャストは display_area の検証で
+    // 負値 / 逆転を弾いており、実用上の解像度は i16 の上限を超えないため安全)
+    create_info.display_area.left = format.display_area.left as i16;
+    create_info.display_area.top = format.display_area.top as i16;
+    create_info.display_area.right = format.display_area.right as i16;
+    create_info.display_area.bottom = format.display_area.bottom as i16;
+
     // パーサーと共有するコンテキストロックを使用
     create_info.vidLock = state.ctx_lock;
 
@@ -575,7 +628,20 @@ fn create_decoder(state: &mut DecoderState, format: &sys::CUVIDEOFORMAT) -> Resu
         state
             .lib
             .cuvid_create_decoder(&mut state.decoder, &mut create_info)
-    })
+    })?;
+
+    // 作成時ジオメトリを保存する
+    // 以降の cuvidReconfigureDecoder では target / display_area をこの値に固定して渡す
+    state.create_geometry = DecoderCreateGeometry {
+        target_width: format.coded_width,
+        target_height: format.coded_height,
+        display_left: create_info.display_area.left,
+        display_top: create_info.display_area.top,
+        display_right: create_info.display_area.right,
+        display_bottom: create_info.display_area.bottom,
+    };
+
+    Ok(())
 }
 
 /// 既存デコーダーを破棄してから再作成する
