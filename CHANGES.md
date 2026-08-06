@@ -12,6 +12,9 @@
 ## develop
 
 - [CHANGE] `DecoderConfig` に `max_coded_width` / `max_coded_height` を追加してデコーダーの動的解像度変更を `cuvidReconfigureDecoder` で行えるようにする
+  - 両方 `Some` を指定すると解像度変化を in-place で再構成し、両方 `None` なら従来どおりデコーダーの再作成で対応する (片方だけの指定はエラー)
+  - `DecoderConfig` の struct literal に `max_coded_width: None` / `max_coded_height: None` の追記が必要
+  - デコーダー作成時の `ulNumDecodeSurfaces` をコーデック別の推奨値 (H.264/HEVC: 20, VP9/AV1: 12, VP8: 8, JPEG: 1) に引き上げる (`max_num_decode_surfaces` を上限として clamp)
   - @sile
 - [CHANGE] MSRV (rust-version) を 1.93 に上げる
   - @voluntas

@@ -410,7 +410,9 @@ assert_eq!(frame.width(), 1280);  // 自動的に追従
 | 設定 | 再構成方式 |
 |------|-----------|
 | 両方 `Some(v)` | `cuvidReconfigureDecoder` による in-place 再構成。デコーダー再作成コストがかからない。`v` を超える解像度のストリームが来た場合はエラーを通知する |
-| 両方 `None` | 従来どおり destroy+create。解像度変更のたびにデコーダーを作り直す |
+| 両方 `None` | destroy+create。解像度変更のたびにデコーダーを作り直す |
+
+なお、両方 `Some` でもコーデック情報 (コーデック種別 / クロマフォーマット / ビット深度 / progressive) が変化した場合は in-place 再構成できず、destroy+create にフォールバックする。
 
 ```rust
 // 作成時に最大符号化解像度を指定すると in-place 再構成が有効になる
@@ -425,7 +427,7 @@ let config = DecoderConfig {
 
 `max_coded_width` / `max_coded_height` の指定が必要なのは、NVDEC がデコーダー作成時に内部サーフェスを最大解像度前提で確保し、`cuvidReconfigureDecoder` は作成時に宣言した `ulMaxWidth` / `ulMaxHeight` を超える解像度に変更できないため (SDK の MUST 制約)。ストリームの最大解像度を事前に知っている呼び出し側だけが宣言できる。
 
-宣言値を超えるストリームが来た場合はエラーで通知される (黙って destroy+create にフォールバックしない)。宣言した最大解像度自体を変更したい場合は `Decoder` を作り直して新しい最大解像度を宣言すること (インスタンスの作り直しは従来どおり常に可能)。
+宣言値を超えるストリームが来た場合はエラーで通知される (黙って destroy+create にフォールバックしない)。エラーは `decode()` の戻り値とデコード結果を受け取るハンドラ (コールバック) の両方に通知される (ハンドラには `Result::Err` として非同期に通知され、`decode()` はエラーが発生したパケットで `Err` を返す)。宣言した最大解像度自体を変更したい場合は `Decoder` を作り直して新しい最大解像度を宣言すること (インスタンスの作り直しは常に可能)。
 
 ### まとめ
 
@@ -434,7 +436,7 @@ let config = DecoderConfig {
 | 仕組み | `reconfigure()` で明示的に変更 | パーサーが自動検出して再構成 |
 | 利用者の操作 | `ReconfigureParams` で新解像度を指定 | 不要 |
 | 制約 | `max_encode_width` / `max_encode_height` 以内 | `max_coded_width` / `max_coded_height` 以内 |
-| 超えた場合 | エンコーダーを作り直す | エラーを通知する |
+| 超えた場合 | エラーを通知する | エラーを通知する |
 
 ## スレッドモデル
 

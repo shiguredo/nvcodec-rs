@@ -64,20 +64,25 @@ encoder は明示的に `reconfigure()` を呼び出す API、decoder は `pfnSe
 5. `state.decoder` が非 `null` かつ `max_coded_*` が両方 `Some` かつ判定用ベースラインから `codec` / `chroma_format` / `bit_depth_luma_minus8` / `bit_depth_chroma_minus8` / `progressive_sequence` のいずれかが変化: **destroy+create フォールバック** (`ulMaxWidth` / `ulMaxHeight` には引き続き `max_coded_width` / `max_coded_height` を渡し、新しいコーデック情報で判定用ベースラインを更新して次回以降 reconfigure 経路に戻れるようにする)
 6. それ以外: **`cuvidReconfigureDecoder`** で in-place 再構成
 
-reconfigure / destroy+create のいずれのパスでも、成功後は現行 create パスと同じロジックで `state.width` / `state.height` / `state.surface_width` / `state.surface_height` を更新し、戻り値も同じく `Ok(format.min_num_decode_surfaces as i32)` を返す。
+reconfigure / destroy+create のいずれのパスでも、成功後は現行 create パスと同じロジックで `state.width` / `state.height` / `state.surface_width` / `state.surface_height` を更新し、戻り値も同じく `Ok(effective_num_decode_surfaces(...) as i32)` を返す。
 
 ### `CUVIDRECONFIGUREDECODERINFO` の設定値
 
-`cuvidReconfigureDecoder` に渡す `CUVIDRECONFIGUREDECODERINFO` は現行 `CUVIDDECODECREATEINFO` の初期化方針に揃える。
+`cuvidReconfigureDecoder` に渡す `CUVIDRECONFIGUREDECODERINFO` は以下のとおり。
 
 - `ulWidth` / `ulHeight` = `format.coded_width` / `coded_height`
-- `ulTargetWidth` / `ulTargetHeight` = `format.coded_width` / `coded_height` (現行 create パスと同じ)
-- `ulNumDecodeSurfaces` = `format.min_num_decode_surfaces` (現行 create パスと同じ。初回作成時より値が増えるケースの挙動は SDK doc で明言されていないが、現行 destroy+create でもシーケンス変更コールバック毎に値を渡し直しており、reconfigure でも同じ扱いで問題ない前提)
-- `display_area` / `target_rect` = ゼロ埋め (現行 create パスと同じ。`std::mem::zeroed()` で構造体全体を 0 初期化するのに任せる)
+- `ulTargetWidth` / `ulTargetHeight` = 初回 `cuvidCreateDecoder` 時に確定した出力ジオメトリ (`state.create_geometry`)
+  - 縮小方向の解像度変更で `ulTargetWidth` / `ulTargetHeight` を新しい coded サイズに下げると、既に allocate 済みの出力サーフェスとの不整合により `cuvidDecodePicture` が `CUDA_ERROR_INVALID_VALUE` を返すため、NVIDIA 公式サンプル (NvDecoder::ReconfigureDecoder) と同様に作成時サイズを維持する
+- `ulNumDecodeSurfaces` = `effective_num_decode_surfaces` (`format.min_num_decode_surfaces` とコーデック別推奨値の大きい方を、パーサー作成時に指定した `ulMaxNumDecodeSurfaces` を上限として clamp した値)
+  - parser 報告の min では HEVC / VP9 / AV1 で DPB 不足になり `cuvidReconfigureDecoder` 後の `cuvidDecodePicture` が失敗するため、コーデック別の推奨値を採用する
+- `display_area` = 初回 `cuvidCreateDecoder` 時に確定した値 (`state.create_geometry`)
+- `target_rect` = ゼロ埋め (`std::mem::zeroed()` で構造体全体を 0 初期化するのに任せる)
 
-Step 1 で `format.display_area` を検証するのは、`state.width` / `state.height` の計算に使う `right - left` などが破綻しないことを保証するのが目的で、SDK に渡す `display_area` フィールドは Create / Reconfigure ともに現行と一致させる (ゼロ埋め)。
+Create 側も同様に `CUVIDDECODECREATEINFO.display_area` に `format.display_area` を明示設定する (従来はゼロ埋めのままだった)。これは以降の `cuvidReconfigureDecoder` で同じ値を再度渡す必要があるためで、あわせて Create / Reconfigure の display_area を一致させる。
 
-`format.coded_width` / `coded_height` は `u32` だが `CUVIDRECONFIGUREDECODERINFO.ulWidth` / `ulHeight` は `unsigned int` (bindgen 生成後は `c_uint`) なので通常のキャストで問題ない。
+Step 1 で `format.display_area` を検証するのは、`state.width` / `state.height` の計算に使う `right - left` などが破綻しないことを保証するのが目的。
+
+`format.coded_width` / `coded_height` は `u32` だが `CUVIDRECONFIGUREDECODERINFO.ulWidth` / `ulHeight` は `unsigned int` (bindgen 生成後は `c_uint`) なので通常のキャストで問題ない。`display_area` は i32 → i16 のキャストになるが、`validate_display_area` で負値・逆転・coded 超過を弾いており、実用上の解像度は i16 の上限を超えないため安全。
 
 ### 失敗時の状態遷移
 
@@ -119,35 +124,10 @@ Step 1 で `format.display_area` を検証するのは、`state.width` / `state.
 
 ## 実装で判明した追加事項
 
-上記「`CUVIDRECONFIGUREDECODERINFO` の設定値」節では:
+上記「`CUVIDRECONFIGUREDECODERINFO` の設定値」節の内容は当初設計から更新済み。実装検証で HEVC / VP9 / AV1 の縮小方向 reconfigure 直後の `cuvidDecodePicture` が `CUDA_ERROR_INVALID_VALUE` を返す事例があり、NVIDIA 公式サンプル `NvDecoder::ReconfigureDecoder` / `NvDecoder::GetNumDecodeSurfaces` に合わせる形で以下 2 点を追加した (詳細は「`CUVIDRECONFIGUREDECODERINFO` の設定値」節を参照):
 
-- `ulTargetWidth` / `ulTargetHeight` = `format.coded_width` / `coded_height`
-- `display_area` = ゼロ埋め
-- `ulNumDecodeSurfaces` = `format.min_num_decode_surfaces`
-
-を渡す方針としていたが、実装検証で HEVC / VP9 / AV1 の縮小方向 reconfigure 直後の `cuvidDecodePicture` が `CUDA_ERROR_INVALID_VALUE` を返す事例があり、以下の 2 点で NVIDIA 公式サンプル `NvDecoder::ReconfigureDecoder` に合わせる必要があると判明した。
-
-### 追加事項 1: `ulTargetWidth` / `ulTargetHeight` と `display_area` は「作成時サイズ」に固定する
-
-出力サーフェスは `cuvidCreateDecoder` 時に `ulMaxWidth` × `ulMaxHeight` で allocate 済み。縮小方向で reconfigure の `ulTargetWidth` / `ulTargetHeight` に新 coded サイズを下げて渡すと、この出力側と不整合になり後続の `cuvidDecodePicture` が失敗しうる。NVIDIA サンプルは `m_nSurfaceWidth` / `m_nSurfaceHeight` (作成時サイズ) と `m_displayRect` を保持して reconfigure に渡す。
-
-対応:
-
-- `DecoderState` に `create_geometry: DecoderCreateGeometry` フィールドを追加し、`cuvidCreateDecoder` 成功時に `target_width` / `target_height` (= 初回 `format.coded_width` / `coded_height`) と `display_area` (`left` / `top` / `right` / `bottom`) を保存する
-- `cuvidReconfigureDecoder` 呼び出し時は `ulTargetWidth` / `ulTargetHeight` と `display_area` にこの保存値を渡す
-- 合わせて `cuvidCreateDecoder` 呼び出し時にも `display_area` を `format.display_area` から明示的に設定する (ゼロ埋めから変更)
-
-### 追加事項 2: `ulNumDecodeSurfaces` は codec 別推奨値を使う
-
-`format.min_num_decode_surfaces` (parser 報告の最小値: HEVC=8, VP9=9, AV1=9) では DPB が不足しうる。NVIDIA サンプル `NvDecoder::GetNumDecodeSurfaces` は codec 別推奨値を返す (VP9=12, HEVC=20, H.264=20, AV1=12 (仕様上の 8 参照 + 現在フレーム + 余裕), VP8=8, JPEG=1)。
-
-`ulNumDecodeSurfaces` は reconfigure で後から増やせないため、`cuvidCreateDecoder` の段階から推奨値を渡す必要がある。また `pfnSequenceCallback` の戻り値もこの値に揃える (parser がこの値で `curr_pic_idx` を割り当てるため)。
-
-対応:
-
-- `get_codec_num_decode_surfaces(codec)` と `effective_num_decode_surfaces(format, max_allowed)` helper を追加する。`effective_num_decode_surfaces` は `max(min_num_decode_surfaces, codec_recommended)` を返し、パーサ作成時の `ulMaxNumDecodeSurfaces` を上限として clamp する
-- `DecoderState` に `max_num_decode_surfaces: u32` フィールドを追加し、`config.max_num_decode_surfaces` を保存する (`effective_num_decode_surfaces` の上限として利用)
-- `cuvidCreateDecoder` の `ulNumDecodeSurfaces`、`cuvidReconfigureDecoder` の `ulNumDecodeSurfaces`、`pfnSequenceCallback` の戻り値の 3 箇所で同じ値を渡す
+- `ulTargetWidth` / `ulTargetHeight` / `display_area` を初回 `cuvidCreateDecoder` 時の値に固定する (`state.create_geometry`)。合わせて `cuvidCreateDecoder` 時にも `display_area` を明示設定する
+- `ulNumDecodeSurfaces` に codec 別推奨値を採用する (`effective_num_decode_surfaces` helper)。`cuvidCreateDecoder` / `cuvidReconfigureDecoder` / `pfnSequenceCallback` の戻り値の 3 箇所で同じ値を渡す
 
 ### テストデータの解像度制約
 

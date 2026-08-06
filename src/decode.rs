@@ -79,13 +79,17 @@ pub struct DecoderConfig {
     /// 符号化解像度の最大幅 (cuvidReconfigureDecoder による動的解像度変更で使用)
     ///
     /// max_coded_height と両方指定した場合のみ reconfigure が有効になる。
-    /// None の場合はシーケンス変更ごとにデコーダーを破棄して再作成する
+    /// None の場合はシーケンス変更ごとにデコーダーを破棄して再作成する。
+    /// 片方だけ `Some` にすることはできず、`Decoder::new` がエラーを返す。
+    /// 宣言値を超える符号化解像度のストリームが来た場合はエラーが通知される
     pub max_coded_width: Option<u32>,
 
     /// 符号化解像度の最大高さ (cuvidReconfigureDecoder による動的解像度変更で使用)
     ///
     /// max_coded_width と両方指定した場合のみ reconfigure が有効になる。
-    /// None の場合はシーケンス変更ごとにデコーダーを破棄して再作成する
+    /// None の場合はシーケンス変更ごとにデコーダーを破棄して再作成する。
+    /// 片方だけ `Some` にすることはできず、`Decoder::new` がエラーを返す。
+    /// 宣言値を超える符号化解像度のストリームが来た場合はエラーが通知される
     pub max_coded_height: Option<u32>,
 }
 
@@ -119,6 +123,16 @@ struct DecoderState {
     //  下げると、既に allocate 済みの出力サーフェスとの不整合により
     //  cuvidDecodePicture が CUDA_ERROR_INVALID_VALUE を返すため)
     create_geometry: DecoderCreateGeometry,
+    // テスト用に cuvidCreateDecoder の呼び出し回数を記録する
+    //
+    // 解像度変化が cuvidReconfigureDecoder による in-place 再構成で処理されることを
+    // テストで検証するために使用する (issue の完了条件: 「2 回目以降で
+    // cuvidReconfigureDecoder が呼ばれ cuvidCreateDecoder は呼ばれない」)
+    #[cfg(test)]
+    create_decoder_count: u32,
+    // テスト用に cuvidReconfigureDecoder の呼び出し回数を記録する
+    #[cfg(test)]
+    reconfigure_decoder_count: u32,
 }
 
 /// cuvidCreateDecoder 呼び出し時に確定した出力ジオメトリ
@@ -303,6 +317,10 @@ impl DecoderState {
                     display_right: 0,
                     display_bottom: 0,
                 },
+                #[cfg(test)]
+                create_decoder_count: 0,
+                #[cfg(test)]
+                reconfigure_decoder_count: 0,
             });
 
             // 映像パーサーを作成する
@@ -397,8 +415,18 @@ impl Drop for DecoderState {
 }
 
 enum Job<T> {
-    Decode { data: Vec<u8>, user_data: T },
-    Flush { done: SyncSender<()> },
+    Decode {
+        data: Vec<u8>,
+        user_data: T,
+    },
+    Flush {
+        done: SyncSender<()>,
+    },
+    // テスト用に cuvidCreateDecoder / cuvidReconfigureDecoder の呼び出し回数を取得する
+    #[cfg(test)]
+    QueryCallCounts {
+        done: SyncSender<(u32, u32)>,
+    },
     Terminate,
 }
 
@@ -496,6 +524,17 @@ impl<H: DecodeHandler> Decoder<H> {
             .map_err(|_| Error::new_custom("flush", "recv failed"))?;
         Ok(())
     }
+
+    /// テスト用に cuvidCreateDecoder / cuvidReconfigureDecoder の呼び出し回数を取得する
+    #[cfg(test)]
+    fn decoder_call_counts(&self) -> Result<(u32, u32), Error> {
+        let (tx, rx) = mpsc::sync_channel(0);
+        self.job_tx
+            .send(Job::QueryCallCounts { done: tx })
+            .map_err(|_| Error::new_custom("decoder_call_counts", "send failed"))?;
+        rx.recv()
+            .map_err(|_| Error::new_custom("decoder_call_counts", "recv failed"))
+    }
 }
 
 impl<H: DecodeHandler> Drop for Decoder<H> {
@@ -588,6 +627,12 @@ fn handle_video_sequence_inner(
                 .lib
                 .cuvid_reconfigure_decoder(state.decoder, &mut reconfigure_info)
         })?;
+
+        // テスト用に cuvidReconfigureDecoder の呼び出し回数を記録する
+        #[cfg(test)]
+        {
+            state.reconfigure_decoder_count += 1;
+        }
     }
 
     update_decoder_dimensions(state, format);
@@ -645,6 +690,12 @@ fn create_decoder(state: &mut DecoderState, format: &sys::CUVIDEOFORMAT) -> Resu
             .lib
             .cuvid_create_decoder(&mut state.decoder, &mut create_info)
     })?;
+
+    // テスト用に cuvidCreateDecoder の呼び出し回数を記録する
+    #[cfg(test)]
+    {
+        state.create_decoder_count += 1;
+    }
 
     // 作成時ジオメトリを保存する
     // 以降の cuvidReconfigureDecoder では target / display_area をこの値に固定して渡す
@@ -984,21 +1035,48 @@ where
 
     loop {
         match job_rx.recv() {
-            Ok(Job::Decode { data, user_data }) => {
-                if let Err(e) = state.decode(&data) {
-                    handler.on_decoded(Err(e.into()));
-                    continue;
+            Ok(Job::Decode { data, user_data }) => match state.decode(&data) {
+                Ok(()) => {
+                    pending_user_data.push_back(user_data);
+                    drain_frames(&mut state, &mut handler, &mut pending_user_data);
                 }
-
-                pending_user_data.push_back(user_data);
-                drain_frames(&mut state, &mut handler, &mut pending_user_data);
-            }
+                Err(e) => {
+                    // 失敗したパケットに紐づく内部チャネルのエラーを回収して通知する
+                    //
+                    // シーケンスコールバック等のコールバックエラーはチャネルにも積まれるが、
+                    // cuvidParseVideoData はコールバックの失敗を汎用の CUDA エラーとして返すため、
+                    // 具体的なエラー内容はチャネル側から通知する
+                    // (両方通知すると同一エラーの二重通知になる)
+                    //
+                    // 失敗パケットのフレームは無効なため破棄する
+                    // (残しておくと次の decode の drain でフレームと user_data の
+                    //  対応付けがずれるため)
+                    let mut notified = false;
+                    loop {
+                        match state.frame_rx.try_recv() {
+                            Ok(Ok(_)) => {}
+                            Ok(Err(callback_error)) => {
+                                handler.on_decoded(Err(callback_error.into()));
+                                notified = true;
+                            }
+                            Err(_) => break,
+                        }
+                    }
+                    if !notified {
+                        handler.on_decoded(Err(e.into()));
+                    }
+                }
+            },
             Ok(Job::Flush { done }) => {
                 let _ = state.send_eos();
 
                 drain_frames(&mut state, &mut handler, &mut pending_user_data);
 
                 let _ = done.send(());
+            }
+            #[cfg(test)]
+            Ok(Job::QueryCallCounts { done }) => {
+                let _ = done.send((state.create_decoder_count, state.reconfigure_decoder_count));
             }
             Ok(Job::Terminate) | Err(_) => {
                 // 残っている非同期処理を完了させる
@@ -1566,34 +1644,102 @@ mod tests {
     #[test]
     fn test_validate_max_coded_size_both_some() {
         // 両方 Some は検証を通過する
-        validate_max_coded_size(Some(320), Some(240)).expect("both Some should pass");
+        validate_max_coded_size(Some(320), Some(240)).expect("両方 Some は検証を通過するはず");
     }
 
     #[test]
     fn test_validate_max_coded_size_both_none() {
         // 両方 None は検証を通過する
-        validate_max_coded_size(None, None).expect("both None should pass");
+        validate_max_coded_size(None, None).expect("両方 None は検証を通過するはず");
     }
 
     #[test]
     fn test_validate_max_coded_size_width_only() {
         // 幅だけの指定は検証に失敗する
-        let error = validate_max_coded_size(Some(320), None).expect_err("width only should fail");
+        let error =
+            validate_max_coded_size(Some(320), None).expect_err("幅だけの指定は失敗するはず");
         assert!(error.to_string().contains("both Some or both None"));
     }
 
     #[test]
     fn test_validate_max_coded_size_height_only() {
         // 高さだけの指定は検証に失敗する
-        let error = validate_max_coded_size(None, Some(240)).expect_err("height only should fail");
+        let error =
+            validate_max_coded_size(None, Some(240)).expect_err("高さだけの指定は失敗するはず");
         assert!(error.to_string().contains("both Some or both None"));
+    }
+
+    #[test]
+    fn test_get_codec_num_decode_surfaces() {
+        // コーデック別の推奨デコードサーフェス数が返ることを確認する
+        assert_eq!(
+            get_codec_num_decode_surfaces(sys::cudaVideoCodec_enum_cudaVideoCodec_H264),
+            20
+        );
+        assert_eq!(
+            get_codec_num_decode_surfaces(sys::cudaVideoCodec_enum_cudaVideoCodec_HEVC),
+            20
+        );
+        assert_eq!(
+            get_codec_num_decode_surfaces(sys::cudaVideoCodec_enum_cudaVideoCodec_VP9),
+            12
+        );
+        assert_eq!(
+            get_codec_num_decode_surfaces(sys::cudaVideoCodec_enum_cudaVideoCodec_AV1),
+            12
+        );
+        assert_eq!(
+            get_codec_num_decode_surfaces(sys::cudaVideoCodec_enum_cudaVideoCodec_VP8),
+            8
+        );
+        assert_eq!(
+            get_codec_num_decode_surfaces(sys::cudaVideoCodec_enum_cudaVideoCodec_JPEG),
+            1
+        );
+        // 不明なコーデックにはデフォルト値が返る
+        assert_eq!(get_codec_num_decode_surfaces(0xffff), 8);
+    }
+
+    #[test]
+    fn test_effective_num_decode_surfaces_recommended_dominates() {
+        // codec 別推奨値 (H.264: 20) が parser 報告の min (2) より大きい場合は
+        // 推奨値が採用される
+        let format = test_video_format(320, 240);
+        assert_eq!(effective_num_decode_surfaces(&format, 20), 20);
+    }
+
+    #[test]
+    fn test_effective_num_decode_surfaces_max_allowed_clamps() {
+        // max_allowed が推奨値より小さい場合は max_allowed に clamp される
+        // (parser の ulMaxNumDecodeSurfaces を超える値をコールバックが返さないようにする)
+        let format = test_video_format(320, 240);
+        assert_eq!(effective_num_decode_surfaces(&format, 8), 8);
+        assert_eq!(effective_num_decode_surfaces(&format, 2), 2);
+    }
+
+    #[test]
+    fn test_effective_num_decode_surfaces_min_dominates() {
+        // parser 報告の min が推奨値より大きい場合は min が採用される
+        // (min 未満に減らすと DPB 不足でデコードが失敗するため)
+        let mut format = test_video_format(320, 240);
+        format.min_num_decode_surfaces = 30;
+        assert_eq!(effective_num_decode_surfaces(&format, 20), 30);
+        // min が max_allowed を超える場合も min が優先される
+        assert_eq!(effective_num_decode_surfaces(&format, 16), 30);
+    }
+
+    #[test]
+    fn test_effective_num_decode_surfaces_max_allowed_below_min() {
+        // max_allowed が min を下回る場合は min が優先される (min 未満には下げない)
+        let format = test_video_format(320, 240);
+        assert_eq!(effective_num_decode_surfaces(&format, 1), 2);
     }
 
     #[test]
     fn test_validate_display_area_valid() {
         // 有効な display_area は検証を通過する
         let format = test_video_format(320, 240);
-        validate_display_area(&format).expect("valid display_area should pass");
+        validate_display_area(&format).expect("有効な display_area は検証を通過するはず");
     }
 
     #[test]
@@ -1767,8 +1913,11 @@ mod tests {
         let mut offset = 32;
         let mut frames = Vec::new();
         while offset + 12 <= data.len() {
-            let size = u32::from_le_bytes(data[offset..offset + 4].try_into().expect("infallible"))
-                as usize;
+            let size = u32::from_le_bytes(
+                data[offset..offset + 4]
+                    .try_into()
+                    .expect("決して失敗しないはず"),
+            ) as usize;
             offset += 12;
             frames.push(&data[offset..offset + size]);
             offset += size;
@@ -1777,12 +1926,15 @@ mod tests {
     }
 
     /// テストデータを 1 フレームずつデコードしてフレームとエラーを収集する
+    ///
+    /// 戻り値は (デコードされたフレーム, エラー, (cuvidCreateDecoder 呼び出し回数,
+    /// cuvidReconfigureDecoder 呼び出し回数))
     fn decode_resolution_change_data(
         codec: DecoderCodec,
         frames: &[&[u8]],
         max_coded_width: Option<u32>,
         max_coded_height: Option<u32>,
-    ) -> (Vec<DecodedFrame<()>>, Vec<Error>) {
+    ) -> (Vec<DecodedFrame<()>>, Vec<Error>, (u32, u32)) {
         let config = DecoderConfig {
             codec,
             device_id: 0,
@@ -1799,14 +1951,19 @@ mod tests {
                 let _ = tx.send(frame);
             }),
         )
-        .expect("Failed to create decoder");
+        .expect("デコーダーの作成に失敗した");
 
         for frame in frames {
-            // シーケンスコールバックのエラーはチャネル経由で通知されるため
-            // decode の戻り値は確認しない
+            // シーケンスコールバックのエラーは decode の戻り値にも伝播するが、
+            // 具体的な内容はハンドラ経由で通知されるため戻り値は確認しない
             let _ = decoder.decode(frame, ());
         }
         let _ = decoder.flush();
+
+        // cuvidCreateDecoder / cuvidReconfigureDecoder の呼び出し回数を取得する
+        let call_counts = decoder
+            .decoder_call_counts()
+            .expect("呼び出し回数の取得に失敗した");
 
         // チャネルからフレームとエラーを回収する
         let mut decoded_frames = Vec::new();
@@ -1818,12 +1975,15 @@ mod tests {
                 Err(mpsc::TryRecvError::Empty | mpsc::TryRecvError::Disconnected) => break,
             }
         }
-        (decoded_frames, errors)
+        (decoded_frames, errors, call_counts)
     }
 
     /// 解像度変化ストリームのデコード結果を検証する
     ///
-    /// 全 45 フレームが 320x240 x30 と 256x160 x15 でデコードされることを確認する
+    /// 全 45 フレームが 320x240 x30 と 256x160 x15 でデコードされることを確認する。
+    /// あわせて、解像度変化が cuvidReconfigureDecoder による in-place 再構成で
+    /// 処理され (cuvidCreateDecoder は初回のみ)、
+    /// フレームロスが発生しないことを確認する
     fn assert_resolution_change_frames(
         codec: DecoderCodec,
         data: &'static [u8],
@@ -1831,19 +1991,32 @@ mod tests {
         max_coded_width: Option<u32>,
         max_coded_height: Option<u32>,
     ) {
-        let (decoded_frames, errors) =
+        let (decoded_frames, errors, (create_count, reconfigure_count)) =
             decode_resolution_change_data(codec, frames, max_coded_width, max_coded_height);
 
         // エラーが 1 件も通知されないことを確認する
-        assert!(errors.is_empty(), "unexpected errors: {errors:?}");
+        assert!(
+            errors.is_empty(),
+            "予期しないエラーが通知された: {errors:?}"
+        );
+
+        // cuvidCreateDecoder は初回のシーケンスコールバックでのみ呼ばれることを確認する
+        // (2 回目以降は cuvidReconfigureDecoder による in-place 再構成で処理される)
+        assert_eq!(
+            create_count, 1,
+            "cuvidCreateDecoder は初回のみ呼ばれるはず (codec: {codec:?}): {create_count}"
+        );
+        assert!(
+            reconfigure_count >= 1,
+            "cuvidReconfigureDecoder が呼ばれるはず (codec: {codec:?}): {reconfigure_count}"
+        );
 
         // 全フレームがデコードされることを確認する
-        // max_coded_* を指定した場合は cuvidReconfigureDecoder による
-        // in-place 再構成でフレームロスが発生しない
         assert_eq!(
             decoded_frames.len(),
             frames.len(),
-            "decoded frame count should match input frame count (codec: {codec:?}, data: {data:?})"
+            "デコードされたフレーム数が入力フレーム数と一致するはず (codec: {codec:?}, data: {data:?}): {}",
+            decoded_frames.len()
         );
 
         // 各フレームのサイズを検証する
@@ -1864,7 +2037,7 @@ mod tests {
         // H.264 テストデータは 45 アクセスユニットに分割される
         let data = include_bytes!("../testdata/resolution-change/h264.h264");
         let frames = split_annexb_frames(data, |nal| (nal & 0x1f) == 1 || (nal & 0x1f) == 5);
-        assert_eq!(frames.len(), 45, "h264 frame count");
+        assert_eq!(frames.len(), 45, "h264 フレーム数");
 
         // 先頭フレームには SPS (NAL type 7) が含まれる
         // 先頭フレームからパラメータセットが欠落するとデコードできないため
@@ -1873,7 +2046,7 @@ mod tests {
             frames[0]
                 .windows(4)
                 .any(|w| w[..3] == [0, 0, 1] && (w[3] & 0x1f) == 7),
-            "first frame should contain SPS"
+            "先頭フレームに SPS が含まれるはず"
         );
     }
 
@@ -1882,13 +2055,13 @@ mod tests {
         // H.265 テストデータは 45 アクセスユニットに分割される
         let data = include_bytes!("../testdata/resolution-change/h265.h265");
         let frames = split_annexb_frames(data, |nal| nal >> 1 <= 31);
-        assert_eq!(frames.len(), 45, "h265 frame count");
+        assert_eq!(frames.len(), 45, "h265 フレーム数");
 
         // 先頭フレームには VPS (NAL type 32) が含まれる
         // 先頭フレームからパラメータセットが欠落するとデコードできないため
         assert!(
             frames[0].windows(4).any(|w| w == [0, 0, 1, 0x40]),
-            "first frame should contain VPS"
+            "先頭フレームに VPS が含まれるはず"
         );
     }
 
@@ -1896,11 +2069,11 @@ mod tests {
     fn test_split_ivf_frames() {
         // IVF テストデータは 45 フレームに分割される
         let vp8_data = include_bytes!("../testdata/resolution-change/vp8.ivf");
-        assert_eq!(split_ivf_frames(vp8_data).len(), 45, "vp8 frame count");
+        assert_eq!(split_ivf_frames(vp8_data).len(), 45, "vp8 フレーム数");
         let vp9_data = include_bytes!("../testdata/resolution-change/vp9.ivf");
-        assert_eq!(split_ivf_frames(vp9_data).len(), 45, "vp9 frame count");
+        assert_eq!(split_ivf_frames(vp9_data).len(), 45, "vp9 フレーム数");
         let av1_data = include_bytes!("../testdata/resolution-change/av1.ivf");
-        assert_eq!(split_ivf_frames(av1_data).len(), 45, "av1 frame count");
+        assert_eq!(split_ivf_frames(av1_data).len(), 45, "av1 フレーム数");
     }
 
     #[test]
@@ -1909,7 +2082,7 @@ mod tests {
         // 320x240 → 256x160 → 320x240 の変化を cuvidReconfigureDecoder で処理する
         let data = include_bytes!("../testdata/resolution-change/h264.h264");
         let frames = split_annexb_frames(data, |nal| (nal & 0x1f) == 1 || (nal & 0x1f) == 5);
-        assert_eq!(frames.len(), 45, "h264");
+        assert_eq!(frames.len(), 45, "h264 フレーム数");
         assert_resolution_change_frames(DecoderCodec::H264, data, &frames, Some(320), Some(240));
     }
 
@@ -1919,7 +2092,7 @@ mod tests {
         // 320x240 → 256x160 → 320x240 の変化を cuvidReconfigureDecoder で処理する
         let data = include_bytes!("../testdata/resolution-change/h265.h265");
         let frames = split_annexb_frames(data, |nal| nal >> 1 <= 31);
-        assert_eq!(frames.len(), 45, "h265");
+        assert_eq!(frames.len(), 45, "h265 フレーム数");
         assert_resolution_change_frames(DecoderCodec::Hevc, data, &frames, Some(320), Some(240));
     }
 
@@ -1929,7 +2102,7 @@ mod tests {
         // 320x240 → 256x160 → 320x240 の変化を cuvidReconfigureDecoder で処理する
         let data = include_bytes!("../testdata/resolution-change/vp8.ivf");
         let frames = split_ivf_frames(data);
-        assert_eq!(frames.len(), 45, "vp8");
+        assert_eq!(frames.len(), 45, "vp8 フレーム数");
         assert_resolution_change_frames(DecoderCodec::Vp8, data, &frames, Some(320), Some(240));
     }
 
@@ -1939,7 +2112,7 @@ mod tests {
         // 320x240 → 256x160 → 320x240 の変化を cuvidReconfigureDecoder で処理する
         let data = include_bytes!("../testdata/resolution-change/vp9.ivf");
         let frames = split_ivf_frames(data);
-        assert_eq!(frames.len(), 45, "vp9");
+        assert_eq!(frames.len(), 45, "vp9 フレーム数");
         assert_resolution_change_frames(DecoderCodec::Vp9, data, &frames, Some(320), Some(240));
     }
 
@@ -1949,7 +2122,7 @@ mod tests {
         // 320x240 → 256x160 → 320x240 の変化を cuvidReconfigureDecoder で処理する
         let data = include_bytes!("../testdata/resolution-change/av1.ivf");
         let frames = split_ivf_frames(data);
-        assert_eq!(frames.len(), 45, "av1");
+        assert_eq!(frames.len(), 45, "av1 フレーム数");
         assert_resolution_change_frames(DecoderCodec::Av1, data, &frames, Some(320), Some(240));
     }
 
@@ -1959,7 +2132,7 @@ mod tests {
         // 解像度変化に対応する
         let data = include_bytes!("../testdata/resolution-change/h264.h264");
         let frames = split_annexb_frames(data, |nal| (nal & 0x1f) == 1 || (nal & 0x1f) == 5);
-        assert_eq!(frames.len(), 45, "h264");
+        assert_eq!(frames.len(), 45, "h264 フレーム数");
         assert_resolution_change_frames_destroy_and_recreate(DecoderCodec::H264, &frames);
     }
 
@@ -1969,7 +2142,7 @@ mod tests {
         // 解像度変化に対応する
         let data = include_bytes!("../testdata/resolution-change/h265.h265");
         let frames = split_annexb_frames(data, |nal| nal >> 1 <= 31);
-        assert_eq!(frames.len(), 45, "h265");
+        assert_eq!(frames.len(), 45, "h265 フレーム数");
         assert_resolution_change_frames_destroy_and_recreate(DecoderCodec::Hevc, &frames);
     }
 
@@ -1979,7 +2152,7 @@ mod tests {
         // 解像度変化に対応する
         let data = include_bytes!("../testdata/resolution-change/vp8.ivf");
         let frames = split_ivf_frames(data);
-        assert_eq!(frames.len(), 45, "vp8");
+        assert_eq!(frames.len(), 45, "vp8 フレーム数");
         assert_resolution_change_frames_destroy_and_recreate(DecoderCodec::Vp8, &frames);
     }
 
@@ -1989,7 +2162,7 @@ mod tests {
         // 解像度変化に対応する
         let data = include_bytes!("../testdata/resolution-change/vp9.ivf");
         let frames = split_ivf_frames(data);
-        assert_eq!(frames.len(), 45, "vp9");
+        assert_eq!(frames.len(), 45, "vp9 フレーム数");
         assert_resolution_change_frames_destroy_and_recreate(DecoderCodec::Vp9, &frames);
     }
 
@@ -1999,25 +2172,42 @@ mod tests {
         // 解像度変化に対応する
         let data = include_bytes!("../testdata/resolution-change/av1.ivf");
         let frames = split_ivf_frames(data);
-        assert_eq!(frames.len(), 45, "av1");
+        assert_eq!(frames.len(), 45, "av1 フレーム数");
         assert_resolution_change_frames_destroy_and_recreate(DecoderCodec::Av1, &frames);
     }
 
     /// destroy+create 経路で 45 フレーム全てがデコードされることを確認する
     ///
     /// display_delay=0 のためシーケンス変更時に in-flight フレームが存在せず、
-    /// フレームロスは発生しないことを期待する
+    /// フレームロスは発生しないことを期待する。
+    /// あわせて、cuvidReconfigureDecoder が使われず
+    /// シーケンス変更ごとに cuvidCreateDecoder が呼ばれることを確認する
     fn assert_resolution_change_frames_destroy_and_recreate(codec: DecoderCodec, frames: &[&[u8]]) {
-        let (decoded_frames, errors) = decode_resolution_change_data(codec, frames, None, None);
+        let (decoded_frames, errors, (create_count, reconfigure_count)) =
+            decode_resolution_change_data(codec, frames, None, None);
 
         // エラーが 1 件も通知されないことを確認する
-        assert!(errors.is_empty(), "unexpected errors: {errors:?}");
+        assert!(
+            errors.is_empty(),
+            "予期しないエラーが通知された: {errors:?}"
+        );
+
+        // cuvidReconfigureDecoder は使われず、シーケンス変更ごとに
+        // cuvidCreateDecoder で作り直されることを確認する
+        assert_eq!(
+            reconfigure_count, 0,
+            "cuvidReconfigureDecoder は呼ばれないはず (codec: {codec:?}): {reconfigure_count}"
+        );
+        assert!(
+            create_count >= 2,
+            "シーケンス変更ごとに cuvidCreateDecoder が呼ばれるはず (codec: {codec:?}): {create_count}"
+        );
 
         // destroy+create でも全フレームがデコードされる
         assert_eq!(
             decoded_frames.len(),
             frames.len(),
-            "all frames should be decoded (codec: {codec:?}): {}",
+            "全フレームがデコードされるはず (codec: {codec:?}): {}",
             decoded_frames.len()
         );
 
@@ -2040,18 +2230,21 @@ mod tests {
         // 初回のシーケンスコールバックでエラーが通知される
         let data = include_bytes!("../testdata/resolution-change/h264.h264");
         let frames = split_annexb_frames(data, |nal| (nal & 0x1f) == 1 || (nal & 0x1f) == 5);
-        let (decoded_frames, errors) =
+        let (decoded_frames, errors, _call_counts) =
             decode_resolution_change_data(DecoderCodec::H264, &frames, Some(160), Some(120));
 
         // フレームは 1 件もデコードされない
-        assert!(decoded_frames.is_empty(), "no frames should be decoded");
+        assert!(
+            decoded_frames.is_empty(),
+            "フレームは 1 件もデコードされないはず"
+        );
 
         // max 超過エラーが通知される
         assert!(
             errors.iter().any(|e| e
                 .to_string()
                 .contains("exceeds max_coded_width / max_coded_height")),
-            "max_coded_width / max_coded_height error should be reported: {errors:?}"
+            "max_coded_width / max_coded_height のエラーが通知されるはず: {errors:?}"
         );
     }
 }
