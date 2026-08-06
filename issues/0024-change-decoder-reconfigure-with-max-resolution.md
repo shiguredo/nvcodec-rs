@@ -32,6 +32,8 @@ issue 0006 では「方法 2: `cuvidReconfigureDecoder` を使用」も検討さ
 
 `DecoderConfig` は `#[derive(Debug, Clone)]` の pub struct で `Default` 実装を持たない (2026.1.0 で明示的に削除済み) ため、pub フィールドの追加は既存 struct literal 初期化コードを壊す **破壊的変更 (`[CHANGE]`)** に該当する。issue のタイトル prefix・Branch prefix・CHANGES.md エントリの分類はいずれも `change` に統一する。
 
+**片方だけ `Some` の指定は `Decoder::new` でエラーにする** (両方 `Some` か両方 `None` のどちらかを強制する)。理由は、片方だけ `Some` の場合に reconfigure が無効になるだけでなく、create 時に `ulMaxWidth` / `ulMaxHeight` の片方だけが宣言値になり `ulMaxWidth < ulWidth` の矛盾した値が SDK に渡りうるため。encoder 側 (`max_encode_width` / `max_encode_height`) は片方だけ指定を受理するが、encoder は `None` を現在の `width` / `height` にフォールバックして矛盾が構造的に発生しない点で意味論が異なる。
+
 ### encoder 側 (`max_encode_width` / `max_encode_height`) との命名と意味論の違い
 
 命名は SDK 側フィールドに寄せて非対称にする (encoder = `maxEncodeWidth`、decoder = `coded_width`)。意味論も次のように異なる。
