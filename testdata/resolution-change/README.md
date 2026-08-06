@@ -32,4 +32,4 @@ IVF の 1 フレームが 1 ピクチャに対応する。
 - `src/decode.rs` の `mod tests` が `include_bytes!` で読み込む
 - `max_coded_width` / `max_coded_height` を指定したテストは
   解像度変化を `cuvidReconfigureDecoder` で in-place 再構成する経路の検証に使う
-- 指定しないテストは従来の destroy+create 経路の検証に使う
+- 指定しないテストは destroy+create 経路の検証に使う

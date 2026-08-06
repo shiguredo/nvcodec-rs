@@ -79,13 +79,13 @@ pub struct DecoderConfig {
     /// 符号化解像度の最大幅 (cuvidReconfigureDecoder による動的解像度変更で使用)
     ///
     /// max_coded_height と両方指定した場合のみ reconfigure が有効になる。
-    /// None の場合は従来どおりシーケンス変更ごとにデコーダーを破棄して再作成する
+    /// None の場合はシーケンス変更ごとにデコーダーを破棄して再作成する
     pub max_coded_width: Option<u32>,
 
     /// 符号化解像度の最大高さ (cuvidReconfigureDecoder による動的解像度変更で使用)
     ///
     /// max_coded_width と両方指定した場合のみ reconfigure が有効になる。
-    /// None の場合は従来どおりシーケンス変更ごとにデコーダーを破棄して再作成する
+    /// None の場合はシーケンス変更ごとにデコーダーを破棄して再作成する
     pub max_coded_height: Option<u32>,
 }
 
@@ -549,7 +549,7 @@ fn handle_video_sequence_inner(
         create_decoder(state, format)?;
         save_reconfigure_baseline(state, format);
     } else if state.max_coded_width.is_none() || state.max_coded_height.is_none() {
-        // 最大解像度が分からない場合は従来どおり破棄して再作成する
+        // 最大解像度が分からない場合は破棄して再作成する
         // この経路では判定用ベースラインは使わないため保存値の更新は不要
         destroy_and_recreate_decoder(state, format)?;
     } else if state.reconfigure_baseline.changed(format) {
@@ -1838,9 +1838,8 @@ mod tests {
         assert!(errors.is_empty(), "unexpected errors: {errors:?}");
 
         // 全フレームがデコードされることを確認する
-        // max_coded_* を指定した場合は cuvidReconfigureDecoder による in-place 再構成で
-        // フレームロスが発生しない。指定しない場合は destroy+create のため
-        // 再作成時に in-flight フレームが失われる (フレーム数が減る)
+        // max_coded_* を指定した場合は cuvidReconfigureDecoder による
+        // in-place 再構成でフレームロスが発生しない
         assert_eq!(
             decoded_frames.len(),
             frames.len(),
@@ -1956,7 +1955,7 @@ mod tests {
 
     #[test]
     fn test_decode_h264_resolution_change_without_max_coded_width_height() {
-        // max_coded_width / max_coded_height を指定しない場合は従来どおり destroy+create で
+        // max_coded_width / max_coded_height を指定しない場合は destroy+create で
         // 解像度変化に対応する
         let data = include_bytes!("../testdata/resolution-change/h264.h264");
         let frames = split_annexb_frames(data, |nal| (nal & 0x1f) == 1 || (nal & 0x1f) == 5);
@@ -1966,7 +1965,7 @@ mod tests {
 
     #[test]
     fn test_decode_h265_resolution_change_without_max_coded_width_height() {
-        // max_coded_width / max_coded_height を指定しない場合は従来どおり destroy+create で
+        // max_coded_width / max_coded_height を指定しない場合は destroy+create で
         // 解像度変化に対応する
         let data = include_bytes!("../testdata/resolution-change/h265.h265");
         let frames = split_annexb_frames(data, |nal| nal >> 1 <= 31);
@@ -1976,7 +1975,7 @@ mod tests {
 
     #[test]
     fn test_decode_vp8_resolution_change_without_max_coded_width_height() {
-        // max_coded_width / max_coded_height を指定しない場合は従来どおり destroy+create で
+        // max_coded_width / max_coded_height を指定しない場合は destroy+create で
         // 解像度変化に対応する
         let data = include_bytes!("../testdata/resolution-change/vp8.ivf");
         let frames = split_ivf_frames(data);
@@ -1986,7 +1985,7 @@ mod tests {
 
     #[test]
     fn test_decode_vp9_resolution_change_without_max_coded_width_height() {
-        // max_coded_width / max_coded_height を指定しない場合は従来どおり destroy+create で
+        // max_coded_width / max_coded_height を指定しない場合は destroy+create で
         // 解像度変化に対応する
         let data = include_bytes!("../testdata/resolution-change/vp9.ivf");
         let frames = split_ivf_frames(data);
@@ -1996,7 +1995,7 @@ mod tests {
 
     #[test]
     fn test_decode_av1_resolution_change_without_max_coded_width_height() {
-        // max_coded_width / max_coded_height を指定しない場合は従来どおり destroy+create で
+        // max_coded_width / max_coded_height を指定しない場合は destroy+create で
         // 解像度変化に対応する
         let data = include_bytes!("../testdata/resolution-change/av1.ivf");
         let frames = split_ivf_frames(data);
