@@ -17,6 +17,8 @@ Sora の WebRTC シミュキャスト録画のように 1 つの MP4 内でシ�
 
 issue 0006 では「方法 2: `cuvidReconfigureDecoder` を使用」も検討されたが、`ulMaxWidth` / `ulMaxHeight` を事前に知ることが難しいという理由で見送られた。
 
+`max_coded_width` / `max_coded_height` の指定が必要なのは、NVDEC がデコーダー作成時に内部サーフェスを最大解像度前提で確保し、`cuvidReconfigureDecoder` は作成時に宣言した `ulMaxWidth` / `ulMaxHeight` を超える解像度に変更できないため (SDK の MUST 制約: "MUST be < = ulMaxWidth defined at CUVIDDECODECREATEINFO")。ストリームの最大解像度を事前に知っている呼び出し側だけが宣言できる。
+
 ## 設計方針
 
 呼び出し側が最大解像度を知っている場合に限り、`cuvidReconfigureDecoder` による in-place 再構成に切り替える。知らない場合は現状どおりの destroy+create にフォールバックする。
@@ -78,7 +80,7 @@ Step 1 で `format.display_area` を検証するのは、`state.width` / `state.
 ### 失敗時の状態遷移
 
 - `display_area` 検証失敗 (Step 1): SDK 呼び出しなしのため `state.decoder` は前デコーダー (あるいは初回コールバックなら null) のまま残る。エラーを利用者に通知する。**現行実装は「create → validate」順で失敗時に古いデコーダーが破棄済み状態で Err を返していた (issue 0017 問題 2)**。本 issue の Step 1 変更でこの半壊状態を回避する
-- max 超過事前検証エラー (Step 2): SDK 呼び出しなしのため `state.decoder` は前デコーダー (あるいは初回コールバックなら null) のまま残る。以降のフレームは古い解像度で処理される (あるいは null なのでデコード不能)。次回コールバックで再度チェックが走る
+- max 超過事前検証エラー (Step 2): SDK 呼び出しなしのため `state.decoder` は前デコーダー (あるいは初回コールバックなら null) のまま残る。以降のフレームは古い解像度で処理される (あるいは null なのでデコード不能)。次回コールバックで再度チェックが走る。黙って destroy+create にフォールバックしないのは、宣言値の超過は設定ミスが疑わしいためエラーで表面化させる意図。宣言した最大解像度自体を変更したい場合は、呼び出し側が `Decoder` を作り直して新しい最大解像度を宣言する (インスタンスの作り直しは従来どおり常に可能)
 - `cuvidCreateDecoder` 失敗 (Step 3/4/5 経路): `state.decoder` は null になる。復旧不能問題 (issue 0017 の「問題 1: 順序」) はこの経路に残る
 - `cuvidReconfigureDecoder` 失敗 (Step 6 経路): NVDEC SDK は失敗後のデコーダー状態を明示していない。安全側に倒し、`state.decoder` は変更せずエラーを利用者に通知する。以降のフレームは古い解像度で処理を続けるので実質的に無効になるが、次の解像度変化のコールバックで再度復旧を試みる余地は残る (`state.decoder` を null にせずに済む点だけがメリット)
 - どの経路でも、`handle_video_sequence_inner` が `Err` を返せば現行の `handle_video_sequence` が `frame_tx.send(Err(...))` で利用者に通知する挙動を維持する
