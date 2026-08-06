@@ -13,12 +13,15 @@ pub struct Error {
 
 impl Error {
     // CUDA や NVIDIA Video Codec SDK ではなく、この crate 起因のエラーを構築するための関数
-    pub(crate) fn new_custom(function: &'static str, message: &'static str) -> Self {
+    pub(crate) fn new_custom(
+        function: &'static str,
+        message: impl Into<Cow<'static, str>>,
+    ) -> Self {
         Self {
             function,
             status_code: None,
             status_name: None,
-            status_message: Some(Cow::Borrowed(message)),
+            status_message: Some(message.into()),
         }
     }
 

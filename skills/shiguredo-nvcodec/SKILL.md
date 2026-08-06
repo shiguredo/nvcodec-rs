@@ -409,8 +409,8 @@ assert_eq!(frame.width(), 1280);  // 自動的に追従
 
 | 設定 | 再構成方式 |
 |------|-----------|
-| `Some(v)` | `cuvidReconfigureDecoder` による in-place 再構成。デコーダー再作成コストがかからない。`v` を超える解像度のストリームが来た場合はエラーを通知する |
-| `None` | 従来どおり destroy+create。解像度変更のたびにデコーダーを作り直す |
+| 両方 `Some(v)` | `cuvidReconfigureDecoder` による in-place 再構成。デコーダー再作成コストがかからない。`v` を超える解像度のストリームが来た場合はエラーを通知する |
+| 両方 `None` | 従来どおり destroy+create。解像度変更のたびにデコーダーを作り直す |
 
 ```rust
 // 作成時に最大符号化解像度を指定すると in-place 再構成が有効になる
@@ -420,6 +420,8 @@ let config = DecoderConfig {
     // ...
 };
 ```
+
+`max_coded_width` / `max_coded_height` は**両方指定するか両方 `None` にするかのどちらか**で、片方だけ `Some` にすると `Decoder::new` がエラーを返す。`None` 側は「上限なし (destroy+create で追従)」、encoder の `max_encode_width` / `max_encode_height` (片方だけ指定可、`None` は現在解像度にフォールバック) とは意味論が異なる。
 
 `max_coded_width` / `max_coded_height` の指定が必要なのは、NVDEC がデコーダー作成時に内部サーフェスを最大解像度前提で確保し、`cuvidReconfigureDecoder` は作成時に宣言した `ulMaxWidth` / `ulMaxHeight` を超える解像度に変更できないため (SDK の MUST 制約)。ストリームの最大解像度を事前に知っている呼び出し側だけが宣言できる。
 

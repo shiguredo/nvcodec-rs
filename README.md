@@ -292,7 +292,7 @@ let frame = rx.recv()??;
 assert_eq!(frame.width(), 1280);  // 自動的に変更される
 ```
 
-ストリーム中の解像度変化を `cuvidReconfigureDecoder` による in-place 再構成で処理する場合は、初期化時に `max_coded_width` / `max_coded_height` を設定しておく必要があります。シーケンス変更ごとのデコーダー再作成コストを削減できます。
+ストリーム中の解像度変化を `cuvidReconfigureDecoder` による in-place 再構成で処理する場合は、初期化時に `max_coded_width` / `max_coded_height` の**両方を**設定しておく必要があります。シーケンス変更ごとのデコーダー再作成コストを削減できます。
 
 ```rust
 // 作成時に最大符号化解像度を指定
@@ -305,7 +305,7 @@ let config = DecoderConfig {
 // 1920x1080 以内の解像度変化は in-place で再構成される
 ```
 
-指定しない場合は従来どおり、解像度変化のたびにデコーダーを作り直します。`max_coded_width` / `max_coded_height` を超える解像度のストリームが来た場合は、エラーが通知されます。
+両方 `None` の場合は従来どおり、解像度変化のたびにデコーダーを作り直します。片方だけ `Some` にすることはできません (両方 `Some` か両方 `None` のどちらかを指定してください)。`max_coded_width` / `max_coded_height` を指定した場合、宣言値を超える解像度のストリームが来たときはエラーが通知されます。
 
 ### まとめ
 

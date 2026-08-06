@@ -78,11 +78,13 @@ pub struct DecoderConfig {
 
     /// 符号化解像度の最大幅 (cuvidReconfigureDecoder による動的解像度変更で使用)
     ///
+    /// max_coded_height と両方指定した場合のみ reconfigure が有効になる。
     /// None の場合は従来どおりシーケンス変更ごとにデコーダーを破棄して再作成する
     pub max_coded_width: Option<u32>,
 
     /// 符号化解像度の最大高さ (cuvidReconfigureDecoder による動的解像度変更で使用)
     ///
+    /// max_coded_width と両方指定した場合のみ reconfigure が有効になる。
     /// None の場合は従来どおりシーケンス変更ごとにデコーダーを破棄して再作成する
     pub max_coded_height: Option<u32>,
 }
@@ -148,6 +150,7 @@ unsafe impl Send for DecoderState {}
 impl DecoderState {
     /// 指定されたコーデック設定でデコーダーインスタンスを生成する
     fn new(config: DecoderConfig) -> Result<Box<Self>, Error> {
+        validate_max_coded_size(config.max_coded_width, config.max_coded_height)?;
         let codec_type = match config.codec {
             DecoderCodec::H264 => sys::cudaVideoCodec_enum_cudaVideoCodec_H264,
             DecoderCodec::Hevc => sys::cudaVideoCodec_enum_cudaVideoCodec_HEVC,
@@ -493,7 +496,10 @@ fn handle_video_sequence_inner(
     {
         return Err(Error::new_custom(
             "handle_video_sequence",
-            "coded size exceeds max_coded_size",
+            format!(
+                "coded size ({}x{}) exceeds max_coded_width / max_coded_height ({}x{})",
+                format.coded_width, format.coded_height, max_width, max_height
+            ),
         ));
     }
 
@@ -582,6 +588,24 @@ fn destroy_and_recreate_decoder(
         .with_context(state.ctx, || state.lib.cuvid_destroy_decoder(state.decoder))?;
     state.decoder = ptr::null_mut();
     create_decoder(state, format)
+}
+
+/// max_coded_width / max_coded_height を検証する
+///
+/// 両方 Some か両方 None のどちらかでなければならない
+/// (片方だけ Some は reconfigure が無効になるだけでなく、
+///  create 時に ulMaxWidth < ulWidth の矛盾した値が SDK に渡りうるため)
+fn validate_max_coded_size(
+    max_coded_width: Option<u32>,
+    max_coded_height: Option<u32>,
+) -> Result<(), Error> {
+    if max_coded_width.is_some() != max_coded_height.is_some() {
+        return Err(Error::new_custom(
+            "Decoder::new",
+            "max_coded_width and max_coded_height must be both Some or both None",
+        ));
+    }
+    Ok(())
 }
 
 /// display_area を検証する
@@ -1419,6 +1443,32 @@ mod tests {
     }
 
     #[test]
+    fn test_validate_max_coded_size_both_some() {
+        // 両方 Some は検証を通過する
+        validate_max_coded_size(Some(320), Some(240)).expect("both Some should pass");
+    }
+
+    #[test]
+    fn test_validate_max_coded_size_both_none() {
+        // 両方 None は検証を通過する
+        validate_max_coded_size(None, None).expect("both None should pass");
+    }
+
+    #[test]
+    fn test_validate_max_coded_size_width_only() {
+        // 幅だけの指定は検証に失敗する
+        let error = validate_max_coded_size(Some(320), None).expect_err("width only should fail");
+        assert!(error.to_string().contains("both Some or both None"));
+    }
+
+    #[test]
+    fn test_validate_max_coded_size_height_only() {
+        // 高さだけの指定は検証に失敗する
+        let error = validate_max_coded_size(None, Some(240)).expect_err("height only should fail");
+        assert!(error.to_string().contains("both Some or both None"));
+    }
+
+    #[test]
     fn test_validate_display_area_valid() {
         // 有効な display_area は検証を通過する
         let format = test_video_format(320, 240);
@@ -1731,8 +1781,8 @@ mod tests {
     }
 
     #[test]
-    fn test_decode_h264_resolution_change_with_max_coded_size() {
-        // max_coded_size を指定して H.264 の解像度変化ストリームをデコードする
+    fn test_decode_h264_resolution_change_with_max_coded_width_height() {
+        // max_coded_width / max_coded_height を指定して H.264 の解像度変化ストリームをデコードする
         // 320x240 → 160x120 → 320x240 の変化を cuvidReconfigureDecoder で処理する
         let data = include_bytes!("../testdata/resolution-change/h264.h264");
         let frames = split_annexb_frames(data, |nal| (nal & 0x1f) == 1 || (nal & 0x1f) == 5);
@@ -1741,8 +1791,8 @@ mod tests {
     }
 
     #[test]
-    fn test_decode_h265_resolution_change_with_max_coded_size() {
-        // max_coded_size を指定して H.265 の解像度変化ストリームをデコードする
+    fn test_decode_h265_resolution_change_with_max_coded_width_height() {
+        // max_coded_width / max_coded_height を指定して H.265 の解像度変化ストリームをデコードする
         // 320x240 → 160x120 → 320x240 の変化を cuvidReconfigureDecoder で処理する
         let data = include_bytes!("../testdata/resolution-change/h265.h265");
         let frames = split_annexb_frames(data, |nal| nal >> 1 <= 31);
@@ -1751,8 +1801,8 @@ mod tests {
     }
 
     #[test]
-    fn test_decode_vp8_resolution_change_with_max_coded_size() {
-        // max_coded_size を指定して VP8 の解像度変化ストリームをデコードする
+    fn test_decode_vp8_resolution_change_with_max_coded_width_height() {
+        // max_coded_width / max_coded_height を指定して VP8 の解像度変化ストリームをデコードする
         // 320x240 → 160x120 → 320x240 の変化を cuvidReconfigureDecoder で処理する
         let data = include_bytes!("../testdata/resolution-change/vp8.ivf");
         let frames = split_ivf_frames(data);
@@ -1761,8 +1811,8 @@ mod tests {
     }
 
     #[test]
-    fn test_decode_vp9_resolution_change_with_max_coded_size() {
-        // max_coded_size を指定して VP9 の解像度変化ストリームをデコードする
+    fn test_decode_vp9_resolution_change_with_max_coded_width_height() {
+        // max_coded_width / max_coded_height を指定して VP9 の解像度変化ストリームをデコードする
         // 320x240 → 160x120 → 320x240 の変化を cuvidReconfigureDecoder で処理する
         let data = include_bytes!("../testdata/resolution-change/vp9.ivf");
         let frames = split_ivf_frames(data);
@@ -1771,8 +1821,8 @@ mod tests {
     }
 
     #[test]
-    fn test_decode_av1_resolution_change_with_max_coded_size() {
-        // max_coded_size を指定して AV1 の解像度変化ストリームをデコードする
+    fn test_decode_av1_resolution_change_with_max_coded_width_height() {
+        // max_coded_width / max_coded_height を指定して AV1 の解像度変化ストリームをデコードする
         // 320x240 → 160x120 → 320x240 の変化を cuvidReconfigureDecoder で処理する
         let data = include_bytes!("../testdata/resolution-change/av1.ivf");
         let frames = split_ivf_frames(data);
@@ -1781,8 +1831,8 @@ mod tests {
     }
 
     #[test]
-    fn test_decode_h264_resolution_change_without_max_coded_size() {
-        // max_coded_size を指定しない場合は従来どおり destroy+create で
+    fn test_decode_h264_resolution_change_without_max_coded_width_height() {
+        // max_coded_width / max_coded_height を指定しない場合は従来どおり destroy+create で
         // 解像度変化に対応する (フレームロスは発生する)
         let data = include_bytes!("../testdata/resolution-change/h264.h264");
         let frames = split_annexb_frames(data, |nal| (nal & 0x1f) == 1 || (nal & 0x1f) == 5);
@@ -1817,8 +1867,8 @@ mod tests {
     }
 
     #[test]
-    fn test_decode_resolution_change_exceeds_max_coded_size() {
-        // max_coded_size (160x120) を超える 320x240 のストリームをデコードすると
+    fn test_decode_resolution_change_exceeds_max_coded_width_height() {
+        // max_coded_width / max_coded_height (160x120) を超える 320x240 のストリームをデコードすると
         // 初回のシーケンスコールバックでエラーが通知される
         let data = include_bytes!("../testdata/resolution-change/h264.h264");
         let frames = split_annexb_frames(data, |nal| (nal & 0x1f) == 1 || (nal & 0x1f) == 5);
@@ -1830,10 +1880,10 @@ mod tests {
 
         // max 超過エラーが通知される
         assert!(
-            errors
-                .iter()
-                .any(|e| e.to_string().contains("exceeds max_coded_size")),
-            "max_coded_size error should be reported: {errors:?}"
+            errors.iter().any(|e| e
+                .to_string()
+                .contains("exceeds max_coded_width / max_coded_height")),
+            "max_coded_width / max_coded_height error should be reported: {errors:?}"
         );
     }
 }
