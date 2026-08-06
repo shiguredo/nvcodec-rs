@@ -117,6 +117,61 @@ Step 1 で `format.display_area` を検証するのは、`state.width` / `state.
   - `- [CHANGE] DecoderConfig に max_coded_width / max_coded_height を追加してデコーダーの動的解像度変更を cuvidReconfigureDecoder で行えるようにする`
   - `  - @担当者`
 
+## 実装で判明した追加事項
+
+上記「`CUVIDRECONFIGUREDECODERINFO` の設定値」節では:
+
+- `ulTargetWidth` / `ulTargetHeight` = `format.coded_width` / `coded_height`
+- `display_area` = ゼロ埋め
+- `ulNumDecodeSurfaces` = `format.min_num_decode_surfaces`
+
+を渡す方針としていたが、実装検証で HEVC / VP9 / AV1 の縮小方向 reconfigure 直後の `cuvidDecodePicture` が `CUDA_ERROR_INVALID_VALUE` を返す事例があり、以下の 2 点で NVIDIA 公式サンプル `NvDecoder::ReconfigureDecoder` に合わせる必要があると判明した。
+
+### 追加事項 1: `ulTargetWidth` / `ulTargetHeight` と `display_area` は「作成時サイズ」に固定する
+
+出力サーフェスは `cuvidCreateDecoder` 時に `ulMaxWidth` × `ulMaxHeight` で allocate 済み。縮小方向で reconfigure の `ulTargetWidth` / `ulTargetHeight` に新 coded サイズを下げて渡すと、この出力側と不整合になり後続の `cuvidDecodePicture` が失敗しうる。NVIDIA サンプルは `m_nSurfaceWidth` / `m_nSurfaceHeight` (作成時サイズ) と `m_displayRect` を保持して reconfigure に渡す。
+
+対応:
+
+- `DecoderState` に `create_geometry: DecoderCreateGeometry` フィールドを追加し、`cuvidCreateDecoder` 成功時に `target_width` / `target_height` (= 初回 `format.coded_width` / `coded_height`) と `display_area` (`left` / `top` / `right` / `bottom`) を保存する
+- `cuvidReconfigureDecoder` 呼び出し時は `ulTargetWidth` / `ulTargetHeight` と `display_area` にこの保存値を渡す
+- 合わせて `cuvidCreateDecoder` 呼び出し時にも `display_area` を `format.display_area` から明示的に設定する (ゼロ埋めから変更)
+
+### 追加事項 2: `ulNumDecodeSurfaces` は codec 別推奨値を使う
+
+`format.min_num_decode_surfaces` (parser 報告の最小値: HEVC=8, VP9=9, AV1=9) では DPB が不足しうる。NVIDIA サンプル `NvDecoder::GetNumDecodeSurfaces` は codec 別推奨値を返す (VP9=12, HEVC=20, H.264=20, AV1=12 (仕様上の 8 参照 + 現在フレーム + 余裕), VP8=8, JPEG=1)。
+
+`ulNumDecodeSurfaces` は reconfigure で後から増やせないため、`cuvidCreateDecoder` の段階から推奨値を渡す必要がある。また `pfnSequenceCallback` の戻り値もこの値に揃える (parser がこの値で `curr_pic_idx` を割り当てるため)。
+
+対応:
+
+- `get_codec_num_decode_surfaces(codec)` と `effective_num_decode_surfaces(format, max_allowed)` helper を追加する。`effective_num_decode_surfaces` は `max(min_num_decode_surfaces, codec_recommended)` を返し、パーサ作成時の `ulMaxNumDecodeSurfaces` を上限として clamp する
+- `DecoderState` に `max_num_decode_surfaces: u32` フィールドを追加し、`config.max_num_decode_surfaces` を保存する (`effective_num_decode_surfaces` の上限として利用)
+- `cuvidCreateDecoder` の `ulNumDecodeSurfaces`、`cuvidReconfigureDecoder` の `ulNumDecodeSurfaces`、`pfnSequenceCallback` の戻り値の 3 箇所で同じ値を渡す
+
+### テストデータの解像度制約
+
+`query_decoder_caps` で得られる各コーデックのハードウェア最小デコード解像度は以下 (NVIDIA GeForce 系での実測):
+
+- HEVC: 144x144
+- VP9 / AV1: 128x128
+- H.264 / VP8: 十分小さい (実用上問題なし)
+
+解像度変更テストデータの小さい方の解像度が上記 min を下回ると、シーケンスコールバックは正常に発火して decoder 作成 / reconfigure も成功するが、その解像度での `cuvidDecodePicture` が全ピクチャで `CUDA_ERROR_INVALID_VALUE` を返す (reconfigure / destroy+create のどちらの経路でも同じ)。テストデータは全 codec の min を上回る解像度で生成する (本 issue では 256x160 を採用)。
+
+### PR マージ後のフォローアップ候補 (別 issue 化予定)
+
+本 issue の実装検証で派生的に浮上した検討事項。本 issue の範囲外だが、PR マージ後に独立した issue として起票して扱う。
+
+- **P1: reconfigure 失敗時の自動 destroy+create フォールバック機能**
+  - 現状は `cuvidReconfigureDecoder` が失敗すると Err を上位に通知するだけで、外側からフォールバックを実装するには Decoder drop + 再作成 + packet 再入力の制御が必要で重い
+  - `handle_video_sequence_inner` の reconfigure 分岐で失敗を検出したら、その場で `destroy_and_recreate_decoder` を試みて上位には Ok として返す方針を検討 (silent 自動フォールバック)
+  - デバッグ性のため「フォールバックが起きた」を後から取得できる API (例: `Decoder::last_fallback_reason()` or event 通知) を併せて設計する
+  - 破壊的変更なしで実現可能な見込み
+- **P2: `ulNumDecodeSurfaces` の codec 別推奨値化の意味論見直し**
+  - 追加事項 2 で導入した `effective_num_decode_surfaces` は「予防的措置」として同梱したが、実質的には create 時の DPB デフォルト挙動変更のため、利用側への影響 (GPU メモリ増、`max_num_decode_surfaces` の clamp 意味論追加) を独立して議論する
+  - 後方互換オプション (config で codec 推奨値を無効化できるようにするか等) の是非を検討する
+
 ## 関連 issue
 
 - 0006 (closed)
