@@ -1961,19 +1961,64 @@ mod tests {
         let data = include_bytes!("../testdata/resolution-change/h264.h264");
         let frames = split_annexb_frames(data, |nal| (nal & 0x1f) == 1 || (nal & 0x1f) == 5);
         assert_eq!(frames.len(), 45, "h264");
-        let (decoded_frames, errors) =
-            decode_resolution_change_data(DecoderCodec::H264, &frames, None, None);
+        assert_resolution_change_frames_destroy_and_recreate(DecoderCodec::H264, &frames);
+    }
+
+    #[test]
+    fn test_decode_h265_resolution_change_without_max_coded_width_height() {
+        // max_coded_width / max_coded_height を指定しない場合は従来どおり destroy+create で
+        // 解像度変化に対応する
+        let data = include_bytes!("../testdata/resolution-change/h265.h265");
+        let frames = split_annexb_frames(data, |nal| nal >> 1 <= 31);
+        assert_eq!(frames.len(), 45, "h265");
+        assert_resolution_change_frames_destroy_and_recreate(DecoderCodec::Hevc, &frames);
+    }
+
+    #[test]
+    fn test_decode_vp8_resolution_change_without_max_coded_width_height() {
+        // max_coded_width / max_coded_height を指定しない場合は従来どおり destroy+create で
+        // 解像度変化に対応する
+        let data = include_bytes!("../testdata/resolution-change/vp8.ivf");
+        let frames = split_ivf_frames(data);
+        assert_eq!(frames.len(), 45, "vp8");
+        assert_resolution_change_frames_destroy_and_recreate(DecoderCodec::Vp8, &frames);
+    }
+
+    #[test]
+    fn test_decode_vp9_resolution_change_without_max_coded_width_height() {
+        // max_coded_width / max_coded_height を指定しない場合は従来どおり destroy+create で
+        // 解像度変化に対応する
+        let data = include_bytes!("../testdata/resolution-change/vp9.ivf");
+        let frames = split_ivf_frames(data);
+        assert_eq!(frames.len(), 45, "vp9");
+        assert_resolution_change_frames_destroy_and_recreate(DecoderCodec::Vp9, &frames);
+    }
+
+    #[test]
+    fn test_decode_av1_resolution_change_without_max_coded_width_height() {
+        // max_coded_width / max_coded_height を指定しない場合は従来どおり destroy+create で
+        // 解像度変化に対応する
+        let data = include_bytes!("../testdata/resolution-change/av1.ivf");
+        let frames = split_ivf_frames(data);
+        assert_eq!(frames.len(), 45, "av1");
+        assert_resolution_change_frames_destroy_and_recreate(DecoderCodec::Av1, &frames);
+    }
+
+    /// destroy+create 経路で 45 フレーム全てがデコードされることを確認する
+    ///
+    /// display_delay=0 のためシーケンス変更時に in-flight フレームが存在せず、
+    /// フレームロスは発生しないことを期待する
+    fn assert_resolution_change_frames_destroy_and_recreate(codec: DecoderCodec, frames: &[&[u8]]) {
+        let (decoded_frames, errors) = decode_resolution_change_data(codec, frames, None, None);
 
         // エラーが 1 件も通知されないことを確認する
         assert!(errors.is_empty(), "unexpected errors: {errors:?}");
 
         // destroy+create でも全フレームがデコードされる
-        // display_delay=0 のためシーケンス変更時に in-flight フレームが存在せず、
-        // フレームロスは発生しない
         assert_eq!(
             decoded_frames.len(),
             frames.len(),
-            "all frames should be decoded: {}",
+            "all frames should be decoded (codec: {codec:?}): {}",
             decoded_frames.len()
         );
 
@@ -1985,9 +2030,9 @@ mod tests {
                 .and_modify(|c| *c += 1)
                 .or_insert(1);
         }
-        assert_eq!(size_counts.get(&(320, 240)), Some(&30), "codec: H264");
-        assert_eq!(size_counts.get(&(256, 160)), Some(&15), "codec: H264");
-        assert_eq!(size_counts.len(), 2, "codec: H264");
+        assert_eq!(size_counts.get(&(320, 240)), Some(&30), "codec: {codec:?}");
+        assert_eq!(size_counts.get(&(256, 160)), Some(&15), "codec: {codec:?}");
+        assert_eq!(size_counts.len(), 2, "codec: {codec:?}");
     }
 
     #[test]
