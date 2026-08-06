@@ -1702,7 +1702,7 @@ mod tests {
 
     /// 解像度変化ストリームのデコード結果を検証する
     ///
-    /// 全 45 フレームが 320x240 x30 と 160x120 x15 でデコードされることを確認する
+    /// 全 45 フレームが 320x240 x30 と 256x160 x15 でデコードされることを確認する
     fn assert_resolution_change_frames(
         codec: DecoderCodec,
         data: &'static [u8],
@@ -1735,7 +1735,7 @@ mod tests {
                 .or_insert(1);
         }
         assert_eq!(size_counts.get(&(320, 240)), Some(&30), "codec: {codec:?}");
-        assert_eq!(size_counts.get(&(160, 120)), Some(&15), "codec: {codec:?}");
+        assert_eq!(size_counts.get(&(256, 160)), Some(&15), "codec: {codec:?}");
         assert_eq!(size_counts.len(), 2, "codec: {codec:?}");
     }
 
@@ -1748,8 +1748,11 @@ mod tests {
 
         // 先頭フレームには SPS (NAL type 7) が含まれる
         // 先頭フレームからパラメータセットが欠落するとデコードできないため
+        // (nal_ref_idc の値はエンコーダーによって異なるため NAL type ビットのみで判定する)
         assert!(
-            frames[0].windows(4).any(|w| w == [0, 0, 1, 0x27]),
+            frames[0]
+                .windows(4)
+                .any(|w| w[..3] == [0, 0, 1] && (w[3] & 0x1f) == 7),
             "first frame should contain SPS"
         );
     }
@@ -1783,7 +1786,7 @@ mod tests {
     #[test]
     fn test_decode_h264_resolution_change_with_max_coded_width_height() {
         // max_coded_width / max_coded_height を指定して H.264 の解像度変化ストリームをデコードする
-        // 320x240 → 160x120 → 320x240 の変化を cuvidReconfigureDecoder で処理する
+        // 320x240 → 256x160 → 320x240 の変化を cuvidReconfigureDecoder で処理する
         let data = include_bytes!("../testdata/resolution-change/h264.h264");
         let frames = split_annexb_frames(data, |nal| (nal & 0x1f) == 1 || (nal & 0x1f) == 5);
         assert_eq!(frames.len(), 45, "h264");
@@ -1793,7 +1796,7 @@ mod tests {
     #[test]
     fn test_decode_h265_resolution_change_with_max_coded_width_height() {
         // max_coded_width / max_coded_height を指定して H.265 の解像度変化ストリームをデコードする
-        // 320x240 → 160x120 → 320x240 の変化を cuvidReconfigureDecoder で処理する
+        // 320x240 → 256x160 → 320x240 の変化を cuvidReconfigureDecoder で処理する
         let data = include_bytes!("../testdata/resolution-change/h265.h265");
         let frames = split_annexb_frames(data, |nal| nal >> 1 <= 31);
         assert_eq!(frames.len(), 45, "h265");
@@ -1803,7 +1806,7 @@ mod tests {
     #[test]
     fn test_decode_vp8_resolution_change_with_max_coded_width_height() {
         // max_coded_width / max_coded_height を指定して VP8 の解像度変化ストリームをデコードする
-        // 320x240 → 160x120 → 320x240 の変化を cuvidReconfigureDecoder で処理する
+        // 320x240 → 256x160 → 320x240 の変化を cuvidReconfigureDecoder で処理する
         let data = include_bytes!("../testdata/resolution-change/vp8.ivf");
         let frames = split_ivf_frames(data);
         assert_eq!(frames.len(), 45, "vp8");
@@ -1813,7 +1816,7 @@ mod tests {
     #[test]
     fn test_decode_vp9_resolution_change_with_max_coded_width_height() {
         // max_coded_width / max_coded_height を指定して VP9 の解像度変化ストリームをデコードする
-        // 320x240 → 160x120 → 320x240 の変化を cuvidReconfigureDecoder で処理する
+        // 320x240 → 256x160 → 320x240 の変化を cuvidReconfigureDecoder で処理する
         let data = include_bytes!("../testdata/resolution-change/vp9.ivf");
         let frames = split_ivf_frames(data);
         assert_eq!(frames.len(), 45, "vp9");
@@ -1823,7 +1826,7 @@ mod tests {
     #[test]
     fn test_decode_av1_resolution_change_with_max_coded_width_height() {
         // max_coded_width / max_coded_height を指定して AV1 の解像度変化ストリームをデコードする
-        // 320x240 → 160x120 → 320x240 の変化を cuvidReconfigureDecoder で処理する
+        // 320x240 → 256x160 → 320x240 の変化を cuvidReconfigureDecoder で処理する
         let data = include_bytes!("../testdata/resolution-change/av1.ivf");
         let frames = split_ivf_frames(data);
         assert_eq!(frames.len(), 45, "av1");
@@ -1833,7 +1836,7 @@ mod tests {
     #[test]
     fn test_decode_h264_resolution_change_without_max_coded_width_height() {
         // max_coded_width / max_coded_height を指定しない場合は従来どおり destroy+create で
-        // 解像度変化に対応する (フレームロスは発生する)
+        // 解像度変化に対応する
         let data = include_bytes!("../testdata/resolution-change/h264.h264");
         let frames = split_annexb_frames(data, |nal| (nal & 0x1f) == 1 || (nal & 0x1f) == 5);
         assert_eq!(frames.len(), 45, "h264");
@@ -1843,27 +1846,27 @@ mod tests {
         // エラーが 1 件も通知されないことを確認する
         assert!(errors.is_empty(), "unexpected errors: {errors:?}");
 
-        // destroy+create のため in-flight フレームが失われて 45 フレーム未満になる
-        assert!(
-            !decoded_frames.is_empty(),
-            "at least one frame should be decoded"
-        );
-        assert!(
-            decoded_frames.len() < frames.len(),
-            "destroy+create should lose in-flight frames: {}",
+        // destroy+create でも全フレームがデコードされる
+        // display_delay=0 のためシーケンス変更時に in-flight フレームが存在せず、
+        // フレームロスは発生しない
+        assert_eq!(
+            decoded_frames.len(),
+            frames.len(),
+            "all frames should be decoded: {}",
             decoded_frames.len()
         );
 
-        // デコードされたフレームはすべて有効なサイズを持つことを確認する
+        // 各フレームのサイズを検証する
+        let mut size_counts = std::collections::HashMap::new();
         for frame in &decoded_frames {
-            assert!(
-                (frame.width(), frame.height()) == (320, 240)
-                    || (frame.width(), frame.height()) == (160, 120),
-                "unexpected frame size: {}x{}",
-                frame.width(),
-                frame.height()
-            );
+            size_counts
+                .entry((frame.width(), frame.height()))
+                .and_modify(|c| *c += 1)
+                .or_insert(1);
         }
+        assert_eq!(size_counts.get(&(320, 240)), Some(&30), "codec: H264");
+        assert_eq!(size_counts.get(&(256, 160)), Some(&15), "codec: H264");
+        assert_eq!(size_counts.len(), 2, "codec: H264");
     }
 
     #[test]
