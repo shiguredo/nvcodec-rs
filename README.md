@@ -135,6 +135,8 @@ let config = DecoderConfig {
     max_num_decode_surfaces: 20,
     max_display_delay: 0,
     surface_format: SurfaceFormat::Nv12,
+    max_coded_width: None,
+    max_coded_height: None,
 };
 
 let (tx, rx) = mpsc::sync_channel(4);
@@ -290,14 +292,29 @@ let frame = rx.recv()??;
 assert_eq!(frame.width(), 1280);  // 自動的に変更される
 ```
 
+ストリーム中の解像度変化を `cuvidReconfigureDecoder` による in-place 再構成で処理する場合は、初期化時に `max_coded_width` / `max_coded_height` を設定しておく必要があります。シーケンス変更ごとのデコーダー再作成コストを削減できます。
+
+```rust
+// 作成時に最大符号化解像度を指定
+let config = DecoderConfig {
+    max_coded_width: Some(1920),
+    max_coded_height: Some(1080),
+    // ...
+};
+
+// 1920x1080 以内の解像度変化は in-place で再構成される
+```
+
+指定しない場合は従来どおり、解像度変化のたびにデコーダーを作り直します。`max_coded_width` / `max_coded_height` を超える解像度のストリームが来た場合は、エラーが通知されます。
+
 ### まとめ
 
 | | エンコーダー | デコーダー |
 |---|---|---|
-| 仕組み | `reconfigure()` で明示的に変更 | パーサーが自動検出して再作成 |
+| 仕組み | `reconfigure()` で明示的に変更 | パーサーが自動検出して再構成 |
 | 利用者の操作 | `ReconfigureParams` で新解像度を指定 | 不要 |
-| 制約 | `max_encode_width` / `max_encode_height` 以内 | なし |
-| 超えた場合 | エンコーダーを作り直す | 自動対応 |
+| 制約 | `max_encode_width` / `max_encode_height` 以内 | `max_coded_width` / `max_coded_height` 以内 |
+| 超えた場合 | エンコーダーを作り直す | エラーを通知する |
 
 ## ライセンス
 

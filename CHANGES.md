@@ -11,6 +11,8 @@
 
 ## develop
 
+- [CHANGE] `DecoderConfig` に `max_coded_width` / `max_coded_height` を追加してデコーダーの動的解像度変更を `cuvidReconfigureDecoder` で行えるようにする
+  - @sile
 - [CHANGE] MSRV (rust-version) を 1.93 に上げる
   - @voluntas
 

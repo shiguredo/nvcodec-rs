@@ -73,7 +73,7 @@ docs.rs 向けには `DOCS_RS=1 cargo doc --no-deps` でスタブヘッダー経
 | 型 | 説明 | 主要メソッド・フィールド |
 |----|------|------------------------|
 | `Decoder<H: DecodeHandler>` | デコーダー本体。内部で `nvcodec-decoder` ワーカースレッドを起動 | `new(DecoderConfig, H)`, `decode(&[u8], H::UserData)`, `flush()` |
-| `DecoderConfig` | デコーダー設定 | `codec: DecoderCodec`, `device_id`, `max_num_decode_surfaces`, `max_display_delay`, `surface_format: SurfaceFormat` |
+| `DecoderConfig` | デコーダー設定 | `codec: DecoderCodec`, `device_id`, `max_num_decode_surfaces`, `max_display_delay`, `surface_format: SurfaceFormat`, `max_coded_width: Option<u32>`, `max_coded_height: Option<u32>` |
 | `DecoderCodec` | デコーダー対応コーデック | `H264`, `Hevc`, `Av1`, `Vp8`, `Vp9`, `Jpeg` |
 | `SurfaceFormat` | 出力サーフェスフォーマット | `Nv12` のみ (他フォーマット要望時は `DecodedFrame` 拡張が必要) |
 | `DecodedFrame<T>` | デコード済みフレーム (NV12) | `y_plane()`, `uv_plane()`, `y_stride()`, `uv_stride()`, `width()`, `height()`, `user_data()`, `into_parts()` |
@@ -271,6 +271,8 @@ let config = DecoderConfig {
     max_num_decode_surfaces: 20,
     max_display_delay: 0,
     surface_format: SurfaceFormat::Nv12,
+    max_coded_width: None,
+    max_coded_height: None,
 };
 
 let (tx, rx) = mpsc::sync_channel(4);
@@ -389,7 +391,7 @@ encoder.encode(&new_frame, &EncodeOptions {
 
 ### デコーダー
 
-ストリーム中に解像度が変わった場合、内部でパーサーが検出して自動的にデコーダーを再作成する。利用者側の操作は不要。
+ストリーム中に解像度が変わった場合、内部でパーサーが検出してデコーダーを再構成する。利用者側の操作は不要。
 
 `DecodedFrame` はフレームごとに `width()` / `height()` を持つので、フレームごとにサイズを確認する。
 
@@ -403,14 +405,34 @@ let frame = rx.recv()??;
 assert_eq!(frame.width(), 1280);  // 自動的に追従
 ```
 
+再構成の方式は `max_coded_width` / `max_coded_height` の指定有無で変わる。
+
+| 設定 | 再構成方式 |
+|------|-----------|
+| `Some(v)` | `cuvidReconfigureDecoder` による in-place 再構成。デコーダー再作成コストがかからない。`v` を超える解像度のストリームが来た場合はエラーを通知する |
+| `None` | 従来どおり destroy+create。解像度変更のたびにデコーダーを作り直す |
+
+```rust
+// 作成時に最大符号化解像度を指定すると in-place 再構成が有効になる
+let config = DecoderConfig {
+    max_coded_width: Some(1920),
+    max_coded_height: Some(1080),
+    // ...
+};
+```
+
+`max_coded_width` / `max_coded_height` の指定が必要なのは、NVDEC がデコーダー作成時に内部サーフェスを最大解像度前提で確保し、`cuvidReconfigureDecoder` は作成時に宣言した `ulMaxWidth` / `ulMaxHeight` を超える解像度に変更できないため (SDK の MUST 制約)。ストリームの最大解像度を事前に知っている呼び出し側だけが宣言できる。
+
+宣言値を超えるストリームが来た場合はエラーで通知される (黙って destroy+create にフォールバックしない)。宣言した最大解像度自体を変更したい場合は `Decoder` を作り直して新しい最大解像度を宣言すること (インスタンスの作り直しは従来どおり常に可能)。
+
 ### まとめ
 
 | | エンコーダー | デコーダー |
 |---|---|---|
-| 仕組み | `reconfigure()` で明示的に変更 | パーサーが自動検出して再作成 |
+| 仕組み | `reconfigure()` で明示的に変更 | パーサーが自動検出して再構成 |
 | 利用者の操作 | `ReconfigureParams` で新解像度を指定 | 不要 |
-| 制約 | `max_encode_width` / `max_encode_height` 以内 | なし |
-| 超えた場合 | エンコーダーを作り直す | 自動対応 |
+| 制約 | `max_encode_width` / `max_encode_height` 以内 | `max_coded_width` / `max_coded_height` 以内 |
+| 超えた場合 | エンコーダーを作り直す | エラーを通知する |
 
 ## スレッドモデル
 

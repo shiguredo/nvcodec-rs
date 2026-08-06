@@ -238,6 +238,13 @@ impl CudaLibrary {
                         Error::new_custom("CudaLibrary::load", "cuvidDestroyDecoder not found")
                     })?;
 
+                let _: unsafe extern "C" fn(
+                    sys::CUvideodecoder,
+                    *mut sys::CUVIDRECONFIGUREDECODERINFO,
+                ) -> u32 = nvcuvid_lib.get(b"cuvidReconfigureDecoder").map_err(|_| {
+                    Error::new_custom("CudaLibrary::load", "cuvidReconfigureDecoder not found")
+                })?;
+
                 let _: unsafe extern "C" fn(sys::CUvideodecoder, *mut sys::CUVIDPICPARAMS) -> u32 =
                     nvcuvid_lib.get(b"cuvidDecodePicture").map_err(|_| {
                         Error::new_custom("CudaLibrary::load", "cuvidDecodePicture not found")
@@ -572,6 +579,25 @@ impl CudaLibrary {
                 .expect("cuvidDestroyDecoder should exist (checked in load())");
             let status = f(decoder);
             Error::check_cuda(status, "cuvidDestroyDecoder")
+        }
+    }
+
+    /// cuvidReconfigureDecoder を呼び出す
+    fn cuvid_reconfigure_decoder(
+        &self,
+        decoder: sys::CUvideodecoder,
+        reconfigure_info: *mut sys::CUVIDRECONFIGUREDECODERINFO,
+    ) -> Result<(), Error> {
+        unsafe {
+            let f: unsafe extern "C" fn(
+                sys::CUvideodecoder,
+                *mut sys::CUVIDRECONFIGUREDECODERINFO,
+            ) -> u32 = self
+                .nvcuvid_lib
+                .get(b"cuvidReconfigureDecoder")
+                .expect("cuvidReconfigureDecoder should exist (checked in load())");
+            let status = f(decoder, reconfigure_info);
+            Error::check_cuda(status, "cuvidReconfigureDecoder")
         }
     }
 
