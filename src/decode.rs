@@ -104,6 +104,10 @@ struct DecoderState {
     frame_rx: Receiver<Result<RawFrame, Error>>,
     max_coded_width: Option<u32>,
     max_coded_height: Option<u32>,
+    // パーサ作成時に指定した ulMaxNumDecodeSurfaces
+    // decoder の ulNumDecodeSurfaces を codec 別推奨値に引き上げる際、
+    // この値を超えないように clamp する用途で保持する
+    max_num_decode_surfaces: u32,
     // cuvidReconfigureDecoder の適用可否判定用のベースライン
     // 直近の create / reconfigure 時のコーデック情報を保存する
     reconfigure_baseline: ReconfigureBaseline,
@@ -285,6 +289,7 @@ impl DecoderState {
                 frame_rx,
                 max_coded_width: config.max_coded_width,
                 max_coded_height: config.max_coded_height,
+                max_num_decode_surfaces: config.max_num_decode_surfaces,
                 // 判定用ベースラインは初回のシーケンスコールバックで上書きされるため
                 // ここでの初期値は意味を持たない
                 reconfigure_baseline: ReconfigureBaseline::from_format(&std::mem::zeroed()),
@@ -575,7 +580,10 @@ fn handle_video_sequence_inner(
             reconfigure_info.display_area.top = state.create_geometry.display_top;
             reconfigure_info.display_area.right = state.create_geometry.display_right;
             reconfigure_info.display_area.bottom = state.create_geometry.display_bottom;
-            reconfigure_info.ulNumDecodeSurfaces = format.min_num_decode_surfaces as u32;
+            // ulNumDecodeSurfaces は create 時と同じ codec 別推奨値を渡す
+            // (parser 報告の min では DPB 不足で cuvidDecodePicture が失敗するため)
+            reconfigure_info.ulNumDecodeSurfaces =
+                effective_num_decode_surfaces(format, state.max_num_decode_surfaces);
             state
                 .lib
                 .cuvid_reconfigure_decoder(state.decoder, &mut reconfigure_info)
@@ -584,7 +592,9 @@ fn handle_video_sequence_inner(
 
     update_decoder_dimensions(state, format);
 
-    Ok(format.min_num_decode_surfaces as i32)
+    // シーケンスコールバックの戻り値は decoder の ulNumDecodeSurfaces と
+    // 同じ値でなければならない (parser がこの値で curr_pic_idx を割り当てるため)
+    Ok(effective_num_decode_surfaces(format, state.max_num_decode_surfaces) as i32)
 }
 
 /// デコーダーを新規作成する
@@ -605,7 +615,13 @@ fn create_decoder(state: &mut DecoderState, format: &sys::CUVIDEOFORMAT) -> Resu
     };
     create_info.ulNumOutputSurfaces = 2; // 出力サーフェスの数（ダブルバッファリング用に2を指定）
     create_info.ulCreationFlags = sys::cudaVideoCreateFlags_enum_cudaVideoCreate_PreferCUVID as u64; // CUVID ハードウェアデコーダーの使用を優先するフラグ
-    create_info.ulNumDecodeSurfaces = format.min_num_decode_surfaces as u64;
+    // ulNumDecodeSurfaces は codec 別の推奨値を採用する
+    // (parser 報告の min_num_decode_surfaces では HEVC/VP9/AV1 で DPB 不足になり
+    //  cuvidReconfigureDecoder 後の cuvidDecodePicture が失敗するため)
+    // なお reconfigure で ulNumDecodeSurfaces を後から増やすことはできないため、
+    // 最初の create で十分な値を確保しておく必要がある
+    create_info.ulNumDecodeSurfaces =
+        effective_num_decode_surfaces(format, state.max_num_decode_surfaces) as u64;
     create_info.ulWidth = format.coded_width as u64;
     create_info.ulHeight = format.coded_height as u64;
     create_info.ulMaxWidth = state.max_coded_width.unwrap_or(format.coded_width) as u64;
@@ -654,6 +670,45 @@ fn destroy_and_recreate_decoder(
         .with_context(state.ctx, || state.lib.cuvid_destroy_decoder(state.decoder))?;
     state.decoder = ptr::null_mut();
     create_decoder(state, format)
+}
+
+/// コーデック別の推奨デコードサーフェス数を返す
+///
+/// NVIDIA 公式サンプル NvDecoder::GetNumDecodeSurfaces に準拠する。
+/// 参照フレーム数の多い HEVC / VP9 / AV1 では parser 報告値の
+/// `min_num_decode_surfaces` (通常 8-9) では DPB が不足して
+/// 縮小方向の reconfigure 直後の cuvidDecodePicture が
+/// CUDA_ERROR_INVALID_VALUE を返すため、コーデック仕様の最大参照フレーム数に
+/// 余裕を加えた値を使う。
+///
+/// 実際に create / reconfigure に渡す値は
+/// `max(min_num_decode_surfaces, get_codec_num_decode_surfaces(...))`。
+fn get_codec_num_decode_surfaces(codec: sys::cudaVideoCodec) -> u32 {
+    // NVIDIA サンプル (NvDecoder.cpp) の GetNumDecodeSurfaces と同じ値を採用する
+    // AV1 はサンプルでは default (8) だが、仕様上 8 参照 + 現在フレーム = 9 必要なため
+    // 余裕を持たせて VP9 相当の 12 を採用する
+    match codec {
+        c if c == sys::cudaVideoCodec_enum_cudaVideoCodec_VP9 => 12,
+        c if c == sys::cudaVideoCodec_enum_cudaVideoCodec_HEVC => 20,
+        c if c == sys::cudaVideoCodec_enum_cudaVideoCodec_H264 => 20,
+        c if c == sys::cudaVideoCodec_enum_cudaVideoCodec_AV1 => 12,
+        c if c == sys::cudaVideoCodec_enum_cudaVideoCodec_VP8 => 8,
+        c if c == sys::cudaVideoCodec_enum_cudaVideoCodec_JPEG => 1,
+        // それ以外は NVIDIA サンプルの default 値
+        _ => 8,
+    }
+}
+
+/// format と codec からデコードサーフェス数を決定する
+///
+/// parser 報告の最小値と codec 別推奨値の大きい方を採用し、
+/// パーサ作成時に指定した `ulMaxNumDecodeSurfaces` を上限として clamp する
+/// (シーケンスコールバックの戻り値がパーサ上限を超えると parser が
+///  想定外の curr_pic_idx を生成する可能性があるため)
+fn effective_num_decode_surfaces(format: &sys::CUVIDEOFORMAT, max_allowed: u32) -> u32 {
+    let min = format.min_num_decode_surfaces as u32;
+    let codec_recommended = get_codec_num_decode_surfaces(format.codec);
+    min.max(codec_recommended).min(max_allowed.max(min))
 }
 
 /// max_coded_width / max_coded_height を検証する
