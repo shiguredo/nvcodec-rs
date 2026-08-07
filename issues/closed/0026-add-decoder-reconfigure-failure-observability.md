@@ -1,7 +1,10 @@
 # 0026-add-decoder-reconfigure-failure-observability
 
 - Created: 2026-08-06
+- Completed: 2026-08-07
 - Branch: feature/add-decoder-reconfigure-failure-observability
+
+**本 issue は 0027 (Decoder / Encoder 統計値 API を追加する) に吸収されました。** `Decoder::reconfigure_failure_count()` の個別 API ではなく、0027 の統一 API (`Decoder::stats() -> DecoderStats`) の一項目として `reconfigure_failure_count` を提供する方針に変更しています。`Error::function()` の pub 化については 0027 では扱わないため、必要になった段階で別 issue を起票します。
 
 ## 目的
 
