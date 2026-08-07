@@ -64,16 +64,20 @@ reconfigure / destroy+create のいずれのパスでも、成功後は現行 cr
 
 ### `CUVIDRECONFIGUREDECODERINFO` の設定値
 
-`cuvidReconfigureDecoder` に渡す `CUVIDRECONFIGUREDECODERINFO` は現行 `CUVIDDECODECREATEINFO` の初期化方針に揃える。
+`cuvidReconfigureDecoder` に渡す `CUVIDRECONFIGUREDECODERINFO` は以下のとおり。
 
 - `ulWidth` / `ulHeight` = `format.coded_width` / `coded_height`
-- `ulTargetWidth` / `ulTargetHeight` = `format.coded_width` / `coded_height` (現行 create パスと同じ)
-- `ulNumDecodeSurfaces` = `format.min_num_decode_surfaces` (現行 create パスと同じ。初回作成時より値が増えるケースの挙動は SDK doc で明言されていないが、現行 destroy+create でもシーケンス変更コールバック毎に値を渡し直しており、reconfigure でも同じ扱いで問題ない前提)
-- `display_area` / `target_rect` = ゼロ埋め (現行 create パスと同じ。`std::mem::zeroed()` で構造体全体を 0 初期化するのに任せる)
+- `ulTargetWidth` / `ulTargetHeight` = 初回 `cuvidCreateDecoder` 時の値 (`state.create_geometry` で保持)
+  - 縮小方向の解像度変更で新 coded サイズに下げると、既に allocate 済みの出力サーフェスとの不整合により `cuvidDecodePicture` が `CUDA_ERROR_INVALID_VALUE` を返すため、NVIDIA 公式サンプル `NvDecoder::ReconfigureDecoder` と同様に作成時サイズを維持する
+- `ulNumDecodeSurfaces` = `format.min_num_decode_surfaces` (本 issue のスコープ内では現行と同じ扱い。codec 別推奨値への引き上げは 0028 で対応)
+- `display_area` = 初回 `cuvidCreateDecoder` 時の値 (`state.create_geometry` で保持)
+- `target_rect` = ゼロ埋め (`std::mem::zeroed()` で構造体全体を 0 初期化するのに任せる)
 
-Step 1 で `format.display_area` を検証するのは、`state.width` / `state.height` の計算に使う `right - left` などが破綻しないことを保証するのが目的で、SDK に渡す `display_area` フィールドは Create / Reconfigure ともに現行と一致させる (ゼロ埋め)。
+Create 側も同様に `CUVIDDECODECREATEINFO.display_area` に `format.display_area` を明示設定する (以降の `cuvidReconfigureDecoder` で同じ値を再度渡す必要があるため)。
 
-`format.coded_width` / `coded_height` は `u32` だが `CUVIDRECONFIGUREDECODERINFO.ulWidth` / `ulHeight` は `unsigned int` (bindgen 生成後は `c_uint`) なので通常のキャストで問題ない。
+Step 1 で `format.display_area` を検証するのは、`state.width` / `state.height` の計算に使う `right - left` などが破綻しないことを保証するのが目的。
+
+`format.coded_width` / `coded_height` は `u32` だが `CUVIDRECONFIGUREDECODERINFO.ulWidth` / `ulHeight` は `unsigned int` (bindgen 生成後は `c_uint`) なので通常のキャストで問題ない。`display_area` は i32 → i16 のキャストになるが、`validate_display_area` で負値・逆転・coded 超過を弾いており、実用上の解像度は i16 の上限を超えないため安全。
 
 ### 失敗時の状態遷移
 
@@ -105,13 +109,30 @@ Step 1 で `format.display_area` を検証するのは、`state.width` / `state.
 
 ### 変更対象ファイル
 
-- `src/decode.rs` — `DecoderConfig` フィールド追加、`DecoderState` に判定用ベースライン (コーデック情報) 保存フィールド追加、`handle_video_sequence_inner` の分岐再構成 (`display_area` 検証・max 超過事前検証を先頭に移動、reconfigure / destroy+create の 6 ステップ分岐)、既存の struct literal 初期化コード (`test_decoder_config` 等) の更新
+- `src/decode.rs` — `DecoderConfig` フィールド追加、`DecoderState` に判定用ベースライン (コーデック情報) 保存フィールド追加、`DecoderState` に `create_geometry` (`DecoderCreateGeometry`) フィールド追加 (`cuvidCreateDecoder` 成功時に `target_width` / `target_height` / `display_area` を保存し、以降の `cuvidReconfigureDecoder` で参照する)、`handle_video_sequence_inner` の分岐再構成 (`display_area` 検証・max 超過事前検証を先頭に移動、reconfigure / destroy+create の 6 ステップ分岐)、既存の struct literal 初期化コード (`test_decoder_config` 等) の更新
 - `src/lib.rs` — `CudaLibrary::load` に `cuvidReconfigureDecoder` の存在チェック追加、`cuvid_reconfigure_decoder` ラッパー追加
+- `testdata/resolution-change/{h264.h264, h265.h265, vp8.ivf, vp9.ivf, av1.ivf}` — 320x240 x15 + 256x160 x15 + 320x240 x15 の 3 セグメント構成で新規追加 (HEVC 144x144 / VP9 / AV1 128x128 の hardware 最小デコード解像度を上回るサイズ)
+- `testdata/resolution-change/README.md` — テストデータの構造と解像度選定理由を記載
 - `README.md` — 「デコード」コード例の `DecoderConfig` struct literal に `max_coded_width` / `max_coded_height` を追記 (`None` を渡し従来動作を示す)
 - `skills/shiguredo-nvcodec/SKILL.md` — 「動的解像度変更」節 (デコーダー / まとめ表) と `DecoderConfig` 表に `max_coded_width` / `max_coded_height` を追記。デコーダーのコード例の `DecoderConfig` struct literal にも同フィールドを追記
 - `CHANGES.md` — 追記例:
   - `- [CHANGE] DecoderConfig に max_coded_width / max_coded_height を追加してデコーダーの動的解像度変更を cuvidReconfigureDecoder で行えるようにする`
   - `  - @担当者`
+
+## 実装で判明した追加事項
+
+実装検証で以下 2 点が判明した。1 点目は本 issue の設計方針節に反映済み。
+
+- **`ulTargetWidth` / `ulTargetHeight` と `display_area` は作成時サイズに固定する**: 縮小方向 reconfigure 直後の `cuvidDecodePicture` が `CUDA_ERROR_INVALID_VALUE` を返す事例があり、NVIDIA 公式サンプル準拠で作成時サイズを保持する必要があると判明。詳細は上記「`CUVIDRECONFIGUREDECODERINFO` の設定値」節を参照
+- **テストデータの解像度制約**: `query_decoder_caps` で得られる各コーデックの hardware 最小デコード解像度 (HEVC: 144x144、VP9 / AV1: 128x128) を下回るテストデータでは、シーケンスコールバックは正常に発火して decoder 作成 / reconfigure も成功するが、その解像度での `cuvidDecodePicture` が全ピクチャで `CUDA_ERROR_INVALID_VALUE` を返す (reconfigure / destroy+create のどちらの経路でも同じ)。テストデータは全 codec の min を上回る解像度で生成する (本 issue では 256x160 を採用)
+
+### 派生的な検討事項として切り出した別 issue
+
+本 issue の実装検証で派生的に浮上した検討事項は、意味論を独立議論するために別 issue として起票済み:
+
+- **0027**: `Decoder` / `Encoder` 統計値 API を追加する — 実装検証時の `#[cfg(test)]` カウンター (`create_decoder_count` / `reconfigure_decoder_count`) を pub 化して統一 API に統合する
+- **0028**: `ulNumDecodeSurfaces` を codec 別推奨値に引き上げる — 参照フレーム数の多い HEVC / VP9 / AV1 で DPB 不足リスクを低減する
+- **0029**: デコーダーのコールバックエラー通知を frame_rx から分離する — 二重通知バグと `drain_frames` scorched-earth バグを同時解消する
 
 ## 関連 issue
 
@@ -119,3 +140,6 @@ Step 1 で `format.display_area` を検証するのは、`state.width` / `state.
 - 0017 (pending): destroy-then-create 順序による復旧不能問題。本 issue マージ後の扱い:
   - 「問題 2: `display_area` 検証位置」は本 issue の Step 1 で destroy+create 経路も含めて解消される
   - 「問題 1: 順序」は依然として `max_coded_*` = `None` のフォールバック経路に残るため、0017 は pending を維持する
+- 0027: `Decoder` / `Encoder` 統計値 API 追加 (本 issue の実装検証から派生)
+- 0028: `ulNumDecodeSurfaces` codec 別推奨値化 (本 issue の実装検証から派生)
+- 0029: デコーダーのコールバックエラー通知の frame_rx 分離 (本 issue の実装検証から派生)
