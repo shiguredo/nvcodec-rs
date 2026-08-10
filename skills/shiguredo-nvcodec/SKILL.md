@@ -41,7 +41,7 @@ docs.rs 向けには `DOCS_RS=1 cargo doc --no-deps` でスタブヘッダー経
 
 | 型 | 説明 | 主要メソッド・フィールド |
 |----|------|------------------------|
-| `Encoder<H: EncodeHandler>` | エンコーダー本体。内部で `nvcodec-encoder` / `nvcodec-drain` の 2 スレッドを起動 | `new(EncoderConfig, H)`, `encode(&[u8], &EncodeOptions, H::UserData)`, `flush()`, `reconfigure(ReconfigureParams)`, `get_sequence_params()` |
+| `Encoder<H: EncodeHandler>` | エンコーダー本体。内部で `nvcodec-encoder` / `nvcodec-drain` の 2 スレッドを起動 | `new(EncoderConfig, H)`, `encode(&[u8], &EncodeOptions, H::UserData)`, `flush()`, `reconfigure(ReconfigureParams)`, `get_sequence_params()`, `stats()` |
 | `EncoderConfig` | エンコーダー設定 | `codec`, `width`, `height`, `max_encode_width`, `max_encode_height`, `framerate_num`, `framerate_den`, `average_bitrate`, `preset`, `tuning_info`, `rate_control_mode`, `gop_length`, `frame_interval_p`, `buffer_format`, `device_id` |
 | `CodecConfig` | コーデック+プロファイル設定 enum | `H264(H264EncoderConfig)`, `Hevc(HevcEncoderConfig)`, `Av1(Av1EncoderConfig)` |
 | `H264EncoderConfig` | H.264 固有設定 | `profile: Option<H264Profile>`, `idr_period: Option<u32>` |
@@ -51,6 +51,7 @@ docs.rs 向けには `DOCS_RS=1 cargo doc --no-deps` でスタブヘッダー経
 | `ReconfigureParams` | 動的再構成パラメータ (全フィールド `Option`) | `width`, `height`, `framerate_num`, `framerate_den`, `average_bitrate`, `max_bitrate` |
 | `EncodedFrame<T>` | エンコード済みフレーム | `data()`, `timestamp()`, `picture_type()`, `user_data()`, `into_parts()` |
 | `EncoderCaps` | エンコーダケーパビリティ | `supported_ratecontrol_modes`, `support_yuv444_encode`, `support_yuv422_encode`, `support_meonly_mode`, `width_max/min`, `height_max/min`, `num_max_bframes`, `support_10bit_encode`, `support_lossless_encode`, `support_lookahead`, `support_temporal_aq` |
+| `EncoderStats` | エンコーダ統計値 | counter: `encoder_buffer_full_count` / gauge: `max_in_flight_frames` |
 
 **プリセット定数** (`Preset`): `P1` (最高速) / `P2` / `P3` / `P4` (バランス) / `P5` / `P6` / `P7` (最高品質)
 
@@ -72,12 +73,13 @@ docs.rs 向けには `DOCS_RS=1 cargo doc --no-deps` でスタブヘッダー経
 
 | 型 | 説明 | 主要メソッド・フィールド |
 |----|------|------------------------|
-| `Decoder<H: DecodeHandler>` | デコーダー本体。内部で `nvcodec-decoder` ワーカースレッドを起動 | `new(DecoderConfig, H)`, `decode(&[u8], H::UserData)`, `flush()` |
+| `Decoder<H: DecodeHandler>` | デコーダー本体。内部で `nvcodec-decoder` ワーカースレッドを起動 | `new(DecoderConfig, H)`, `decode(&[u8], H::UserData)`, `flush()`, `stats()` |
 | `DecoderConfig` | デコーダー設定 | `codec: DecoderCodec`, `device_id`, `max_num_decode_surfaces`, `max_display_delay`, `surface_format: SurfaceFormat` |
 | `DecoderCodec` | デコーダー対応コーデック | `H264`, `Hevc`, `Av1`, `Vp8`, `Vp9`, `Jpeg` |
 | `SurfaceFormat` | 出力サーフェスフォーマット | `Nv12` のみ (他フォーマット要望時は `DecodedFrame` 拡張が必要) |
 | `DecodedFrame<T>` | デコード済みフレーム (NV12) | `y_plane()`, `uv_plane()`, `y_stride()`, `uv_stride()`, `width()`, `height()`, `user_data()`, `into_parts()` |
 | `DecoderCaps` | デコーダケーパビリティ | `is_supported`, `max_width`, `max_height`, `max_mb_count`, `min_width`, `min_height` |
+| `DecoderStats` | デコーダ統計値 | counter: `create_decoder_count`, `reconfigure_decoder_count`, `reconfigure_failure_count` |
 
 ### ハンドラートレイト
 
@@ -412,6 +414,42 @@ assert_eq!(frame.width(), 1280);  // 自動的に追従
 | 制約 | `max_encode_width` / `max_encode_height` 以内 | なし |
 | 超えた場合 | エンコーダーを作り直す | 自動対応 |
 
+## 統計値の取得
+
+`Decoder::stats()` / `Encoder::stats()` で、デコーダー / エンコーダーの内部状態を統計値として取得できる。
+
+- counter: 単調増加する通算値 (デコーダー作成回数、"encoder buffer is full" エラー発生回数等)
+- gauge: 現在値またはライフサイクル中変わらない静的な値 (in-flight 上限等)
+
+```rust
+use shiguredo_nvcodec::EncoderStats;
+
+// エンコーダーの統計値を取得
+let stats: EncoderStats = encoder.stats();
+println!(
+    "encoder buffer full count: {}",
+    stats.encoder_buffer_full_count
+);
+
+// in-flight 上限に基づく flush 制御のレシピ
+// max_in_flight_frames を超えて encode を連続呼び出しすると
+// "encoder buffer is full" エラーになるため、
+// 送信フレーム数が上限に達するたびに flush する
+let max_in_flight_frames = encoder.stats().max_in_flight_frames;
+let mut in_flight = 0;
+for nv12_data in frame_stream {
+    encoder.encode(&nv12_data, &options, ())?;
+    in_flight += 1;
+    if in_flight >= max_in_flight_frames {
+        encoder.flush()?;
+        in_flight = 0;
+    }
+}
+encoder.flush()?;
+```
+
+デコーダーも同様に `decoder.stats()` で統計値を取得できる。
+
 ## スレッドモデル
 
 | 構造体 | 内部スレッド | 役割 |
@@ -423,7 +461,7 @@ assert_eq!(frame.width(), 1280);  // 自動的に追従
 - `encode()` / `decode()` は内部 mpsc に送るだけで即座に戻る (非同期)
 - `flush()` は in-flight の全フレームが完了 (ハンドラ呼び出し) するまで同期的に待機
 - `Drop` 時に worker / drain スレッドを終了させ、残フレームを drain してから戻る
-- `Encoder<H>` / `Decoder<H>` は `Send` 実装。`Sync` ではない
+- `Encoder<H>` / `Decoder<H>` は `Send` 実装で、フィールドがすべて `Sync` のため自動導出で `Sync` も成立する (`Arc` 共有で他スレッドから `stats()` を呼べる)
 
 ## 既知の制限事項
 

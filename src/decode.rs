@@ -1,10 +1,11 @@
 use std::collections::VecDeque;
 use std::ffi::c_void;
 use std::ptr;
+use std::sync::Arc;
 use std::sync::mpsc::{self, Receiver, Sender, SyncSender};
 use std::thread::JoinHandle;
 
-use crate::{CudaLibrary, Error, sys};
+use crate::{CudaLibrary, Error, stats::Counter, sys};
 
 /// デコーダのケーパビリティ情報
 #[derive(Debug, Clone)]
@@ -21,6 +22,24 @@ pub struct DecoderCaps {
     pub min_width: u32,
     /// 最小デコード高さ
     pub min_height: u32,
+}
+
+/// デコーダーの統計値
+///
+/// counter は単調増加する通算値、gauge は時点値またはデコーダーの
+/// ライフサイクル中変わらない静的な値。
+#[derive(Debug, Clone)]
+pub struct DecoderStats {
+    // counter (通算値)
+    /// cuvidCreateDecoder の通算成功回数 (初回の create を含む)
+    pub create_decoder_count: u64,
+
+    /// cuvidReconfigureDecoder の通算成功回数
+    pub reconfigure_decoder_count: u64,
+
+    /// cuvidReconfigureDecoder 呼び出しの通算失敗回数
+    /// (解像度上限超過の事前検証エラーや cuvidCreateDecoder の失敗は含まない)
+    pub reconfigure_failure_count: u64,
 }
 
 /// デコーダー用コーデック識別子
@@ -90,6 +109,11 @@ struct DecoderState {
     surface_format: u32,
     frame_tx: Sender<Result<RawFrame, Error>>,
     frame_rx: Receiver<Result<RawFrame, Error>>,
+
+    // 統計値 (Decoder 構造体と Arc で共有する)
+    create_decoder_count: Arc<Counter>,
+    reconfigure_decoder_count: Arc<Counter>,
+    reconfigure_failure_count: Arc<Counter>,
 }
 
 unsafe impl Send for DecoderState {}
@@ -205,6 +229,9 @@ impl DecoderState {
                 surface_format: config.surface_format.to_sys(),
                 frame_tx,
                 frame_rx,
+                create_decoder_count: Arc::new(Counter::new()),
+                reconfigure_decoder_count: Arc::new(Counter::new()),
+                reconfigure_failure_count: Arc::new(Counter::new()),
             });
 
             // 映像パーサーを作成する
@@ -350,6 +377,9 @@ where
 pub struct Decoder<H: DecodeHandler> {
     job_tx: SyncSender<Job<H::UserData>>,
     worker: Option<JoinHandle<()>>,
+    create_decoder_count: Arc<Counter>,
+    reconfigure_decoder_count: Arc<Counter>,
+    reconfigure_failure_count: Arc<Counter>,
 }
 
 impl<H: DecodeHandler> Decoder<H> {
@@ -358,6 +388,11 @@ impl<H: DecodeHandler> Decoder<H> {
         let (job_tx, job_rx) = mpsc::sync_channel::<Job<H::UserData>>(4);
 
         let state = DecoderState::new(config)?;
+
+        // 統計用カウンターをワーカスレッド (DecoderState) と共有する
+        let create_decoder_count = state.create_decoder_count.clone();
+        let reconfigure_decoder_count = state.reconfigure_decoder_count.clone();
+        let reconfigure_failure_count = state.reconfigure_failure_count.clone();
 
         let worker = std::thread::Builder::new()
             .name("nvcodec-decoder".into())
@@ -369,7 +404,22 @@ impl<H: DecodeHandler> Decoder<H> {
         Ok(Self {
             job_tx,
             worker: Some(worker),
+            create_decoder_count,
+            reconfigure_decoder_count,
+            reconfigure_failure_count,
         })
+    }
+
+    /// デコーダーの統計値を取得する
+    ///
+    /// counter はワーカスレッドがインクリメントした通算値で、
+    /// ロックフリーの atomic load で読み出す。
+    pub fn stats(&self) -> DecoderStats {
+        DecoderStats {
+            create_decoder_count: self.create_decoder_count.get(),
+            reconfigure_decoder_count: self.reconfigure_decoder_count.get(),
+            reconfigure_failure_count: self.reconfigure_failure_count.get(),
+        }
     }
 
     /// 圧縮された映像フレームをデコードする
@@ -464,6 +514,8 @@ fn handle_video_sequence_inner(
             .lib
             .cuvid_create_decoder(&mut state.decoder, &mut create_info)
     })?;
+    // cuvidCreateDecoder の成功回数を記録する
+    state.create_decoder_count.inc();
     // display_area は signed 整数のため、壊れたストリームで負値になる可能性がある
     let left = format.display_area.left;
     let right = format.display_area.right;
@@ -1264,5 +1316,67 @@ mod tests {
             "max_height should be positive: {}",
             caps.max_height
         );
+    }
+
+    /// H.264 の黒フレームデータ (640x480) を生成する
+    ///
+    /// test_decode_h264_black_frame と同じ SPS / PPS / フレームデータを
+    /// Annex B 形式 (start code 0x00000001) で結合する。
+    fn h264_black_frame_data() -> Vec<u8> {
+        let sps = vec![
+            103, 100, 0, 30, 172, 217, 64, 160, 61, 176, 17, 0, 0, 3, 0, 1, 0, 0, 3, 0, 50, 15, 22,
+            45, 150,
+        ];
+        let pps = vec![104, 235, 227, 203, 34, 192];
+        let frame_data = vec![
+            101, 136, 132, 0, 43, 255, 254, 246, 115, 124, 10, 107, 109, 176, 149, 46, 5, 118, 247,
+            102, 163, 229, 208, 146, 229, 251, 16, 96, 250, 208, 0, 0, 3, 0, 0, 3, 0, 0, 16, 15,
+            210, 222, 245, 204, 98, 91, 229, 32, 0, 0, 9, 216, 2, 56, 13, 16, 118, 133, 116, 69,
+            196, 32, 71, 6, 120, 150, 16, 161, 210, 50, 128, 0, 0, 3, 0, 0, 3, 0, 0, 3, 0, 0, 3, 0,
+            0, 3, 0, 0, 3, 0, 0, 3, 0, 0, 3, 0, 0, 3, 0, 37, 225,
+        ];
+
+        let mut h264_data = Vec::new();
+        let start_code = [0u8, 0, 0, 1];
+
+        h264_data.extend_from_slice(&start_code);
+        h264_data.extend_from_slice(&sps);
+        h264_data.extend_from_slice(&start_code);
+        h264_data.extend_from_slice(&pps);
+        h264_data.extend_from_slice(&start_code);
+        h264_data.extend_from_slice(&frame_data);
+
+        h264_data
+    }
+
+    /// stats() で create_decoder_count が取得できることを確認する
+    ///
+    /// デコード前は 0 であり、シーケンスコールバックで
+    /// cuvidCreateDecoder が呼ばれると 1 になる。
+    #[test]
+    fn test_decoder_stats_create_decoder_count() {
+        let config = test_decoder_config(DecoderCodec::H264);
+        let (tx, _rx) = mpsc::sync_channel::<Result<DecodedFrame<()>, Error>>(4);
+        let decoder = Decoder::new(
+            config,
+            FnDecodeHandler::new(move |frame| {
+                let _ = tx.send(frame);
+            }),
+        )
+        .expect("H.264 デコーダーの作成に失敗した");
+
+        // デコード前は cuvidCreateDecoder が呼ばれていない
+        assert_eq!(decoder.stats().create_decoder_count, 0);
+
+        // デコードを実行
+        decoder
+            .decode(&h264_black_frame_data(), ())
+            .expect("H.264 データのデコードに失敗した");
+        decoder.flush().expect("flush に失敗した");
+
+        // シーケンスコールバックで cuvidCreateDecoder が 1 回呼ばれる
+        assert_eq!(decoder.stats().create_decoder_count, 1);
+
+        drop(decoder);
     }
 }

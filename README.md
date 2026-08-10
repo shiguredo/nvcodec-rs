@@ -299,6 +299,42 @@ assert_eq!(frame.width(), 1280);  // 自動的に変更される
 | 制約 | `max_encode_width` / `max_encode_height` 以内 | なし |
 | 超えた場合 | エンコーダーを作り直す | 自動対応 |
 
+## 統計値の取得
+
+`Decoder::stats()` / `Encoder::stats()` で、デコーダー / エンコーダーの内部状態を統計値として取得できます。
+
+- counter: 単調増加する通算値 (デコーダー作成回数、"encoder buffer is full" エラー発生回数等)
+- gauge: 現在値またはライフサイクル中変わらない静的な値 (in-flight 上限等)
+
+```rust
+use shiguredo_nvcodec::EncoderStats;
+
+// エンコーダーの統計値を取得
+let stats: EncoderStats = encoder.stats();
+println!(
+    "encoder buffer full count: {}",
+    stats.encoder_buffer_full_count
+);
+
+// in-flight 上限に基づく flush 制御のレシピ
+// max_in_flight_frames を超えて encode を連続呼び出しすると
+// "encoder buffer is full" エラーになるため、
+// 送信フレーム数が上限に達するたびに flush する
+let max_in_flight_frames = encoder.stats().max_in_flight_frames;
+let mut in_flight = 0;
+for nv12_data in frame_stream {
+    encoder.encode(&nv12_data, &options, ())?;
+    in_flight += 1;
+    if in_flight >= max_in_flight_frames {
+        encoder.flush()?;
+        in_flight = 0;
+    }
+}
+encoder.flush()?;
+```
+
+デコーダーも同様に `decoder.stats()` で統計値を取得できます。
+
 ## ライセンス
 
 Apache License 2.0
