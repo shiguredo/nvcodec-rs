@@ -2,6 +2,7 @@
 
 - Created: 2026-08-07
 - Branch: feature/add-decoder-encoder-stats-api
+- Polished: 2026-08-10
 
 ## 目的
 
@@ -53,7 +54,7 @@ pub struct EncoderStats {
     pub encoder_buffer_full_count: u64,
 
     // gauge (encoder のライフサイクル中変わらない静的な値)
-    /// 利用側が flush せずに encode を連続呼び出しできる最大フレーム数
+    /// "encoder buffer is full" エラーを発生させずに in-flight にできる最大フレーム数
     /// (n_encoder_buffer - 1 = frame_interval_p + 2)
     pub max_in_flight_frames: u32,
 }
@@ -69,7 +70,7 @@ pub struct EncoderStats {
 | `DecoderStats` | counter | `reconfigure_decoder_count` | cuvidReconfigureDecoder の通算成功回数 |
 | `DecoderStats` | counter | `reconfigure_failure_count` | cuvidReconfigureDecoder 呼び出しの通算失敗回数 |
 | `EncoderStats` | counter | `encoder_buffer_full_count` | "encoder buffer is full" エラーの通算発生回数 |
-| `EncoderStats` | gauge (静的) | `max_in_flight_frames` | flush せずに encode を連続呼び出しできる最大フレーム数 (`frame_interval_p + 2`) |
+| `EncoderStats` | gauge (静的) | `max_in_flight_frames` | "encoder buffer is full" エラーを発生させずに in-flight にできる最大フレーム数 (`n_encoder_buffer - 1` = `frame_interval_p + 2`) |
 
 #### 将来拡張候補 (本 issue では実装しない)
 
@@ -103,6 +104,7 @@ pub struct EncoderStats {
 - **counter**: 新規 `src/stats.rs` に `Counter` 型 (`AtomicU64` の薄いラッパー、`const fn new()` / `get()` / `inc()`、すべて relaxed order) を追加し、`DecoderState` / `EncoderState` と `Decoder` / `Encoder` (pub 構造体) が `Arc<Counter>` で共有する。worker スレッド側が `inc()` でインクリメントし、`stats()` は各 counter の `get()` で読み出して値型の `DecoderStats` / `EncoderStats` を組み立てて返す
 - **gauge (静的)**: encoder 生成時に確定する値は、`Encoder` 構造体の `u32` フィールドとして持たせ、cheap read で返す (atomic 不要)
 - **gauge (動的)**: 現状スコープ外だが、追加する場合は `Counter` と同様に `src/stats.rs` に `Gauge` 型 (`AtomicU64` / `AtomicU32` の薄いラッパー) を追加して対応する想定
+- **呼び出しスレッド**: `Decoder` / `Encoder` はフィールド (`SyncSender` / `Sender` / `Option<JoinHandle>` / `Arc<Counter>` / `u32`) がすべて `Sync` のため、自動導出で既に `Sync` である (unsafe impl の追加は不要)。`stats()` は `&self` で呼べるため、`Arc<Decoder>` / `Arc<Encoder>` をメトリクス収集スレッド等へ共有すれば他スレッドから呼べる
 
 いずれも以下の要件を満たす:
 
@@ -128,6 +130,7 @@ pub struct EncoderStats {
   - counter: `encoder_buffer_full_count`
   - gauge: `max_in_flight_frames`
 - counter は `src/stats.rs` の `Counter` 型 (`AtomicU64` の薄いラッパー) で実装され、`stats()` がロックフリーかつ軽量である
+- `Decoder` / `Encoder` は既に `Sync` であり、他スレッド (メトリクス収集スレッド等) から `&Decoder` / `&Encoder` 経由で `stats()` を呼べる
 - 単体テスト or 結合テストがある (`create_decoder_count` / `encoder_buffer_full_count` のインクリメント検証 + `max_in_flight_frames` の値検証)
 - `CHANGES.md` に `[ADD]` エントリが追加されている
 - `README.md` / `skills/shiguredo-nvcodec/SKILL.md` に統計値取得の例と「in-flight 上限に基づく flush 制御」のレシピが追記されている
@@ -139,6 +142,7 @@ pub struct EncoderStats {
 ### 変更対象ファイル
 
 - `src/stats.rs` — `Counter` 型 (新規追加)。doc コメントで将来の `Gauge` 型追加余地を明記
+- `src/lib.rs` — `mod stats;` の追加と `DecoderStats` / `EncoderStats` の re-export 追加
 - `src/decode.rs` — `DecoderStats` 定義、`DecoderState` に `Arc<Counter>` フィールド追加、`Decoder` 構造体に `Arc<Counter>` フィールド追加、`Decoder::stats()` 追加、`handle_video_sequence_inner` の create 成功後にインクリメント
 - `src/encode.rs` — `EncoderStats` 定義、`EncoderState` に `Arc<Counter>` フィールド追加、`Encoder` 構造体に `Arc<Counter>` / `max_in_flight_frames: u32` フィールド追加、`Encoder::stats()` 追加、`encoder buffer is full` 発生箇所でインクリメント
 - `README.md` / `skills/shiguredo-nvcodec/SKILL.md` — 統計値取得節の追加 + in-flight 制御のレシピ
@@ -148,5 +152,5 @@ pub struct EncoderStats {
 
 ## 関連 issue
 
-- 0024: 本 issue の派生元 (0024 の実装検証で追加した `#[cfg(test)]` カウンターが本 API の発想の元)。ただし本 issue は 0024 とは独立して develop ベースで進める。0024 が develop にマージされた時点で、0024 側が `#[cfg(test)]` カウンターを削除して本 API に統合し、`reconfigure_decoder_count` / `reconfigure_failure_count` のインクリメントを追加する
+- 0024: 本 issue の派生元 (0024 の実装検証で追加した `#[cfg(test)]` カウンターが本 API の発想の元)。ただし本 issue は 0024 とは独立して develop ベースで進める。0024 が develop にマージされる際に、0024 側が `#[cfg(test)]` カウンターを削除して本 API に統合し、`reconfigure_decoder_count` / `reconfigure_failure_count` のインクリメントを追加する。なお 0024 の issue の関連 issue 節には「0027 がカウンターを統合する」と記載されているが、独立方針のため実際の統合は 0024 のマージ時作業となり、0024 の issue の該当記述は 0024 実装時に整合させること
 - 0026 (closed): `Decoder::reconfigure_failure_count()` の個別 API 案。本 issue に吸収して close 済み
