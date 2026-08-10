@@ -27,6 +27,7 @@ pub use encode::{
     RateControlMode, ReconfigureParams, TuningInfo, query_encoder_caps,
 };
 pub use error::Error;
+pub use stats::Counter;
 
 /// ビルド時に参照したバージョン
 pub const BUILD_VERSION: &str = sys::BUILD_METADATA_VERSION;

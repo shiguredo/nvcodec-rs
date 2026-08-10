@@ -1,7 +1,6 @@
 use std::collections::VecDeque;
 use std::ffi::c_void;
 use std::ptr;
-use std::sync::Arc;
 use std::sync::mpsc::{self, Receiver, Sender, SyncSender};
 use std::thread::JoinHandle;
 
@@ -399,18 +398,35 @@ pub struct EncoderCaps {
 
 /// エンコーダの統計値
 ///
-/// counter は単調増加する通算値、gauge は時点値またはエンコーダーの
-/// ライフサイクル中変わらない静的な値。
+/// 統計値は常に [`Counter`] 型で表現する。フィールドはワーカスレッドが
+/// インクリメントする共有カウンターであり、`get()` で現在値を読み出す。
+/// `max_in_flight_frames` は生成時に確定する静的な値だが、統一性のため
+/// [`Counter`] 型で表現する。
 #[derive(Debug, Clone)]
 pub struct EncoderStats {
     // counter
     /// "encoder buffer is full" エラーの通算発生回数
-    pub encoder_buffer_full_count: u64,
+    pub encoder_buffer_full_count: Counter,
 
     // gauge (encoder のライフサイクル中変わらない静的な値)
     /// "encoder buffer is full" エラーを発生させずに in-flight にできる最大フレーム数
     /// (n_encoder_buffer - 1 = frame_interval_p + 2)
-    pub max_in_flight_frames: u32,
+    pub max_in_flight_frames: Counter,
+}
+
+impl EncoderStats {
+    /// すべて 0 で初期化した統計値を作成する
+    ///
+    /// `max_in_flight_frames` には `frame_interval_p + 2` を設定する
+    /// (n_encoder_buffer = frame_interval_p + 3 のバッファを 1 つ空けて運用する)
+    fn new(frame_interval_p: u32) -> Self {
+        let max_in_flight_frames = Counter::new();
+        max_in_flight_frames.add(frame_interval_p as u64 + 2);
+        Self {
+            encoder_buffer_full_count: Counter::new(),
+            max_in_flight_frames,
+        }
+    }
 }
 
 /// エンコーダ再構成パラメータ
@@ -486,8 +502,8 @@ struct EncoderState {
     i_got: usize,
     mapped_inputs: Vec<Option<sys::NV_ENC_INPUT_PTR>>,
 
-    // 統計値 (Encoder 構造体と Arc で共有する)
-    encoder_buffer_full_count: Arc<Counter>,
+    // 統計値 (Encoder 構造体と clone で共有する)
+    stats: EncoderStats,
 }
 
 unsafe impl Send for EncoderState {}
@@ -553,7 +569,7 @@ impl EncoderState {
                 i_to_send: 0,
                 i_got: 0,
                 mapped_inputs: vec![None; n_encoder_buffer],
-                encoder_buffer_full_count: Arc::new(Counter::new()),
+                stats: EncoderStats::new(config.frame_interval_p),
             };
 
             // デフォルトパラメータでエンコーダーを初期化
@@ -1219,8 +1235,7 @@ pub struct Encoder<H: EncodeHandler> {
     job_tx: Sender<Job<H::UserData>>,
     worker: Option<JoinHandle<()>>,
     drain_handle: Option<JoinHandle<()>>,
-    encoder_buffer_full_count: Arc<Counter>,
-    max_in_flight_frames: u32,
+    stats: EncoderStats,
 }
 
 /// drain スレッドへのリクエスト
@@ -1281,10 +1296,7 @@ impl<H: EncodeHandler> Encoder<H> {
         let state = EncoderState::new(&config)?;
 
         // 統計用カウンターをワーカスレッド (EncoderState) と共有する
-        let encoder_buffer_full_count = state.encoder_buffer_full_count.clone();
-        // in-flight の上限は frame_interval_p + 2
-        // (n_encoder_buffer = frame_interval_p + 3 のバッファを 1 つ空けて運用する)
-        let max_in_flight_frames = config.frame_interval_p + 2;
+        let stats = state.stats.clone();
 
         // drain スレッドを起動
         let drain_job_tx = job_tx.clone();
@@ -1307,8 +1319,7 @@ impl<H: EncodeHandler> Encoder<H> {
             job_tx,
             worker: Some(worker),
             drain_handle: Some(drain_handle),
-            encoder_buffer_full_count,
-            max_in_flight_frames,
+            stats,
         })
     }
 
@@ -1316,11 +1327,8 @@ impl<H: EncodeHandler> Encoder<H> {
     ///
     /// counter はワーカスレッドがインクリメントした通算値で、
     /// ロックフリーの atomic load で読み出す。
-    pub fn stats(&self) -> EncoderStats {
-        EncoderStats {
-            encoder_buffer_full_count: self.encoder_buffer_full_count.get(),
-            max_in_flight_frames: self.max_in_flight_frames,
-        }
+    pub fn stats(&self) -> &EncoderStats {
+        &self.stats
     }
 
     /// フレームをエンコードする
@@ -1611,7 +1619,7 @@ fn run_worker<H>(
                 // バッファが満杯の場合はエラー callback を実行する
                 if state.i_to_send - state.i_got >= state.n_encoder_buffer {
                     // "encoder buffer is full" の発生回数を記録する
-                    state.encoder_buffer_full_count.inc();
+                    state.stats.encoder_buffer_full_count.inc();
                     handler.on_encoded(Err(
                         Error::new_custom("encode", "encoder buffer is full").into()
                     ));
@@ -2972,7 +2980,7 @@ mod tests {
         .expect("H.264 エンコーダーの作成に失敗した");
 
         // max_in_flight_frames = frame_interval_p + 2 = 3
-        assert_eq!(encoder.stats().max_in_flight_frames, 3);
+        assert_eq!(encoder.stats().max_in_flight_frames.get(), 3);
 
         drop(encoder);
     }
@@ -3027,7 +3035,8 @@ mod tests {
         // stats のカウンターと通知されたエラー数が一致することを確認する
         let stats = encoder.stats();
         assert_eq!(
-            stats.encoder_buffer_full_count, error_count as u64,
+            stats.encoder_buffer_full_count.get(),
+            error_count as u64,
             "encoder_buffer_full_count が通知されたエラー数と一致しない"
         );
         assert!(error_count > 0, "buffer full エラーが 1 件も発生しなかった");

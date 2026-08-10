@@ -1,7 +1,6 @@
 use std::collections::VecDeque;
 use std::ffi::c_void;
 use std::ptr;
-use std::sync::Arc;
 use std::sync::mpsc::{self, Receiver, Sender, SyncSender};
 use std::thread::JoinHandle;
 
@@ -26,20 +25,49 @@ pub struct DecoderCaps {
 
 /// デコーダーの統計値
 ///
-/// counter は単調増加する通算値、gauge は時点値またはデコーダーの
-/// ライフサイクル中変わらない静的な値。
+/// 統計値は常に [`Counter`] 型で表現する。フィールドはワーカスレッドが
+/// インクリメントする共有カウンターであり、`get()` で現在値を読み出す。
+/// `decode_count - output_frame_count` で、入力されたがまだ出力されていない
+/// フレーム数 (in-flight 相当) を導出できる。
 #[derive(Debug, Clone)]
 pub struct DecoderStats {
     // counter (通算値)
     /// cuvidCreateDecoder の通算成功回数 (初回の create を含む)
-    pub create_decoder_count: u64,
+    pub create_decoder_count: Counter,
 
     /// cuvidReconfigureDecoder の通算成功回数
-    pub reconfigure_decoder_count: u64,
+    pub reconfigure_decoder_count: Counter,
 
     /// cuvidReconfigureDecoder 呼び出しの通算失敗回数
     /// (解像度上限超過の事前検証エラーや cuvidCreateDecoder の失敗は含まない)
-    pub reconfigure_failure_count: u64,
+    pub reconfigure_failure_count: Counter,
+
+    /// decode() の通算呼び出し回数 (入力フレーム数)
+    pub decode_count: Counter,
+
+    /// シーケンスコールバックの通算回数 (解像度変更の回数)
+    pub sequence_callback_count: Counter,
+
+    /// デコードコールバックの通算回数 (cuvidDecodePicture の実行回数)
+    pub decode_callback_count: Counter,
+
+    /// 出力フレーム数 (表示コールバックの通算回数)
+    pub output_frame_count: Counter,
+}
+
+impl DecoderStats {
+    /// すべて 0 で初期化した統計値を作成する
+    fn new() -> Self {
+        Self {
+            create_decoder_count: Counter::new(),
+            reconfigure_decoder_count: Counter::new(),
+            reconfigure_failure_count: Counter::new(),
+            decode_count: Counter::new(),
+            sequence_callback_count: Counter::new(),
+            decode_callback_count: Counter::new(),
+            output_frame_count: Counter::new(),
+        }
+    }
 }
 
 /// デコーダー用コーデック識別子
@@ -110,10 +138,8 @@ struct DecoderState {
     frame_tx: Sender<Result<RawFrame, Error>>,
     frame_rx: Receiver<Result<RawFrame, Error>>,
 
-    // 統計値 (Decoder 構造体と Arc で共有する)
-    create_decoder_count: Arc<Counter>,
-    reconfigure_decoder_count: Arc<Counter>,
-    reconfigure_failure_count: Arc<Counter>,
+    // 統計値 (Decoder 構造体と clone で共有する)
+    stats: DecoderStats,
 }
 
 unsafe impl Send for DecoderState {}
@@ -229,9 +255,7 @@ impl DecoderState {
                 surface_format: config.surface_format.to_sys(),
                 frame_tx,
                 frame_rx,
-                create_decoder_count: Arc::new(Counter::new()),
-                reconfigure_decoder_count: Arc::new(Counter::new()),
-                reconfigure_failure_count: Arc::new(Counter::new()),
+                stats: DecoderStats::new(),
             });
 
             // 映像パーサーを作成する
@@ -377,9 +401,7 @@ where
 pub struct Decoder<H: DecodeHandler> {
     job_tx: SyncSender<Job<H::UserData>>,
     worker: Option<JoinHandle<()>>,
-    create_decoder_count: Arc<Counter>,
-    reconfigure_decoder_count: Arc<Counter>,
-    reconfigure_failure_count: Arc<Counter>,
+    stats: DecoderStats,
 }
 
 impl<H: DecodeHandler> Decoder<H> {
@@ -390,9 +412,7 @@ impl<H: DecodeHandler> Decoder<H> {
         let state = DecoderState::new(config)?;
 
         // 統計用カウンターをワーカスレッド (DecoderState) と共有する
-        let create_decoder_count = state.create_decoder_count.clone();
-        let reconfigure_decoder_count = state.reconfigure_decoder_count.clone();
-        let reconfigure_failure_count = state.reconfigure_failure_count.clone();
+        let stats = state.stats.clone();
 
         let worker = std::thread::Builder::new()
             .name("nvcodec-decoder".into())
@@ -404,9 +424,7 @@ impl<H: DecodeHandler> Decoder<H> {
         Ok(Self {
             job_tx,
             worker: Some(worker),
-            create_decoder_count,
-            reconfigure_decoder_count,
-            reconfigure_failure_count,
+            stats,
         })
     }
 
@@ -414,12 +432,8 @@ impl<H: DecodeHandler> Decoder<H> {
     ///
     /// counter はワーカスレッドがインクリメントした通算値で、
     /// ロックフリーの atomic load で読み出す。
-    pub fn stats(&self) -> DecoderStats {
-        DecoderStats {
-            create_decoder_count: self.create_decoder_count.get(),
-            reconfigure_decoder_count: self.reconfigure_decoder_count.get(),
-            reconfigure_failure_count: self.reconfigure_failure_count.get(),
-        }
+    pub fn stats(&self) -> &DecoderStats {
+        &self.stats
     }
 
     /// 圧縮された映像フレームをデコードする
@@ -432,7 +446,10 @@ impl<H: DecodeHandler> Decoder<H> {
                 data: data.to_vec(),
                 user_data,
             })
-            .map_err(|_| Error::new_custom("decode", "decoder worker thread has terminated"))
+            .map_err(|_| Error::new_custom("decode", "decoder worker thread has terminated"))?;
+        // 入力フレーム数 (ジョブ送信数) を記録する
+        self.stats.decode_count.inc();
+        Ok(())
     }
 
     /// 送信済みの未完了フレームがすべて完了するまで待機する
@@ -476,6 +493,8 @@ fn handle_video_sequence_inner(
     state: &mut DecoderState,
     format: &sys::CUVIDEOFORMAT,
 ) -> Result<i32, Error> {
+    // シーケンスコールバックの呼び出し回数を記録する
+    state.stats.sequence_callback_count.inc();
     // デコーダーが既に作成されている場合は破棄して再作成する
     // ストリーム中の解像度変更に対応するため
     if !state.decoder.is_null() {
@@ -515,7 +534,7 @@ fn handle_video_sequence_inner(
             .cuvid_create_decoder(&mut state.decoder, &mut create_info)
     })?;
     // cuvidCreateDecoder の成功回数を記録する
-    state.create_decoder_count.inc();
+    state.stats.create_decoder_count.inc();
     // display_area は signed 整数のため、壊れたストリームで負値になる可能性がある
     let left = format.display_area.left;
     let right = format.display_area.right;
@@ -596,6 +615,8 @@ fn handle_picture_decode_inner(
     state: &mut DecoderState,
     pic_params: &sys::CUVIDPICPARAMS,
 ) -> Result<(), Error> {
+    // デコードコールバックの呼び出し回数を記録する
+    state.stats.decode_callback_count.inc();
     if state.decoder.is_null() {
         return Err(Error::new_custom(
             "handle_picture_decode",
@@ -679,6 +700,8 @@ fn handle_picture_display_inner(
         })
     })?;
 
+    // 出力フレーム数を記録する
+    state.stats.output_frame_count.inc();
     // チャンネル経由で送信 (受信側が破棄されている場合の送信エラーは無視)
     let _ = state.frame_tx.send(Ok(decoded_frame));
 
@@ -1351,12 +1374,16 @@ mod tests {
         h264_data
     }
 
-    /// stats() で create_decoder_count が取得できることを確認する
+    /// stats() でデコーダーの統計値が取得できることを確認する
     ///
-    /// デコード前は 0 であり、シーケンスコールバックで
-    /// cuvidCreateDecoder が呼ばれると 1 になる。
+    /// H.264 の 1 フレームをデコードすると:
+    /// - create_decoder_count が 1 (シーケンスコールバックで cuvidCreateDecoder が 1 回呼ばれる)
+    /// - decode_count が 1 (decode() を 1 回呼んだ)
+    /// - sequence_callback_count が 1 (シーケンスコールバックが 1 回呼ばれる)
+    /// - decode_callback_count が 1 (デコードコールバックが 1 回呼ばれる)
+    /// - output_frame_count が 1 (1 フレームが出力される)
     #[test]
-    fn test_decoder_stats_create_decoder_count() {
+    fn test_decoder_stats_counters() {
         let config = test_decoder_config(DecoderCodec::H264);
         let (tx, _rx) = mpsc::sync_channel::<Result<DecodedFrame<()>, Error>>(4);
         let decoder = Decoder::new(
@@ -1367,8 +1394,12 @@ mod tests {
         )
         .expect("H.264 デコーダーの作成に失敗した");
 
-        // デコード前は cuvidCreateDecoder が呼ばれていない
-        assert_eq!(decoder.stats().create_decoder_count, 0);
+        // デコード前はすべて 0 である
+        assert_eq!(decoder.stats().create_decoder_count.get(), 0);
+        assert_eq!(decoder.stats().decode_count.get(), 0);
+        assert_eq!(decoder.stats().sequence_callback_count.get(), 0);
+        assert_eq!(decoder.stats().decode_callback_count.get(), 0);
+        assert_eq!(decoder.stats().output_frame_count.get(), 0);
 
         // デコードを実行
         decoder
@@ -1377,7 +1408,15 @@ mod tests {
         decoder.flush().expect("flush に失敗した");
 
         // シーケンスコールバックで cuvidCreateDecoder が 1 回呼ばれる
-        assert_eq!(decoder.stats().create_decoder_count, 1);
+        assert_eq!(decoder.stats().create_decoder_count.get(), 1);
+        // decode() を 1 回呼んだ
+        assert_eq!(decoder.stats().decode_count.get(), 1);
+        // シーケンスコールバックが 1 回呼ばれる
+        assert_eq!(decoder.stats().sequence_callback_count.get(), 1);
+        // デコードコールバックが 1 回呼ばれる
+        assert_eq!(decoder.stats().decode_callback_count.get(), 1);
+        // 1 フレームが出力される
+        assert_eq!(decoder.stats().output_frame_count.get(), 1);
 
         drop(decoder);
     }

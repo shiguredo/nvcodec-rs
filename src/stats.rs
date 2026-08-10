@@ -1,45 +1,48 @@
 //! 統計値取得用のプリミティブ型
 
+use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-/// 単調増加する通算カウンター
+/// 共有可能な単調増加カウンター
 ///
-/// `AtomicU64` の薄いラッパー。カウンターは純粋な累積値であり、
-/// スレッド間の happens-before 関係を要求しないため、すべての操作を
-/// relaxed order で行う。
+/// 統計値はすべてこの型で表現する。内部で `Arc<AtomicU64>` を持ち、
+/// `clone()` で同じカウンターを共有できる。ワーカスレッドが `inc()` で
+/// インクリメントし、利用側が `get()` で読み出す。
 ///
-/// ワーカスレッドが `inc()` でインクリメントし、利用側が `get()` で
-/// 読み出す。`Arc<Counter>` で共有することで、ワーカスレッドと
-/// 利用側の両方から同じカウンターにアクセスできる。
-///
-/// 将来、現在値を表す gauge が必要になった場合は、このモジュールに
-/// `Gauge` 型 (`AtomicU64` / `AtomicU32` の薄いラッパー) を追加する想定。
-#[derive(Debug, Default)]
-pub(crate) struct Counter(AtomicU64);
+/// カウンターは純粋な累積値であり、スレッド間の happens-before 関係を
+/// 要求しないため、すべての操作を relaxed order で行う。
+#[derive(Debug, Clone, Default)]
+pub struct Counter(Arc<AtomicU64>);
 
 impl Counter {
     /// 0 で初期化したカウンターを生成する
-    pub(crate) const fn new() -> Self {
-        Self(AtomicU64::new(0))
+    pub fn new() -> Self {
+        Self(Arc::new(AtomicU64::new(0)))
     }
 
     /// 現在の値を読み出す
     ///
     /// relaxed order の atomic load で、単純な `u64` のスナップショットを返す
-    pub(crate) fn get(&self) -> u64 {
+    pub fn get(&self) -> u64 {
         self.0.load(Ordering::Relaxed)
     }
 
     /// カウンターを 1 増やす
-    pub(crate) fn inc(&self) {
+    pub fn inc(&self) {
         self.0.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// カウンターに `n` を加算する
+    ///
+    /// 生成時に確定する値 (例: `max_in_flight_frames`) の初期化に使う
+    pub fn add(&self, n: u64) {
+        self.0.fetch_add(n, Ordering::Relaxed);
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::Arc;
 
     /// 生成直後のカウンターは 0 である
     #[test]
@@ -58,10 +61,19 @@ mod tests {
         assert_eq!(counter.get(), 3);
     }
 
-    /// Arc で共有したカウンターは両方の参照から同じ値が見える
+    /// add() で指定した値が加算される
     #[test]
-    fn counter_shared_via_arc() {
-        let counter = Arc::new(Counter::new());
+    fn counter_add_increments_by_n() {
+        let counter = Counter::new();
+        counter.add(5);
+        counter.add(7);
+        assert_eq!(counter.get(), 12);
+    }
+
+    /// clone したカウンターは同じ値を共有する
+    #[test]
+    fn counter_clone_shares_value() {
+        let counter = Counter::new();
         let counter_clone = counter.clone();
 
         counter_clone.inc();
