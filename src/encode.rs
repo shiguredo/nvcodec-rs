@@ -2739,9 +2739,10 @@ mod tests {
             "encode() failed: encoder worker thread has terminated"
         );
 
-        unsafe {
-            ManuallyDrop::drop(&mut encoder);
-        }
+        // encoder は上で drop 済みのため、ここで再度 ManuallyDrop::drop を
+        // 呼ぶとフィールドが二重ドロップされて解放済みメモリを破壊する。
+        // ManuallyDrop の Drop は中身をドロップしないため、
+        // そのままテストを終了しても二重ドロップにはならない。
     }
 
     #[test]
@@ -2772,9 +2773,10 @@ mod tests {
             "flush() failed: send failed"
         );
 
-        unsafe {
-            ManuallyDrop::drop(&mut encoder);
-        }
+        // encoder は上で drop 済みのため、ここで再度 ManuallyDrop::drop を
+        // 呼ぶとフィールドが二重ドロップされて解放済みメモリを破壊する。
+        // ManuallyDrop の Drop は中身をドロップしないため、
+        // そのままテストを終了しても二重ドロップにはならない。
     }
 
     #[test]
@@ -2805,9 +2807,10 @@ mod tests {
             "reconfigure() failed: send failed"
         );
 
-        unsafe {
-            ManuallyDrop::drop(&mut encoder);
-        }
+        // encoder は上で drop 済みのため、ここで再度 ManuallyDrop::drop を
+        // 呼ぶとフィールドが二重ドロップされて解放済みメモリを破壊する。
+        // ManuallyDrop の Drop は中身をドロップしないため、
+        // そのままテストを終了しても二重ドロップにはならない。
     }
 
     /// drain スレッドによってコールバックハンドラが遅延なく発火することを確認する
@@ -2927,9 +2930,10 @@ mod tests {
             "get_sequence_params() failed: send failed"
         );
 
-        unsafe {
-            ManuallyDrop::drop(&mut encoder);
-        }
+        // encoder は上で drop 済みのため、ここで再度 ManuallyDrop::drop を
+        // 呼ぶとフィールドが二重ドロップされて解放済みメモリを破壊する。
+        // ManuallyDrop の Drop は中身をドロップしないため、
+        // そのままテストを終了しても二重ドロップにはならない。
     }
 
     #[test]

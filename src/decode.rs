@@ -1267,9 +1267,10 @@ mod tests {
             "decode() failed: decoder worker thread has terminated"
         );
 
-        unsafe {
-            ManuallyDrop::drop(&mut decoder);
-        }
+        // decoder は上で drop 済みのため、ここで再度 ManuallyDrop::drop を
+        // 呼ぶとフィールドが二重ドロップされて解放済みメモリを破壊する。
+        // ManuallyDrop の Drop は中身をドロップしないため、
+        // そのままテストを終了しても二重ドロップにはならない。
     }
 
     #[test]
@@ -1297,9 +1298,10 @@ mod tests {
             "flush() failed: send failed"
         );
 
-        unsafe {
-            ManuallyDrop::drop(&mut decoder);
-        }
+        // decoder は上で drop 済みのため、ここで再度 ManuallyDrop::drop を
+        // 呼ぶとフィールドが二重ドロップされて解放済みメモリを破壊する。
+        // ManuallyDrop の Drop は中身をドロップしないため、
+        // そのままテストを終了しても二重ドロップにはならない。
     }
 
     #[test]
