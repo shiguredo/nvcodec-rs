@@ -313,7 +313,7 @@ assert_eq!(frame.width(), 1280);  // 自動的に変更される
 let stats = encoder.stats();
 println!(
     "encoder buffer full count: {}",
-    stats.encoder_buffer_full_count.get()
+    stats.total_encoder_buffer_full_count.get()
 );
 
 // in-flight 上限に基づく flush 制御のレシピ
@@ -339,13 +339,13 @@ encoder.flush()?;
 let stats = decoder.stats();
 println!(
     "input frames: {}, output frames: {}",
-    stats.decode_count.get(),
-    stats.output_frame_count.get()
+    stats.total_decode_count.get(),
+    stats.total_output_frame_count.get()
 );
 
 // 入力フレーム数 - 出力フレーム数で、
 // 入力されたがまだ出力されていないフレーム数 (in-flight 相当) を導出できる
-let in_flight = stats.decode_count.get() - stats.output_frame_count.get();
+let in_flight = stats.total_decode_count.get() - stats.total_output_frame_count.get();
 ```
 
 ## ライセンス

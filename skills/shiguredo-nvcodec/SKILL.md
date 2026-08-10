@@ -51,7 +51,7 @@ docs.rs 向けには `DOCS_RS=1 cargo doc --no-deps` でスタブヘッダー経
 | `ReconfigureParams` | 動的再構成パラメータ (全フィールド `Option`) | `width`, `height`, `framerate_num`, `framerate_den`, `average_bitrate`, `max_bitrate` |
 | `EncodedFrame<T>` | エンコード済みフレーム | `data()`, `timestamp()`, `picture_type()`, `user_data()`, `into_parts()` |
 | `EncoderCaps` | エンコーダケーパビリティ | `supported_ratecontrol_modes`, `support_yuv444_encode`, `support_yuv422_encode`, `support_meonly_mode`, `width_max/min`, `height_max/min`, `num_max_bframes`, `support_10bit_encode`, `support_lossless_encode`, `support_lookahead`, `support_temporal_aq` |
-| `EncoderStats` | エンコーダ統計値 (全フィールド `Counter`) | counter: `encoder_buffer_full_count` / gauge: `max_in_flight_frames` |
+| `EncoderStats` | エンコーダ統計値 (全フィールド `Counter`) | counter: `total_encoder_buffer_full_count` / gauge: `max_in_flight_frames` |
 | `Counter` | 統計値のプリミティブ型 (内部で `Arc` を持つ共有可能なカウンター) | `new()`, `get() -> u64`, `inc()`, `add(u64)` |
 
 **プリセット定数** (`Preset`): `P1` (最高速) / `P2` / `P3` / `P4` (バランス) / `P5` / `P6` / `P7` (最高品質)
@@ -80,7 +80,7 @@ docs.rs 向けには `DOCS_RS=1 cargo doc --no-deps` でスタブヘッダー経
 | `SurfaceFormat` | 出力サーフェスフォーマット | `Nv12` のみ (他フォーマット要望時は `DecodedFrame` 拡張が必要) |
 | `DecodedFrame<T>` | デコード済みフレーム (NV12) | `y_plane()`, `uv_plane()`, `y_stride()`, `uv_stride()`, `width()`, `height()`, `user_data()`, `into_parts()` |
 | `DecoderCaps` | デコーダケーパビリティ | `is_supported`, `max_width`, `max_height`, `max_mb_count`, `min_width`, `min_height` |
-| `DecoderStats` | デコーダ統計値 (全フィールド `Counter`) | counter: `create_decoder_count`, `reconfigure_decoder_count`, `reconfigure_failure_count`, `decode_count`, `sequence_callback_count`, `decode_callback_count`, `output_frame_count` |
+| `DecoderStats` | デコーダ統計値 (全フィールド `Counter`) | counter: `total_create_decoder_count`, `total_reconfigure_decoder_count`, `total_reconfigure_failure_count`, `total_decode_count`, `total_sequence_callback_count`, `total_decode_callback_count`, `total_output_frame_count` |
 
 ### ハンドラートレイト
 
@@ -429,7 +429,7 @@ assert_eq!(frame.width(), 1280);  // 自動的に追従
 let stats = encoder.stats();
 println!(
     "encoder buffer full count: {}",
-    stats.encoder_buffer_full_count.get()
+    stats.total_encoder_buffer_full_count.get()
 );
 
 // in-flight 上限に基づく flush 制御のレシピ
@@ -455,13 +455,13 @@ encoder.flush()?;
 let stats = decoder.stats();
 println!(
     "input frames: {}, output frames: {}",
-    stats.decode_count.get(),
-    stats.output_frame_count.get()
+    stats.total_decode_count.get(),
+    stats.total_output_frame_count.get()
 );
 
 // 入力フレーム数 - 出力フレーム数で、
 // 入力されたがまだ出力されていないフレーム数 (in-flight 相当) を導出できる
-let in_flight = stats.decode_count.get() - stats.output_frame_count.get();
+let in_flight = stats.total_decode_count.get() - stats.total_output_frame_count.get();
 ```
 
 ## スレッドモデル

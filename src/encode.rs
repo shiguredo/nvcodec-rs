@@ -406,7 +406,7 @@ pub struct EncoderCaps {
 pub struct EncoderStats {
     // counter
     /// "encoder buffer is full" エラーの通算発生回数
-    pub encoder_buffer_full_count: Counter,
+    pub total_encoder_buffer_full_count: Counter,
 
     // gauge (encoder のライフサイクル中変わらない静的な値)
     /// "encoder buffer is full" エラーを発生させずに in-flight にできる最大フレーム数
@@ -423,7 +423,7 @@ impl EncoderStats {
         let max_in_flight_frames = Counter::new();
         max_in_flight_frames.add(frame_interval_p as u64 + 2);
         Self {
-            encoder_buffer_full_count: Counter::new(),
+            total_encoder_buffer_full_count: Counter::new(),
             max_in_flight_frames,
         }
     }
@@ -1619,7 +1619,7 @@ fn run_worker<H>(
                 // バッファが満杯の場合はエラー callback を実行する
                 if state.i_to_send - state.i_got >= state.n_encoder_buffer {
                     // "encoder buffer is full" の発生回数を記録する
-                    state.stats.encoder_buffer_full_count.inc();
+                    state.stats.total_encoder_buffer_full_count.inc();
                     handler.on_encoded(Err(
                         Error::new_custom("encode", "encoder buffer is full").into()
                     ));
@@ -2985,12 +2985,12 @@ mod tests {
         drop(encoder);
     }
 
-    /// stats() で encoder_buffer_full_count が取得できることを確認する
+    /// stats() で total_encoder_buffer_full_count が取得できることを確認する
     ///
     /// frame_interval_p = 0 (n_encoder_buffer = 3) にし、drain の完了より
     /// 速く encode を連続送信して "encoder buffer is full" エラーを
     /// 発生させる。コールバックハンドラに通知されたエラー数と
-    /// stats() の encoder_buffer_full_count が一致することを確認する。
+    /// stats() の total_encoder_buffer_full_count が一致することを確認する。
     #[test]
     fn test_encoder_stats_buffer_full_count() {
         let mut config = test_encoder_config(CodecConfig::H264(H264EncoderConfig {
@@ -3035,9 +3035,9 @@ mod tests {
         // stats のカウンターと通知されたエラー数が一致することを確認する
         let stats = encoder.stats();
         assert_eq!(
-            stats.encoder_buffer_full_count.get(),
+            stats.total_encoder_buffer_full_count.get(),
             error_count as u64,
-            "encoder_buffer_full_count が通知されたエラー数と一致しない"
+            "total_encoder_buffer_full_count が通知されたエラー数と一致しない"
         );
         assert!(error_count > 0, "buffer full エラーが 1 件も発生しなかった");
 
