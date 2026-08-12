@@ -1,8 +1,11 @@
 # 0027-add-decoder-encoder-stats-api
 
 - Created: 2026-08-07
+- Completed: 2026-08-12
 - Branch: feature/add-decoder-encoder-stats-api
 - Polished: 2026-08-10
+
+**本 issue は実装が完了しました。** `Decoder::stats()` / `Encoder::stats()` による統計値 API が実装され、レビュー指摘 (統計値の書き込み API の `pub(crate)` 化、worker 終了エラーパステストの use-after-free 修正、統計項目の doc 整理 等) への対応も完了しています。
 
 ## 目的
 
