@@ -299,6 +299,52 @@ assert_eq!(frame.width(), 1280);  // 自動的に変更される
 | 制約 | `max_encode_width` / `max_encode_height` 以内 | なし |
 | 超えた場合 | エンコーダーを作り直す | 自動対応 |
 
+## 統計値の取得
+
+`Decoder::stats()` / `Encoder::stats()` で、デコーダー / エンコーダーの内部状態を統計値として取得できます。
+
+統計値は `Counter` 型 (通算値) と `Gauge` 型 (時点値) で表現され、`get()` で現在値を読み出します。`stats()` が返すのは共有統計値への参照であり、読み出すたびに最新値が読めます (値を保持したい場合は `clone()` でスナップショットを取得)。
+
+- counter: 単調増加する通算値 (デコーダー作成回数、"encoder buffer is full" エラー発生回数等)
+- gauge: 現在値を表す時点値 (in-flight 上限等)
+
+```rust
+// エンコーダーの統計値を取得
+let stats = encoder.stats();
+println!(
+    "encoder buffer full count: {}",
+    stats.total_encoder_buffer_full_count.get()
+);
+
+// in-flight 上限に基づく flush 制御のレシピ
+// max_in_flight_frames を超えて encode を連続呼び出しすると
+// "encoder buffer is full" エラーになるため、
+// 送信フレーム数が上限に達するたびに flush する
+let max_in_flight_frames = encoder.stats().max_in_flight_frames.get();
+let mut in_flight = 0;
+for nv12_data in frame_stream {
+    encoder.encode(&nv12_data, &options, ())?;
+    in_flight += 1;
+    if in_flight >= max_in_flight_frames {
+        encoder.flush()?;
+        in_flight = 0;
+    }
+}
+encoder.flush()?;
+```
+
+デコーダーも同様に `decoder.stats()` で統計値を取得できます。
+
+```rust
+let stats = decoder.stats();
+println!(
+    "decode calls: {}, output frames: {}, in flight: {}",
+    stats.total_decode_count.get(),
+    stats.total_output_frame_count.get(),
+    stats.in_flight_frames()
+);
+```
+
 ## ライセンス
 
 Apache License 2.0

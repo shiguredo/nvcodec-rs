@@ -13,6 +13,8 @@
 
 - [CHANGE] MSRV (rust-version) を 1.93 に上げる
   - @voluntas
+- [ADD] Decoder::stats() / Encoder::stats() で内部状態 (counter / gauge) を取得できるようにする
+  - @sile
 
 ### misc
 

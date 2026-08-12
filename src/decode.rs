@@ -1,10 +1,11 @@
 use std::collections::VecDeque;
 use std::ffi::c_void;
 use std::ptr;
+use std::sync::Arc;
 use std::sync::mpsc::{self, Receiver, Sender, SyncSender};
 use std::thread::JoinHandle;
 
-use crate::{CudaLibrary, Error, sys};
+use crate::{CudaLibrary, Error, stats::Counter, sys};
 
 /// デコーダのケーパビリティ情報
 #[derive(Debug, Clone)]
@@ -21,6 +22,53 @@ pub struct DecoderCaps {
     pub min_width: u32,
     /// 最小デコード高さ
     pub min_height: u32,
+}
+
+/// デコーダーの統計値
+///
+/// `clone()` は各フィールドを個別にコピーするため、フィールド間の一貫性は保証されない。
+#[derive(Debug, Clone, Default)]
+pub struct DecoderStats {
+    /// cuvidCreateDecoder の通算成功回数 (初回の create を含む)
+    pub total_create_decoder_count: Counter,
+
+    /// cuvidReconfigureDecoder の通算成功回数
+    /// (reconfigure 経路は 0024 マージ後に導入予定のため、それまでは常に 0 を返す)
+    pub total_reconfigure_decoder_count: Counter,
+
+    /// cuvidReconfigureDecoder 呼び出しの通算失敗回数
+    /// (解像度上限超過の事前検証エラーや cuvidCreateDecoder の失敗は含まない。
+    ///  reconfigure 経路は 0024 マージ後に導入予定のため、それまでは常に 0 を返す)
+    pub total_reconfigure_failure_count: Counter,
+
+    /// decode() で正常に送信された通算回数
+    pub total_decode_count: Counter,
+
+    /// シーケンスコールバックの通算回数 (初回のシーケンス処理を含む)
+    pub total_sequence_callback_count: Counter,
+
+    /// デコードコールバックの通算回数 (cuvidDecodePicture の呼び出し試行回数)
+    pub total_decode_callback_count: Counter,
+
+    /// 出力フレーム数 (表示コールバックの通算回数)
+    pub total_output_frame_count: Counter,
+}
+
+impl DecoderStats {
+    /// 入力されたがまだ出力されていないフレーム数 (in-flight 相当) を返す
+    ///
+    /// `total_decode_count - total_output_frame_count` で算出する。
+    /// 各カウンターは個別に読み取られるため近似値であり、`decode()` は
+    /// 1 回の呼び出しに複数フレームを渡せるためバッファ内の実フレーム数とは
+    /// 一致しない。デコードエラー等で出力されなかったフレームがあると
+    /// 0 に戻らないことがある。
+    pub fn in_flight_frames(&self) -> u64 {
+        // 出力フレーム数は入力フレーム数を超えないため通常は負数にならないが、
+        // 2 つのカウンターの読み取りは原子的でないため saturating で算出する
+        self.total_decode_count
+            .get()
+            .saturating_sub(self.total_output_frame_count.get())
+    }
 }
 
 /// デコーダー用コーデック識別子
@@ -90,6 +138,7 @@ struct DecoderState {
     surface_format: u32,
     frame_tx: Sender<Result<RawFrame, Error>>,
     frame_rx: Receiver<Result<RawFrame, Error>>,
+    stats: Arc<DecoderStats>,
 }
 
 unsafe impl Send for DecoderState {}
@@ -205,6 +254,7 @@ impl DecoderState {
                 surface_format: config.surface_format.to_sys(),
                 frame_tx,
                 frame_rx,
+                stats: Arc::new(DecoderStats::default()),
             });
 
             // 映像パーサーを作成する
@@ -350,6 +400,7 @@ where
 pub struct Decoder<H: DecodeHandler> {
     job_tx: SyncSender<Job<H::UserData>>,
     worker: Option<JoinHandle<()>>,
+    stats: Arc<DecoderStats>,
 }
 
 impl<H: DecodeHandler> Decoder<H> {
@@ -358,6 +409,8 @@ impl<H: DecodeHandler> Decoder<H> {
         let (job_tx, job_rx) = mpsc::sync_channel::<Job<H::UserData>>(4);
 
         let state = DecoderState::new(config)?;
+
+        let stats = state.stats.clone();
 
         let worker = std::thread::Builder::new()
             .name("nvcodec-decoder".into())
@@ -369,7 +422,16 @@ impl<H: DecodeHandler> Decoder<H> {
         Ok(Self {
             job_tx,
             worker: Some(worker),
+            stats,
         })
+    }
+
+    /// デコーダーの統計値を取得する
+    ///
+    /// 返される参照は共有統計値への参照であり、読み出すたびに
+    /// 最新値が読める。保持したい場合は `clone()` でスナップショットを取得する。
+    pub fn stats(&self) -> &DecoderStats {
+        &self.stats
     }
 
     /// 圧縮された映像フレームをデコードする
@@ -382,7 +444,9 @@ impl<H: DecodeHandler> Decoder<H> {
                 data: data.to_vec(),
                 user_data,
             })
-            .map_err(|_| Error::new_custom("decode", "decoder worker thread has terminated"))
+            .map_err(|_| Error::new_custom("decode", "decoder worker thread has terminated"))?;
+        self.stats.total_decode_count.inc();
+        Ok(())
     }
 
     /// 送信済みの未完了フレームがすべて完了するまで待機する
@@ -426,6 +490,7 @@ fn handle_video_sequence_inner(
     state: &mut DecoderState,
     format: &sys::CUVIDEOFORMAT,
 ) -> Result<i32, Error> {
+    state.stats.total_sequence_callback_count.inc();
     // デコーダーが既に作成されている場合は破棄して再作成する
     // ストリーム中の解像度変更に対応するため
     if !state.decoder.is_null() {
@@ -464,6 +529,7 @@ fn handle_video_sequence_inner(
             .lib
             .cuvid_create_decoder(&mut state.decoder, &mut create_info)
     })?;
+    state.stats.total_create_decoder_count.inc();
     // display_area は signed 整数のため、壊れたストリームで負値になる可能性がある
     let left = format.display_area.left;
     let right = format.display_area.right;
@@ -544,6 +610,7 @@ fn handle_picture_decode_inner(
     state: &mut DecoderState,
     pic_params: &sys::CUVIDPICPARAMS,
 ) -> Result<(), Error> {
+    state.stats.total_decode_callback_count.inc();
     if state.decoder.is_null() {
         return Err(Error::new_custom(
             "handle_picture_decode",
@@ -627,6 +694,7 @@ fn handle_picture_display_inner(
         })
     })?;
 
+    state.stats.total_output_frame_count.inc();
     // チャンネル経由で送信 (受信側が破棄されている場合の送信エラーは無視)
     let _ = state.frame_tx.send(Ok(decoded_frame));
 
@@ -1192,62 +1260,56 @@ mod tests {
 
     #[test]
     fn test_decode_after_worker_terminated() {
-        use std::mem::ManuallyDrop;
-
         let (tx, _rx) = mpsc::sync_channel::<Result<DecodedFrame<()>, Error>>(4);
         let config = test_decoder_config(DecoderCodec::H264);
 
-        let mut decoder = ManuallyDrop::new(
-            Decoder::new(
-                config,
-                FnDecodeHandler::new(move |frame| {
-                    let _ = tx.send(frame);
-                }),
-            )
-            .unwrap(),
-        );
+        let mut decoder = Decoder::new(
+            config,
+            FnDecodeHandler::new(move |frame| {
+                let _ = tx.send(frame);
+            }),
+        )
+        .expect("H.264 デコーダーの作成に失敗した");
 
-        unsafe { ManuallyDrop::drop(&mut decoder) };
+        // 受信側を先に drop したチャネルで置き換える。
+        // この代入で元の job_tx が drop され、ワーカースレッドは
+        // recv の Err を検知して終了する。
+        let (dead_tx, dead_rx) = mpsc::sync_channel::<Job<()>>(4);
+        drop(dead_rx);
+        decoder.job_tx = dead_tx;
 
         let result = decoder.decode(&[], ());
         assert_eq!(
             result.unwrap_err().to_string(),
             "decode() failed: decoder worker thread has terminated"
         );
-
-        unsafe {
-            ManuallyDrop::drop(&mut decoder);
-        }
     }
 
     #[test]
     fn test_flush_after_decoder_worker_terminated() {
-        use std::mem::ManuallyDrop;
-
         let (tx, _rx) = mpsc::sync_channel::<Result<DecodedFrame<()>, Error>>(4);
         let config = test_decoder_config(DecoderCodec::H264);
 
-        let mut decoder = ManuallyDrop::new(
-            Decoder::new(
-                config,
-                FnDecodeHandler::new(move |frame| {
-                    let _ = tx.send(frame);
-                }),
-            )
-            .unwrap(),
-        );
+        let mut decoder = Decoder::new(
+            config,
+            FnDecodeHandler::new(move |frame| {
+                let _ = tx.send(frame);
+            }),
+        )
+        .expect("H.264 デコーダーの作成に失敗した");
 
-        unsafe { ManuallyDrop::drop(&mut decoder) };
+        // 受信側を先に drop したチャネルで置き換える。
+        // この代入で元の job_tx が drop され、ワーカースレッドは
+        // recv の Err を検知して終了する。
+        let (dead_tx, dead_rx) = mpsc::sync_channel::<Job<()>>(4);
+        drop(dead_rx);
+        decoder.job_tx = dead_tx;
 
         let result = decoder.flush();
         assert_eq!(
             result.unwrap_err().to_string(),
             "flush() failed: send failed"
         );
-
-        unsafe {
-            ManuallyDrop::drop(&mut decoder);
-        }
     }
 
     #[test]
@@ -1264,5 +1326,85 @@ mod tests {
             "max_height should be positive: {}",
             caps.max_height
         );
+    }
+
+    /// H.264 の黒フレームデータ (640x480) を生成する
+    ///
+    /// test_decode_h264_black_frame と同じ SPS / PPS / フレームデータを
+    /// Annex B 形式 (start code 0x00000001) で結合する。
+    fn h264_black_frame_data() -> Vec<u8> {
+        let sps = vec![
+            103, 100, 0, 30, 172, 217, 64, 160, 61, 176, 17, 0, 0, 3, 0, 1, 0, 0, 3, 0, 50, 15, 22,
+            45, 150,
+        ];
+        let pps = vec![104, 235, 227, 203, 34, 192];
+        let frame_data = vec![
+            101, 136, 132, 0, 43, 255, 254, 246, 115, 124, 10, 107, 109, 176, 149, 46, 5, 118, 247,
+            102, 163, 229, 208, 146, 229, 251, 16, 96, 250, 208, 0, 0, 3, 0, 0, 3, 0, 0, 16, 15,
+            210, 222, 245, 204, 98, 91, 229, 32, 0, 0, 9, 216, 2, 56, 13, 16, 118, 133, 116, 69,
+            196, 32, 71, 6, 120, 150, 16, 161, 210, 50, 128, 0, 0, 3, 0, 0, 3, 0, 0, 3, 0, 0, 3, 0,
+            0, 3, 0, 0, 3, 0, 0, 3, 0, 0, 3, 0, 0, 3, 0, 37, 225,
+        ];
+
+        let mut h264_data = Vec::new();
+        let start_code = [0u8, 0, 0, 1];
+
+        h264_data.extend_from_slice(&start_code);
+        h264_data.extend_from_slice(&sps);
+        h264_data.extend_from_slice(&start_code);
+        h264_data.extend_from_slice(&pps);
+        h264_data.extend_from_slice(&start_code);
+        h264_data.extend_from_slice(&frame_data);
+
+        h264_data
+    }
+
+    /// stats() でデコーダーの統計値が取得できることを確認する
+    ///
+    /// H.264 の 1 フレームをデコードすると:
+    /// - total_create_decoder_count が 1 (シーケンスコールバックで cuvidCreateDecoder が 1 回呼ばれる)
+    /// - total_decode_count が 1 (decode() を 1 回呼んだ)
+    /// - total_sequence_callback_count が 1 (シーケンスコールバックが 1 回呼ばれる)
+    /// - total_decode_callback_count が 1 (デコードコールバックが 1 回呼ばれる)
+    /// - total_output_frame_count が 1 (1 フレームが出力される)
+    #[test]
+    fn test_decoder_stats_counters() {
+        let config = test_decoder_config(DecoderCodec::H264);
+        let (tx, _rx) = mpsc::sync_channel::<Result<DecodedFrame<()>, Error>>(4);
+        let decoder = Decoder::new(
+            config,
+            FnDecodeHandler::new(move |frame| {
+                let _ = tx.send(frame);
+            }),
+        )
+        .expect("H.264 デコーダーの作成に失敗した");
+
+        // デコード前はすべて 0 である
+        assert_eq!(decoder.stats().total_create_decoder_count.get(), 0);
+        assert_eq!(decoder.stats().total_decode_count.get(), 0);
+        assert_eq!(decoder.stats().total_sequence_callback_count.get(), 0);
+        assert_eq!(decoder.stats().total_decode_callback_count.get(), 0);
+        assert_eq!(decoder.stats().total_output_frame_count.get(), 0);
+
+        // デコードを実行
+        decoder
+            .decode(&h264_black_frame_data(), ())
+            .expect("H.264 データのデコードに失敗した");
+        decoder.flush().expect("flush に失敗した");
+
+        // シーケンスコールバックで cuvidCreateDecoder が 1 回呼ばれる
+        assert_eq!(decoder.stats().total_create_decoder_count.get(), 1);
+        // decode() を 1 回呼んだ
+        assert_eq!(decoder.stats().total_decode_count.get(), 1);
+        // シーケンスコールバックが 1 回呼ばれる
+        assert_eq!(decoder.stats().total_sequence_callback_count.get(), 1);
+        // デコードコールバックが 1 回呼ばれる
+        assert_eq!(decoder.stats().total_decode_callback_count.get(), 1);
+        // 1 フレームが出力される
+        assert_eq!(decoder.stats().total_output_frame_count.get(), 1);
+        // 1 バッファに 1 フレームを渡しているため、flush 後の in-flight (入力 - 出力) は 0 になる
+        assert_eq!(decoder.stats().in_flight_frames(), 0);
+
+        drop(decoder);
     }
 }

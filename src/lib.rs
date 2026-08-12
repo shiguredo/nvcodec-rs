@@ -12,20 +12,22 @@ mod decode;
 mod dl;
 mod encode;
 mod error;
+mod stats;
 mod sys;
 
 pub use codec_info::*;
 pub use decode::{
-    DecodeHandler, DecodedFrame, Decoder, DecoderCaps, DecoderCodec, DecoderConfig,
+    DecodeHandler, DecodedFrame, Decoder, DecoderCaps, DecoderCodec, DecoderConfig, DecoderStats,
     FnDecodeHandler, SurfaceFormat, query_decoder_caps,
 };
 pub use encode::{
     Av1EncoderConfig, Av1Profile, BufferFormat, CodecConfig, EncodeHandler, EncodeOptions,
-    EncodedFrame, Encoder, EncoderCaps, EncoderCodec, EncoderConfig, FnEncodeHandler,
+    EncodedFrame, Encoder, EncoderCaps, EncoderCodec, EncoderConfig, EncoderStats, FnEncodeHandler,
     H264EncoderConfig, H264Profile, HevcEncoderConfig, HevcProfile, PictureType, Preset,
     RateControlMode, ReconfigureParams, TuningInfo, query_encoder_caps,
 };
 pub use error::Error;
+pub use stats::{Counter, Gauge};
 
 /// ビルド時に参照したバージョン
 pub const BUILD_VERSION: &str = sys::BUILD_METADATA_VERSION;
