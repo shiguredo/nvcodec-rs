@@ -416,6 +416,15 @@ pub struct EncoderStats {
     pub max_in_flight_frames: Gauge,
 }
 
+impl EncoderStats {
+    /// "encoder buffer is full" エラーを発生させずに in-flight にできる最大フレーム数を算出する
+    ///
+    /// (n_encoder_buffer = frame_interval_p + 3 のバッファを 1 つ空けて運用する)
+    fn max_in_flight_frames(frame_interval_p: u32) -> u64 {
+        frame_interval_p as u64 + 2
+    }
+}
+
 /// エンコーダ再構成パラメータ
 #[derive(Debug, Clone, Default)]
 pub struct ReconfigureParams {
@@ -537,11 +546,10 @@ impl EncoderState {
             let n_encoder_buffer = config.frame_interval_p as usize + 3;
 
             // max_in_flight_frames に frame_interval_p + 2 を設定する
-            // (n_encoder_buffer = frame_interval_p + 3 のバッファを 1 つ空けて運用する)
             let stats = Arc::new(EncoderStats::default());
             stats
                 .max_in_flight_frames
-                .set(config.frame_interval_p as u64 + 2);
+                .set(EncoderStats::max_in_flight_frames(config.frame_interval_p));
 
             let mut state = Self {
                 lib: lib.clone(),
@@ -2951,6 +2959,14 @@ mod tests {
         );
     }
 
+    /// max_in_flight_frames() の値の計算を確認する
+    #[test]
+    fn test_max_in_flight_frames_value() {
+        assert_eq!(EncoderStats::max_in_flight_frames(0), 2);
+        assert_eq!(EncoderStats::max_in_flight_frames(1), 3);
+        assert_eq!(EncoderStats::max_in_flight_frames(2), 4);
+    }
+
     /// stats() で max_in_flight_frames が取得できることを確認する
     ///
     /// max_in_flight_frames は frame_interval_p + 2
@@ -2982,6 +2998,10 @@ mod tests {
     /// 速く encode を連続送信して "encoder buffer is full" エラーを
     /// 発生させる。コールバックハンドラに通知されたエラー数と
     /// stats() の total_encoder_buffer_full_count が一致することを確認する。
+    ///
+    /// エラーが 1 件以上発生することの保証は「worker のジョブ処理が
+    /// drain スレッドのエンコード完了待ちより速い」というハードウェア
+    /// 速度比に依存する (現実的な構成ではほぼ確実に成立する)。
     #[test]
     fn test_encoder_stats_buffer_full_count() {
         let mut config = test_encoder_config(CodecConfig::H264(H264EncoderConfig {
@@ -3021,7 +3041,14 @@ mod tests {
         encoder.flush().expect("flush に失敗した");
 
         // コールバックハンドラに通知された buffer full エラー数を回収する
-        let error_count = rx.try_iter().filter(|result| result.is_err()).count();
+        // (buffer full 以外のエラーが混入しても等号断言が偽陰性にならないように
+        //  メッセージで filter する)
+        let error_count = rx
+            .try_iter()
+            .filter(|result| {
+                matches!(result, Err(e) if e.to_string().contains("encoder buffer is full"))
+            })
+            .count();
 
         // stats のカウンターと通知されたエラー数が一致することを確認する
         let stats = encoder.stats();
