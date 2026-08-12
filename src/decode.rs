@@ -1282,11 +1282,6 @@ mod tests {
             result.unwrap_err().to_string(),
             "decode() failed: decoder worker thread has terminated"
         );
-
-        // decoder は上で drop 済みのため、ここで再度 ManuallyDrop::drop を
-        // 呼ぶとフィールドが二重ドロップされて解放済みメモリを破壊する。
-        // ManuallyDrop の Drop は中身をドロップしないため、
-        // そのままテストを終了しても二重ドロップにはならない。
     }
 
     #[test]
@@ -1313,11 +1308,6 @@ mod tests {
             result.unwrap_err().to_string(),
             "flush() failed: send failed"
         );
-
-        // decoder は上で drop 済みのため、ここで再度 ManuallyDrop::drop を
-        // 呼ぶとフィールドが二重ドロップされて解放済みメモリを破壊する。
-        // ManuallyDrop の Drop は中身をドロップしないため、
-        // そのままテストを終了しても二重ドロップにはならない。
     }
 
     #[test]
