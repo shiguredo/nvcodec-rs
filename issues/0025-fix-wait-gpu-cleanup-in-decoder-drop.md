@@ -1,6 +1,7 @@
 # 0025-fix-wait-gpu-cleanup-in-decoder-drop
 
 - Created: 2026-08-05
+- Completed: 2026-08-12
 - Branch: feature/fix-wait-gpu-cleanup-in-decoder-drop
 - Polished: 2026-08-05
 
@@ -73,15 +74,26 @@ let _ = self.lib.with_context(self.ctx, || {
 
 ## 解決方法
 
-### 変更対象ファイル
+本 issue はコード変更を行わず、対応不要として closed にする。
 
-- `src/decode.rs` — `impl Drop for DecoderState` の `drop` メソッド内、`cuvid_destroy_decoder` を呼ぶ `with_context` クロージャに `cu_ctx_synchronize` の呼び出しを追加
-- `CHANGES.md` — `[FIX]` エントリを追加。文例:
-  ```
-  - [FIX] `Decoder` の drop 直後に新規 `Decoder` を作成すると H.265 で `cuvidCreateDecoder` が失敗する場合がある問題を軽減する
-    - `DecoderState` の `Drop` 実装で `cuvidDestroyDecoder` の後に `cuCtxSynchronize` を呼んで GPU 側の cleanup 完了を待つ
-    - @担当者
-  ```
+現行の `Decoder<H>` の Drop 経路は、worker に終了を要求して終了を待つ。worker は終了前に `DecoderState::send_eos` を呼び、EOS を送信してから `cuCtxSynchronize` ですべてのデコード処理の完了を待つ。その後、`DecoderState` の Drop で parser、decoder、context lock、CUDA context の順に破棄する。
+
+NVIDIA の NVDEC Video Decoder API Programming Guide は、デコード完了後に `cuvidDestroyDecoder` で decoder session と割り当て済みリソースを解放し、その後 CUDA context を破棄するライフサイクルを定めている。`cuvidDestroyDecoder` の後に `cuCtxSynchronize` を追加する要件は示していない。また、CUDA Driver API の `cuCtxSynchronize` が待つ対象は current context で先行して要求された task であり、`cuvidDestroyDecoder` 内部の cleanup がこの対象になることは規定されていない。
+
+- [NVDEC Video Decoder API Programming Guide 13.0](https://docs.nvidia.com/video-technologies/video-codec-sdk/13.0/nvdec-video-decoder-api-prog-guide/index.html)
+- [CUDA Driver API: Context Management](https://docs.nvidia.com/cuda/archive/13.0.2/cuda-driver-api/group__CUDA__CTX.html)
+
+報告された `status=1` は `CUDA_ERROR_INVALID_VALUE` であり、それだけでは GPU リソース競合や decoder cleanup の未完了を示さない。したがって、失敗原因を `cuvidDestroyDecoder` 後の非同期 cleanup とする根拠はなく、提案していた同期処理の有効性も仕様から確認できない。
+
+再現確認のために作成した `test_decoder_recreate_h265_repeatedly` にも、次の観測漏れがあった。
+
+- `Decoder::decode` は worker への job 送信成功を返すだけで、実際のデコード結果を返さない
+- `cuvidCreateDecoder` の失敗はコールバック経由で通知されるが、テストは受信側から結果を取得していない
+- 利用者が `flush` を呼ばずに drop しても、`Decoder<H>` の Drop 経路は内部で EOS 送信と `cuCtxSynchronize` を実行する
+
+このため、修正前の 2 回の CI 成功は現象が再現しなかったことを証明しない。一方、失敗を観測するようにテストを修正しても、CI 環境で修正前の失敗を安定して再現できなければ修正効果を検証できない。根拠と検証手段がないまま同期処理を追加することは避け、再現テストも採用しない。コード変更がないため `CHANGES.md` も変更しない。
+
+今後、同じ現象が再現した場合は、GPU、NVIDIA driver、Video Codec SDK の各バージョン、入力ストリーム、完全なエラー情報、最小再現コードを記録する。修正前後を同一環境で比較できる状態になった場合に、本 issue を reopened にして原因と対策を改めて検討する。
 
 ## 関連 issue
 
