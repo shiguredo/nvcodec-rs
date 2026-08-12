@@ -440,7 +440,6 @@ impl<H: DecodeHandler> Decoder<H> {
                 user_data,
             })
             .map_err(|_| Error::new_custom("decode", "decoder worker thread has terminated"))?;
-        // 入力フレーム数 (ジョブ送信数) を記録する
         self.stats.total_decode_count.inc();
         Ok(())
     }
@@ -486,7 +485,6 @@ fn handle_video_sequence_inner(
     state: &mut DecoderState,
     format: &sys::CUVIDEOFORMAT,
 ) -> Result<i32, Error> {
-    // シーケンスコールバックの呼び出し回数を記録する
     state.stats.total_sequence_callback_count.inc();
     // デコーダーが既に作成されている場合は破棄して再作成する
     // ストリーム中の解像度変更に対応するため
@@ -526,7 +524,6 @@ fn handle_video_sequence_inner(
             .lib
             .cuvid_create_decoder(&mut state.decoder, &mut create_info)
     })?;
-    // cuvidCreateDecoder の成功回数を記録する
     state.stats.total_create_decoder_count.inc();
     // display_area は signed 整数のため、壊れたストリームで負値になる可能性がある
     let left = format.display_area.left;
@@ -608,7 +605,6 @@ fn handle_picture_decode_inner(
     state: &mut DecoderState,
     pic_params: &sys::CUVIDPICPARAMS,
 ) -> Result<(), Error> {
-    // デコードコールバックの呼び出し回数を記録する
     state.stats.total_decode_callback_count.inc();
     if state.decoder.is_null() {
         return Err(Error::new_custom(
@@ -693,7 +689,6 @@ fn handle_picture_display_inner(
         })
     })?;
 
-    // 出力フレーム数を記録する
     state.stats.total_output_frame_count.inc();
     // チャンネル経由で送信 (受信側が破棄されている場合の送信エラーは無視)
     let _ = state.frame_tx.send(Ok(decoded_frame));

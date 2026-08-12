@@ -1605,7 +1605,6 @@ fn run_worker<H>(
             } => {
                 // バッファが満杯の場合はエラー callback を実行する
                 if state.i_to_send - state.i_got >= state.n_encoder_buffer {
-                    // "encoder buffer is full" の発生回数を記録する
                     state.stats.total_encoder_buffer_full_count.inc();
                     handler.on_encoded(Err(
                         Error::new_custom("encode", "encoder buffer is full").into()
