@@ -26,9 +26,7 @@ pub struct DecoderCaps {
 
 /// デコーダーの統計値
 ///
-/// 各フィールドはワーカスレッドと共有するカウンターで、`get()` で現在値を読み出す。
-/// `clone()` は各カウンターを個別に読み取ったスナップショットであり、
-/// フィールド間の一貫性は保証されない。
+/// `clone()` は各フィールドを個別にコピーするため、フィールド間の一貫性は保証されない。
 #[derive(Debug, Clone, Default)]
 pub struct DecoderStats {
     /// cuvidCreateDecoder の通算成功回数 (初回の create を含む)

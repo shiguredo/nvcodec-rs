@@ -403,9 +403,7 @@ pub struct EncoderCaps {
 
 /// エンコーダの統計値
 ///
-/// 各フィールドはワーカスレッドと共有する統計値で、`get()` で現在値を読み出す。
-/// `clone()` は各フィールドを個別に読み取ったスナップショットであり、
-/// フィールド間の一貫性は保証されない。
+/// `clone()` は各フィールドを個別にコピーするため、フィールド間の一貫性は保証されない。
 #[derive(Debug, Clone, Default)]
 pub struct EncoderStats {
     /// "encoder buffer is full" エラーの通算発生回数
