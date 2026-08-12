@@ -397,20 +397,14 @@ pub struct EncoderCaps {
 }
 
 /// エンコーダの統計値
-///
-/// 統計値は常に [`Counter`] 型で表現する。フィールドはワーカスレッドが
-/// インクリメントする共有カウンターであり、`get()` で現在値を読み出す。
-/// `max_in_flight_frames` は生成時に確定する静的な値だが、統一性のため
-/// [`Counter`] 型で表現する。
 #[derive(Debug, Clone)]
 pub struct EncoderStats {
-    // counter
     /// "encoder buffer is full" エラーの通算発生回数
     pub total_encoder_buffer_full_count: Counter,
 
     // gauge (encoder のライフサイクル中変わらない静的な値)
     /// "encoder buffer is full" エラーを発生させずに in-flight にできる最大フレーム数
-    /// (n_encoder_buffer - 1 = frame_interval_p + 2)
+    /// (n_encoder_buffer - 1 = frame_interval_p + 2、生成時に確定する静的な値)
     pub max_in_flight_frames: Counter,
 }
 

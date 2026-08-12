@@ -33,9 +33,9 @@
 `Decoder::stats(&self) -> &DecoderStats` / `Encoder::stats(&self) -> &EncoderStats` の統一メソッドを追加し、`DecoderStats` / `EncoderStats` 構造体への参照を返す。counter と gauge を同じ構造体に含め、統計値はすべて `Counter` 型で表現する。
 
 ```rust
+/// デコーダーの統計値
 #[derive(Debug, Clone)]
 pub struct DecoderStats {
-    // counter (通算値)
     /// cuvidCreateDecoder の通算成功回数 (初回の create を含む)
     pub total_create_decoder_count: Counter,
 
@@ -59,15 +59,27 @@ pub struct DecoderStats {
     pub total_output_frame_count: Counter,
 }
 
+impl DecoderStats {
+    /// 入力されたがまだ出力されていないフレーム数 (in-flight 相当) を返す
+    ///
+    /// `total_decode_count - total_output_frame_count` で算出する。
+    /// 出力フレーム数は入力フレーム数を超えないため通常は負数にならないが、
+    /// 2 つのカウンターの読み取りは原子的でないため saturating で算出する。
+    pub fn in_flight_frames(&self) -> u64 {
+        self.total_decode_count
+            .get()
+            .saturating_sub(self.total_output_frame_count.get())
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct EncoderStats {
-    // counter
     /// "encoder buffer is full" エラーの通算発生回数
     pub total_encoder_buffer_full_count: Counter,
 
     // gauge (encoder のライフサイクル中変わらない静的な値)
     /// "encoder buffer is full" エラーを発生させずに in-flight にできる最大フレーム数
-    /// (n_encoder_buffer - 1 = frame_interval_p + 2)
+    /// (n_encoder_buffer - 1 = frame_interval_p + 2、生成時に確定する静的な値)
     pub max_in_flight_frames: Counter,
 }
 ```
@@ -102,9 +114,9 @@ pub struct EncoderStats {
 
 補足:
 
-- `current_in_flight_frames` のような「他の counter の差分で導出できる gauge」は独立して提供しない (Prometheus / OpenMetrics 運用では total の差分で求められる gauge を別途提供しないことが多い)
-  - in-flight フレーム数は `total_encode_count - total_encoded_frame_count` で導出できる
-  - デコーダー側は `total_decode_count - total_output_frame_count` で導出できる
+- `current_in_flight_frames` のような「他の counter の差分で導出できる gauge」はフィールドとして独立して提供しない (Prometheus / OpenMetrics 運用では total の差分で求められる gauge を別途提供しないことが多い)
+  - エンコーダー側は `total_encode_count - total_encoded_frame_count` で導出できる
+  - デコーダー側は `DecoderStats::in_flight_frames()` メソッドで取得できる
 - エラー系カウンターの一部は 0029 (エラーチャネル分離) と絡むため、追加するかは 0029 の状況を見て判断する
 
 ### counter / gauge の区別

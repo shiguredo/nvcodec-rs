@@ -24,14 +24,8 @@ pub struct DecoderCaps {
 }
 
 /// デコーダーの統計値
-///
-/// 統計値は常に [`Counter`] 型で表現する。フィールドはワーカスレッドが
-/// インクリメントする共有カウンターであり、`get()` で現在値を読み出す。
-/// `total_decode_count - total_output_frame_count` で、入力されたがまだ出力されていない
-/// フレーム数 (in-flight 相当) を導出できる。
 #[derive(Debug, Clone)]
 pub struct DecoderStats {
-    // counter (通算値)
     /// cuvidCreateDecoder の通算成功回数 (初回の create を含む)
     pub total_create_decoder_count: Counter,
 
@@ -67,6 +61,17 @@ impl DecoderStats {
             total_decode_callback_count: Counter::new(),
             total_output_frame_count: Counter::new(),
         }
+    }
+
+    /// 入力されたがまだ出力されていないフレーム数 (in-flight 相当) を返す
+    ///
+    /// `total_decode_count - total_output_frame_count` で算出する。
+    /// 出力フレーム数は入力フレーム数を超えないため通常は負数にならないが、
+    /// 2 つのカウンターの読み取りは原子的でないため saturating で算出する。
+    pub fn in_flight_frames(&self) -> u64 {
+        self.total_decode_count
+            .get()
+            .saturating_sub(self.total_output_frame_count.get())
     }
 }
 
@@ -1417,6 +1422,8 @@ mod tests {
         assert_eq!(decoder.stats().total_decode_callback_count.get(), 1);
         // 1 フレームが出力される
         assert_eq!(decoder.stats().total_output_frame_count.get(), 1);
+        // flush 済みなので in-flight (入力 - 出力) は 0 になる
+        assert_eq!(decoder.stats().in_flight_frames(), 0);
 
         drop(decoder);
     }

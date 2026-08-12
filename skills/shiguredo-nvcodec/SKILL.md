@@ -454,14 +454,11 @@ encoder.flush()?;
 ```rust
 let stats = decoder.stats();
 println!(
-    "input frames: {}, output frames: {}",
+    "input frames: {}, output frames: {}, in flight: {}",
     stats.total_decode_count.get(),
-    stats.total_output_frame_count.get()
+    stats.total_output_frame_count.get(),
+    stats.in_flight_frames()
 );
-
-// 入力フレーム数 - 出力フレーム数で、
-// 入力されたがまだ出力されていないフレーム数 (in-flight 相当) を導出できる
-let in_flight = stats.total_decode_count.get() - stats.total_output_frame_count.get();
 ```
 
 ## スレッドモデル
