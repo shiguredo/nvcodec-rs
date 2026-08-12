@@ -52,8 +52,8 @@ docs.rs 向けには `DOCS_RS=1 cargo doc --no-deps` でスタブヘッダー経
 | `EncodedFrame<T>` | エンコード済みフレーム | `data()`, `timestamp()`, `picture_type()`, `user_data()`, `into_parts()` |
 | `EncoderCaps` | エンコーダケーパビリティ | `supported_ratecontrol_modes`, `support_yuv444_encode`, `support_yuv422_encode`, `support_meonly_mode`, `width_max/min`, `height_max/min`, `num_max_bframes`, `support_10bit_encode`, `support_lossless_encode`, `support_lookahead`, `support_temporal_aq` |
 | `EncoderStats` | エンコーダ統計値 (全フィールド `Counter`) | counter: `total_encoder_buffer_full_count` / gauge: `max_in_flight_frames` |
-| `Counter` | 統計値のプリミティブ型 (通算値。`AtomicU64` の薄いラッパー。共有は `Arc<DecoderStats>` / `Arc<EncoderStats>` で行う) | `new()`, `get() -> u64`, `inc()`, `add(u64)` |
-| `Gauge` | 統計値のプリミティブ型 (時点値。`AtomicU64` の薄いラッパー。共有は `Arc<DecoderStats>` / `Arc<EncoderStats>` で行う) | `new()`, `get() -> u64`, `set(u64)` |
+| `Counter` | 統計値のプリミティブ型 (通算値。`AtomicU64` の薄いラッパー。共有は `Arc<DecoderStats>` / `Arc<EncoderStats>` で行う。`inc()` は crate 内部のみ) | `new()`, `get() -> u64` |
+| `Gauge` | 統計値のプリミティブ型 (時点値。`AtomicU64` の薄いラッパー。共有は `Arc<DecoderStats>` / `Arc<EncoderStats>` で行う。`set()` は crate 内部のみ) | `new()`, `get() -> u64` |
 
 **プリセット定数** (`Preset`): `P1` (最高速) / `P2` / `P3` / `P4` (バランス) / `P5` / `P6` / `P7` (最高品質)
 

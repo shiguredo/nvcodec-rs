@@ -26,13 +26,8 @@ impl Counter {
     }
 
     /// カウンターを 1 増やす
-    pub fn inc(&self) {
+    pub(crate) fn inc(&self) {
         self.0.fetch_add(1, Ordering::Relaxed);
-    }
-
-    /// カウンターに `n` を加算する
-    pub fn add(&self, n: u64) {
-        self.0.fetch_add(n, Ordering::Relaxed);
     }
 }
 
@@ -68,7 +63,7 @@ impl Gauge {
     }
 
     /// 値を設定する
-    pub fn set(&self, value: u64) {
+    pub(crate) fn set(&self, value: u64) {
         self.0.store(value, Ordering::Relaxed);
     }
 }
@@ -103,26 +98,17 @@ mod tests {
         assert_eq!(counter.get(), 3);
     }
 
-    /// add() で指定した値が加算される
-    #[test]
-    fn counter_add_increments_by_n() {
-        let counter = Counter::new();
-        counter.add(5);
-        counter.add(7);
-        assert_eq!(counter.get(), 12);
-    }
-
     /// clone したカウンターは現在値のスナップショットであり、以後の変更は互いに影響しない
     #[test]
     fn counter_clone_is_independent_snapshot() {
         let counter = Counter::new();
-        counter.add(5);
+        counter.inc();
 
         let snapshot = counter.clone();
 
         counter.inc();
-        assert_eq!(counter.get(), 6);
-        assert_eq!(snapshot.get(), 5);
+        assert_eq!(counter.get(), 2);
+        assert_eq!(snapshot.get(), 1);
     }
 
     /// 生成直後のゲージは 0 である
