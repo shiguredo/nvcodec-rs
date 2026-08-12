@@ -1263,22 +1263,23 @@ mod tests {
 
     #[test]
     fn test_decode_after_worker_terminated() {
-        use std::mem::ManuallyDrop;
-
         let (tx, _rx) = mpsc::sync_channel::<Result<DecodedFrame<()>, Error>>(4);
         let config = test_decoder_config(DecoderCodec::H264);
 
-        let mut decoder = ManuallyDrop::new(
-            Decoder::new(
-                config,
-                FnDecodeHandler::new(move |frame| {
-                    let _ = tx.send(frame);
-                }),
-            )
-            .unwrap(),
-        );
+        let mut decoder = Decoder::new(
+            config,
+            FnDecodeHandler::new(move |frame| {
+                let _ = tx.send(frame);
+            }),
+        )
+        .expect("H.264 デコーダーの作成に失敗した");
 
-        unsafe { ManuallyDrop::drop(&mut decoder) };
+        // 受信側を先に drop したチャネルで置き換える。
+        // この代入で元の job_tx が drop され、ワーカースレッドは
+        // recv の Err を検知して終了する。
+        let (dead_tx, dead_rx) = mpsc::sync_channel::<Job<()>>(4);
+        drop(dead_rx);
+        decoder.job_tx = dead_tx;
 
         let result = decoder.decode(&[], ());
         assert_eq!(
@@ -1289,22 +1290,23 @@ mod tests {
 
     #[test]
     fn test_flush_after_decoder_worker_terminated() {
-        use std::mem::ManuallyDrop;
-
         let (tx, _rx) = mpsc::sync_channel::<Result<DecodedFrame<()>, Error>>(4);
         let config = test_decoder_config(DecoderCodec::H264);
 
-        let mut decoder = ManuallyDrop::new(
-            Decoder::new(
-                config,
-                FnDecodeHandler::new(move |frame| {
-                    let _ = tx.send(frame);
-                }),
-            )
-            .unwrap(),
-        );
+        let mut decoder = Decoder::new(
+            config,
+            FnDecodeHandler::new(move |frame| {
+                let _ = tx.send(frame);
+            }),
+        )
+        .expect("H.264 デコーダーの作成に失敗した");
 
-        unsafe { ManuallyDrop::drop(&mut decoder) };
+        // 受信側を先に drop したチャネルで置き換える。
+        // この代入で元の job_tx が drop され、ワーカースレッドは
+        // recv の Err を検知して終了する。
+        let (dead_tx, dead_rx) = mpsc::sync_channel::<Job<()>>(4);
+        drop(dead_rx);
+        decoder.job_tx = dead_tx;
 
         let result = decoder.flush();
         assert_eq!(

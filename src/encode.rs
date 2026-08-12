@@ -2704,25 +2704,27 @@ mod tests {
 
     #[test]
     fn test_encode_after_worker_terminated() {
-        use std::mem::ManuallyDrop;
-
         let (tx, _rx) = mpsc::sync_channel::<Result<EncodedFrame<()>, Error>>(4);
         let config = test_encoder_config(CodecConfig::H264(H264EncoderConfig {
             profile: None,
             idr_period: None,
         }));
 
-        let mut encoder = ManuallyDrop::new(
-            Encoder::new(
-                config,
-                FnEncodeHandler::new(move |frame| {
-                    let _ = tx.send(frame);
-                }),
-            )
-            .unwrap(),
-        );
+        let mut encoder = Encoder::new(
+            config,
+            FnEncodeHandler::new(move |frame| {
+                let _ = tx.send(frame);
+            }),
+        )
+        .expect("H.264 エンコーダーの作成に失敗した");
 
-        unsafe { ManuallyDrop::drop(&mut encoder) };
+        // 受信側を先に drop したチャネルで置き換えて send 失敗を検証する。
+        // drain スレッドが job_tx.clone() を保持しているためワーカースレッドは終了しない。
+        // 元の job_tx は検証後に復元してから drop する
+        // (置き換えたまま drop すると worker が recv でブロックし続け、join がデッドロックする)。
+        let (dead_tx, dead_rx) = mpsc::channel::<Job<()>>();
+        drop(dead_rx);
+        let original_job_tx = std::mem::replace(&mut encoder.job_tx, dead_tx);
 
         let result = encoder.encode(
             &[],
@@ -2737,64 +2739,77 @@ mod tests {
             result.unwrap_err().to_string(),
             "encode() failed: encoder worker thread has terminated"
         );
+
+        // 元の job_tx を復元してから drop する
+        encoder.job_tx = original_job_tx;
     }
 
     #[test]
     fn test_flush_after_encoder_worker_terminated() {
-        use std::mem::ManuallyDrop;
-
         let (tx, _rx) = mpsc::sync_channel::<Result<EncodedFrame<()>, Error>>(4);
         let config = test_encoder_config(CodecConfig::H264(H264EncoderConfig {
             profile: None,
             idr_period: None,
         }));
 
-        let mut encoder = ManuallyDrop::new(
-            Encoder::new(
-                config,
-                FnEncodeHandler::new(move |frame| {
-                    let _ = tx.send(frame);
-                }),
-            )
-            .unwrap(),
-        );
+        let mut encoder = Encoder::new(
+            config,
+            FnEncodeHandler::new(move |frame| {
+                let _ = tx.send(frame);
+            }),
+        )
+        .expect("H.264 エンコーダーの作成に失敗した");
 
-        unsafe { ManuallyDrop::drop(&mut encoder) };
+        // 受信側を先に drop したチャネルで置き換えて send 失敗を検証する。
+        // drain スレッドが job_tx.clone() を保持しているためワーカースレッドは終了しない。
+        // 元の job_tx は検証後に復元してから drop する
+        // (置き換えたまま drop すると worker が recv でブロックし続け、join がデッドロックする)。
+        let (dead_tx, dead_rx) = mpsc::channel::<Job<()>>();
+        drop(dead_rx);
+        let original_job_tx = std::mem::replace(&mut encoder.job_tx, dead_tx);
 
         let result = encoder.flush();
         assert_eq!(
             result.unwrap_err().to_string(),
             "flush() failed: send failed"
         );
+
+        // 元の job_tx を復元してから drop する
+        encoder.job_tx = original_job_tx;
     }
 
     #[test]
     fn test_reconfigure_after_encoder_worker_terminated() {
-        use std::mem::ManuallyDrop;
-
         let (tx, _rx) = mpsc::sync_channel::<Result<EncodedFrame<()>, Error>>(4);
         let config = test_encoder_config(CodecConfig::H264(H264EncoderConfig {
             profile: None,
             idr_period: None,
         }));
 
-        let mut encoder = ManuallyDrop::new(
-            Encoder::new(
-                config,
-                FnEncodeHandler::new(move |frame| {
-                    let _ = tx.send(frame);
-                }),
-            )
-            .unwrap(),
-        );
+        let mut encoder = Encoder::new(
+            config,
+            FnEncodeHandler::new(move |frame| {
+                let _ = tx.send(frame);
+            }),
+        )
+        .expect("H.264 エンコーダーの作成に失敗した");
 
-        unsafe { ManuallyDrop::drop(&mut encoder) };
+        // 受信側を先に drop したチャネルで置き換えて send 失敗を検証する。
+        // drain スレッドが job_tx.clone() を保持しているためワーカースレッドは終了しない。
+        // 元の job_tx は検証後に復元してから drop する
+        // (置き換えたまま drop すると worker が recv でブロックし続け、join がデッドロックする)。
+        let (dead_tx, dead_rx) = mpsc::channel::<Job<()>>();
+        drop(dead_rx);
+        let original_job_tx = std::mem::replace(&mut encoder.job_tx, dead_tx);
 
         let result = encoder.reconfigure(ReconfigureParams::default());
         assert_eq!(
             result.unwrap_err().to_string(),
             "reconfigure() failed: send failed"
         );
+
+        // 元の job_tx を復元してから drop する
+        encoder.job_tx = original_job_tx;
     }
 
     /// drain スレッドによってコールバックハンドラが遅延なく発火することを確認する
@@ -2888,31 +2903,36 @@ mod tests {
 
     #[test]
     fn test_get_sequence_params_after_encoder_worker_terminated() {
-        use std::mem::ManuallyDrop;
-
         let (tx, _rx) = mpsc::sync_channel::<Result<EncodedFrame<()>, Error>>(4);
         let config = test_encoder_config(CodecConfig::H264(H264EncoderConfig {
             profile: None,
             idr_period: None,
         }));
 
-        let mut encoder = ManuallyDrop::new(
-            Encoder::new(
-                config,
-                FnEncodeHandler::new(move |frame| {
-                    let _ = tx.send(frame);
-                }),
-            )
-            .unwrap(),
-        );
+        let mut encoder = Encoder::new(
+            config,
+            FnEncodeHandler::new(move |frame| {
+                let _ = tx.send(frame);
+            }),
+        )
+        .expect("H.264 エンコーダーの作成に失敗した");
 
-        unsafe { ManuallyDrop::drop(&mut encoder) };
+        // 受信側を先に drop したチャネルで置き換えて send 失敗を検証する。
+        // drain スレッドが job_tx.clone() を保持しているためワーカースレッドは終了しない。
+        // 元の job_tx は検証後に復元してから drop する
+        // (置き換えたまま drop すると worker が recv でブロックし続け、join がデッドロックする)。
+        let (dead_tx, dead_rx) = mpsc::channel::<Job<()>>();
+        drop(dead_rx);
+        let original_job_tx = std::mem::replace(&mut encoder.job_tx, dead_tx);
 
         let result = encoder.get_sequence_params();
         assert_eq!(
             result.unwrap_err().to_string(),
             "get_sequence_params() failed: send failed"
         );
+
+        // 元の job_tx を復元してから drop する
+        encoder.job_tx = original_job_tx;
     }
 
     #[test]
