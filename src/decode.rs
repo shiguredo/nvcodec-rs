@@ -1359,6 +1359,76 @@ mod tests {
         h264_data
     }
 
+    /// H.265 の黒フレームデータ (640x480) を生成する
+    ///
+    /// test_decode_h265_black_frame と同じ VPS / SPS / PPS / フレームデータを
+    /// Annex B 形式 (start code 0x00000001) で結合する。
+    fn h265_black_frame_data() -> Vec<u8> {
+        let vps = vec![
+            64, 1, 12, 1, 255, 255, 1, 96, 0, 0, 3, 0, 144, 0, 0, 3, 0, 0, 3, 0, 90, 149, 152, 9,
+        ];
+        let sps = vec![
+            66, 1, 1, 1, 96, 0, 0, 3, 0, 144, 0, 0, 3, 0, 0, 3, 0, 90, 160, 5, 2, 1, 225, 101, 149,
+            154, 73, 50, 188, 5, 160, 32, 0, 0, 3, 0, 32, 0, 0, 3, 3, 33,
+        ];
+        let pps = vec![68, 1, 193, 114, 180, 98, 64];
+        let frame_data = vec![
+            40, 1, 175, 29, 16, 90, 181, 140, 90, 213, 247, 1, 91, 255, 242, 78, 254, 199, 0, 31,
+            209, 50, 148, 21, 162, 38, 146, 0, 0, 3, 1, 203, 169, 113, 202, 5, 24, 129, 39, 128, 0,
+            0, 3, 0, 7, 204, 147, 13, 148, 32, 0, 0, 3, 0, 0, 3, 0, 12, 24, 135, 0, 0, 3, 0, 0, 3,
+            0, 0, 3, 0, 28, 240, 0, 0, 3, 0, 0, 3, 0, 0, 3, 0, 8, 104, 0, 0, 3, 0, 0, 3, 0, 0, 3,
+            0, 104, 192, 0, 0, 3, 0, 0, 3, 0, 0, 3, 1, 223, 0, 0, 3, 0, 9, 248,
+        ];
+
+        let mut h265_data = Vec::new();
+        let start_code = [0u8, 0, 0, 1];
+
+        h265_data.extend_from_slice(&start_code);
+        h265_data.extend_from_slice(&vps);
+        h265_data.extend_from_slice(&start_code);
+        h265_data.extend_from_slice(&sps);
+        h265_data.extend_from_slice(&start_code);
+        h265_data.extend_from_slice(&pps);
+        h265_data.extend_from_slice(&start_code);
+        h265_data.extend_from_slice(&frame_data);
+
+        h265_data
+    }
+
+    /// H.265 デコーダーの再作成を短時間で繰り返すと、
+    /// 2〜3 回目の cuvidCreateDecoder が失敗することがあることの再現テスト
+    ///
+    /// 修正前 (cuvid_destroy_decoder の後に GPU 同期がない) は
+    /// 2〜3 回目の再作成で失敗し、修正後 (cu_ctx_synchronize あり) は失敗しない。
+    #[test]
+    fn test_decoder_recreate_h265_repeatedly() {
+        let h265_data = h265_black_frame_data();
+
+        for _ in 0..5 {
+            let (tx, rx) = mpsc::sync_channel::<Result<DecodedFrame<()>, Error>>(4);
+            let decoder = Decoder::new(
+                test_decoder_config(DecoderCodec::Hevc),
+                FnDecodeHandler::new(move |frame| {
+                    let _ = tx.send(frame);
+                }),
+            )
+            .expect("H.265 デコーダーの作成に失敗した");
+
+            decoder
+                .decode(&h265_data, ())
+                .expect("H.265 データのデコードに失敗した");
+            decoder.flush().expect("flush に失敗した");
+
+            let frame = rx
+                .recv()
+                .expect("デコード済みフレームの受信に失敗した")
+                .expect("デコードエラーが発生した");
+            assert_black_frame(&frame, 640, 480);
+
+            drop(decoder);
+        }
+    }
+
     /// stats() でデコーダーの統計値が取得できることを確認する
     ///
     /// H.264 の 1 フレームをデコードすると:
