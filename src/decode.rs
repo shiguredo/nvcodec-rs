@@ -1398,14 +1398,16 @@ mod tests {
     /// H.265 デコーダーの再作成を短時間で繰り返すと、
     /// 2〜3 回目の cuvidCreateDecoder が失敗することがあることの再現テスト
     ///
+    /// issue の再現手順 (decode → 途中で drop → 新規 Decoder::new を繰り返す) に合わせ、
+    /// flush せずにデコード処理が GPU 側に残った状態で drop して再作成を繰り返す。
     /// 修正前 (cuvid_destroy_decoder の後に GPU 同期がない) は
     /// 2〜3 回目の再作成で失敗し、修正後 (cu_ctx_synchronize あり) は失敗しない。
     #[test]
     fn test_decoder_recreate_h265_repeatedly() {
         let h265_data = h265_black_frame_data();
 
-        for _ in 0..5 {
-            let (tx, rx) = mpsc::sync_channel::<Result<DecodedFrame<()>, Error>>(4);
+        for _ in 0..10 {
+            let (tx, _rx) = mpsc::sync_channel::<Result<DecodedFrame<()>, Error>>(4);
             let decoder = Decoder::new(
                 test_decoder_config(DecoderCodec::Hevc),
                 FnDecodeHandler::new(move |frame| {
@@ -1417,14 +1419,8 @@ mod tests {
             decoder
                 .decode(&h265_data, ())
                 .expect("H.265 データのデコードに失敗した");
-            decoder.flush().expect("flush に失敗した");
 
-            let frame = rx
-                .recv()
-                .expect("デコード済みフレームの受信に失敗した")
-                .expect("デコードエラーが発生した");
-            assert_black_frame(&frame, 640, 480);
-
+            // flush せずに drop する (デコード処理が GPU 側に残った状態で再作成する)
             drop(decoder);
         }
     }
