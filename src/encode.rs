@@ -495,7 +495,6 @@ struct EncoderState {
     i_to_send: usize,
     i_got: usize,
     mapped_inputs: Vec<Option<sys::NV_ENC_INPUT_PTR>>,
-
     stats: Arc<EncoderStats>,
 }
 
@@ -543,7 +542,6 @@ impl EncoderState {
 
             let n_encoder_buffer = config.frame_interval_p as usize + 3;
 
-            // max_in_flight_frames に frame_interval_p + 2 を設定する
             let stats = Arc::new(EncoderStats::default());
             stats
                 .max_in_flight_frames
@@ -1323,7 +1321,7 @@ impl<H: EncodeHandler> Encoder<H> {
 
     /// エンコーダーの統計値を取得する
     ///
-    /// 返される参照は共有カウンターへの参照であり、`get()` を呼ぶたびに
+    /// 返される参照は共有統計値への参照であり、読み出すたびに
     /// 最新値が読める。保持したい場合は `clone()` でスナップショットを取得する。
     pub fn stats(&self) -> &EncoderStats {
         &self.stats

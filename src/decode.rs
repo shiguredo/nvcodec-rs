@@ -138,7 +138,6 @@ struct DecoderState {
     surface_format: u32,
     frame_tx: Sender<Result<RawFrame, Error>>,
     frame_rx: Receiver<Result<RawFrame, Error>>,
-
     stats: Arc<DecoderStats>,
 }
 
@@ -429,7 +428,7 @@ impl<H: DecodeHandler> Decoder<H> {
 
     /// デコーダーの統計値を取得する
     ///
-    /// 返される参照は共有カウンターへの参照であり、`get()` を呼ぶたびに
+    /// 返される参照は共有統計値への参照であり、読み出すたびに
     /// 最新値が読める。保持したい場合は `clone()` でスナップショットを取得する。
     pub fn stats(&self) -> &DecoderStats {
         &self.stats

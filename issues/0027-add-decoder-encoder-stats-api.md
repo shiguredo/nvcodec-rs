@@ -11,7 +11,7 @@
 対象は observability 目的で見たい値全般で、以下 2 種類を同じ `Stats` 構造体に含める。
 
 - **counter**: monotonically increasing な通算値 (`total_create_decoder_count` 等)
-- **gauge**: 現在値または encoder ライフサイクル中変わらない静的な値 (`max_in_flight_frames` 等)
+- **gauge**: 現在値を表す時点値 (`max_in_flight_frames` 等)
 
 利用側 (hisui 等) はメトリクス収集・アラート・テストでの挙動検証・in-flight 制御にこの情報を使う。個別 API を都度生やすのではなく、`Stats` 構造体を返す統一 API として設計する。
 
