@@ -24,7 +24,7 @@ pub struct DecoderCaps {
 }
 
 /// デコーダーの統計値
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct DecoderStats {
     /// cuvidCreateDecoder の通算成功回数 (初回の create を含む)
     pub total_create_decoder_count: Counter,
@@ -50,25 +50,12 @@ pub struct DecoderStats {
 }
 
 impl DecoderStats {
-    /// すべて 0 で初期化した統計値を作成する
-    fn new() -> Self {
-        Self {
-            total_create_decoder_count: Counter::new(),
-            total_reconfigure_decoder_count: Counter::new(),
-            total_reconfigure_failure_count: Counter::new(),
-            total_decode_count: Counter::new(),
-            total_sequence_callback_count: Counter::new(),
-            total_decode_callback_count: Counter::new(),
-            total_output_frame_count: Counter::new(),
-        }
-    }
-
     /// 入力されたがまだ出力されていないフレーム数 (in-flight 相当) を返す
     ///
     /// `total_decode_count - total_output_frame_count` で算出する。
-    /// 出力フレーム数は入力フレーム数を超えないため通常は負数にならないが、
-    /// 2 つのカウンターの読み取りは原子的でないため saturating で算出する。
     pub fn in_flight_frames(&self) -> u64 {
+        // 出力フレーム数は入力フレーム数を超えないため通常は負数にならないが、
+        // 2 つのカウンターの読み取りは原子的でないため saturating で算出する
         self.total_decode_count
             .get()
             .saturating_sub(self.total_output_frame_count.get())
@@ -260,7 +247,7 @@ impl DecoderState {
                 surface_format: config.surface_format.to_sys(),
                 frame_tx,
                 frame_rx,
-                stats: DecoderStats::new(),
+                stats: DecoderStats::default(),
             });
 
             // 映像パーサーを作成する

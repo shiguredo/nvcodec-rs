@@ -397,7 +397,7 @@ pub struct EncoderCaps {
 }
 
 /// エンコーダの統計値
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct EncoderStats {
     /// "encoder buffer is full" エラーの通算発生回数
     pub total_encoder_buffer_full_count: Counter,
@@ -406,21 +406,6 @@ pub struct EncoderStats {
     /// "encoder buffer is full" エラーを発生させずに in-flight にできる最大フレーム数
     /// (n_encoder_buffer - 1 = frame_interval_p + 2、生成時に確定する静的な値)
     pub max_in_flight_frames: Counter,
-}
-
-impl EncoderStats {
-    /// すべて 0 で初期化した統計値を作成する
-    ///
-    /// `max_in_flight_frames` には `frame_interval_p + 2` を設定する
-    /// (n_encoder_buffer = frame_interval_p + 3 のバッファを 1 つ空けて運用する)
-    fn new(frame_interval_p: u32) -> Self {
-        let max_in_flight_frames = Counter::new();
-        max_in_flight_frames.add(frame_interval_p as u64 + 2);
-        Self {
-            total_encoder_buffer_full_count: Counter::new(),
-            max_in_flight_frames,
-        }
-    }
 }
 
 /// エンコーダ再構成パラメータ
@@ -544,6 +529,13 @@ impl EncoderState {
 
             let n_encoder_buffer = config.frame_interval_p as usize + 3;
 
+            // 統計値はすべて 0 で初期化し、max_in_flight_frames に frame_interval_p + 2 を設定する
+            // (n_encoder_buffer = frame_interval_p + 3 のバッファを 1 つ空けて運用する)
+            let stats = EncoderStats::default();
+            stats
+                .max_in_flight_frames
+                .add(config.frame_interval_p as u64 + 2);
+
             let mut state = Self {
                 lib: lib.clone(),
                 ctx,
@@ -563,7 +555,7 @@ impl EncoderState {
                 i_to_send: 0,
                 i_got: 0,
                 mapped_inputs: vec![None; n_encoder_buffer],
-                stats: EncoderStats::new(config.frame_interval_p),
+                stats,
             };
 
             // デフォルトパラメータでエンコーダーを初期化

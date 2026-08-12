@@ -34,7 +34,7 @@
 
 ```rust
 /// デコーダーの統計値
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct DecoderStats {
     /// cuvidCreateDecoder の通算成功回数 (初回の create を含む)
     pub total_create_decoder_count: Counter,
@@ -63,16 +63,17 @@ impl DecoderStats {
     /// 入力されたがまだ出力されていないフレーム数 (in-flight 相当) を返す
     ///
     /// `total_decode_count - total_output_frame_count` で算出する。
-    /// 出力フレーム数は入力フレーム数を超えないため通常は負数にならないが、
-    /// 2 つのカウンターの読み取りは原子的でないため saturating で算出する。
     pub fn in_flight_frames(&self) -> u64 {
+        // 出力フレーム数は入力フレーム数を超えないため通常は負数にならないが、
+        // 2 つのカウンターの読み取りは原子的でないため saturating で算出する
         self.total_decode_count
             .get()
             .saturating_sub(self.total_output_frame_count.get())
     }
 }
 
-#[derive(Debug, Clone)]
+/// エンコーダの統計値
+#[derive(Debug, Clone, Default)]
 pub struct EncoderStats {
     /// "encoder buffer is full" エラーの通算発生回数
     pub total_encoder_buffer_full_count: Counter,
