@@ -40,19 +40,21 @@ pub struct DecoderStats {
     pub total_create_decoder_count: Counter,
 
     /// cuvidReconfigureDecoder の通算成功回数
+    /// (reconfigure 経路は 0024 マージ後に導入予定のため、それまでは常に 0 を返す)
     pub total_reconfigure_decoder_count: Counter,
 
     /// cuvidReconfigureDecoder 呼び出しの通算失敗回数
-    /// (解像度上限超過の事前検証エラーや cuvidCreateDecoder の失敗は含まない)
+    /// (解像度上限超過の事前検証エラーや cuvidCreateDecoder の失敗は含まない。
+    ///  reconfigure 経路は 0024 マージ後に導入予定のため、それまでは常に 0 を返す)
     pub total_reconfigure_failure_count: Counter,
 
-    /// decode() の通算呼び出し回数 (入力フレーム数)
+    /// decode() で正常に送信された通算回数
     pub total_decode_count: Counter,
 
-    /// シーケンスコールバックの通算回数 (解像度変更の回数)
+    /// シーケンスコールバックの通算回数 (初回のシーケンス処理を含む)
     pub total_sequence_callback_count: Counter,
 
-    /// デコードコールバックの通算回数 (cuvidDecodePicture の実行回数)
+    /// デコードコールバックの通算回数 (cuvidDecodePicture の呼び出し試行回数)
     pub total_decode_callback_count: Counter,
 
     /// 出力フレーム数 (表示コールバックの通算回数)
@@ -63,6 +65,10 @@ impl DecoderStats {
     /// 入力されたがまだ出力されていないフレーム数 (in-flight 相当) を返す
     ///
     /// `total_decode_count - total_output_frame_count` で算出する。
+    /// 各カウンターは個別に読み取られるため近似値であり、`decode()` は
+    /// 1 回の呼び出しに複数フレームを渡せるためバッファ内の実フレーム数とは
+    /// 一致しない。デコードエラー等で出力されなかったフレームがあると
+    /// 0 に戻らないことがある。
     pub fn in_flight_frames(&self) -> u64 {
         // 出力フレーム数は入力フレーム数を超えないため通常は負数にならないが、
         // 2 つのカウンターの読み取りは原子的でないため saturating で算出する
@@ -78,10 +84,9 @@ pub struct EncoderStats {
     /// "encoder buffer is full" エラーの通算発生回数
     pub total_encoder_buffer_full_count: Counter,
 
-    // gauge (encoder のライフサイクル中変わらない静的な値)
     /// "encoder buffer is full" エラーを発生させずに in-flight にできる最大フレーム数
     /// (n_encoder_buffer - 1 = frame_interval_p + 2、生成時に確定する静的な値)
-    pub max_in_flight_frames: Counter,
+    pub max_in_flight_frames: Gauge,
 }
 ```
 
@@ -92,11 +97,11 @@ pub struct EncoderStats {
 | 構造体 | 種別 | フィールド | 説明 |
 |---|---|---|---|
 | `DecoderStats` | counter | `total_create_decoder_count` | cuvidCreateDecoder の通算成功回数 (初回の create を含む) |
-| `DecoderStats` | counter | `total_reconfigure_decoder_count` | cuvidReconfigureDecoder の通算成功回数 |
-| `DecoderStats` | counter | `total_reconfigure_failure_count` | cuvidReconfigureDecoder 呼び出しの通算失敗回数 |
-| `DecoderStats` | counter | `total_decode_count` | decode() の通算呼び出し回数 (入力フレーム数) |
-| `DecoderStats` | counter | `total_sequence_callback_count` | シーケンスコールバックの通算回数 (解像度変更の回数) |
-| `DecoderStats` | counter | `total_decode_callback_count` | デコードコールバックの通算回数 (cuvidDecodePicture の実行回数) |
+| `DecoderStats` | counter | `total_reconfigure_decoder_count` | cuvidReconfigureDecoder の通算成功回数 (reconfigure 経路は 0024 マージ後に導入予定のため、それまでは常に 0) |
+| `DecoderStats` | counter | `total_reconfigure_failure_count` | cuvidReconfigureDecoder 呼び出しの通算失敗回数 (同上) |
+| `DecoderStats` | counter | `total_decode_count` | decode() で正常に送信された通算回数 |
+| `DecoderStats` | counter | `total_sequence_callback_count` | シーケンスコールバックの通算回数 (初回のシーケンス処理を含む) |
+| `DecoderStats` | counter | `total_decode_callback_count` | デコードコールバックの通算回数 (cuvidDecodePicture の呼び出し試行回数) |
 | `DecoderStats` | counter | `total_output_frame_count` | 出力フレーム数 (表示コールバックの通算回数) |
 | `EncoderStats` | counter | `total_encoder_buffer_full_count` | "encoder buffer is full" エラーの通算発生回数 |
 | `EncoderStats` | gauge (静的) | `max_in_flight_frames` | "encoder buffer is full" エラーを発生させずに in-flight にできる最大フレーム数 (`n_encoder_buffer - 1` = `frame_interval_p + 2`) |
@@ -107,7 +112,6 @@ pub struct EncoderStats {
 |---|---|---|---|
 | `DecoderStats` | counter | `total_decode_picture_count` | cuvidDecodePicture の通算成功回数 (デコードフレーム数) |
 | `DecoderStats` | counter | `total_decode_failure_count` | cuvidDecodePicture の通算失敗回数 |
-| `DecoderStats` | counter | `total_output_frame_count` | 出力フレーム数 (display コールバックの通算回数) |
 | `DecoderStats` | gauge (動的) | `current_width` / `current_height` | 現在のデコード解像度 |
 | `EncoderStats` | counter | `total_encode_count` | encode_frame の通算成功回数 (送信数) |
 | `EncoderStats` | counter | `total_encode_failure_count` | encode_frame の通算失敗回数 |
@@ -132,8 +136,8 @@ pub struct EncoderStats {
 ### 実装方式
 
 - **counter**: 新規 `src/stats.rs` に `Counter` 型 (`AtomicU64` の薄いラッパー、`new()` / `get()` / `inc()` / `add()`、すべて relaxed order) を追加する。共有は `DecoderState` / `EncoderState` (worker スレッド側) と `Decoder` / `Encoder` (pub 構造体側) が `Arc<DecoderStats>` / `Arc<EncoderStats>` を共有することで行う。worker スレッド側が `inc()` でインクリメントする
-- **gauge (静的)**: `max_in_flight_frames` は生成時に確定する値だが、統一性のため `Counter` 型で表現し、生成時に `add(frame_interval_p + 2)` で初期化する
-- **gauge (動的)**: 現状スコープ外だが、追加する場合は `Counter` と同様に `src/stats.rs` に `Gauge` 型 (`AtomicU64` / `AtomicU32` の薄いラッパー) を追加して対応する想定
+- **gauge (静的)**: `max_in_flight_frames` は生成時に確定する値であり、`src/stats.rs` の `Gauge` 型 (`AtomicU64` の薄いラッパー、`new()` / `get()` / `set()`、すべて relaxed order) で表現し、生成時に `set(frame_interval_p + 2)` で初期化する
+- **gauge (動的)**: 現状スコープ外だが、追加する場合は `Gauge` 型 (既に導入済み) で `set()` により現在値を更新して対応する想定
 - **呼び出しスレッド**: `Decoder` / `Encoder` はフィールド (`SyncSender` / `Sender` / `Option<JoinHandle>` / `Arc<DecoderStats>` / `Arc<EncoderStats>`) がすべて `Sync` のため、自動導出で既に `Sync` である (unsafe impl の追加は不要)。`stats()` は `&self` で共有している `DecoderStats` / `EncoderStats` への参照を返すため、`Arc<Decoder>` / `Arc<Encoder>` をメトリクス収集スレッド等へ共有すれば他スレッドから呼べる
 
 いずれも以下の要件を満たす:
@@ -164,7 +168,7 @@ pub struct EncoderStats {
 - `Encoder::stats() -> &EncoderStats` が pub で追加され、以下の 2 項目が取得できる:
   - counter: `total_encoder_buffer_full_count`
   - gauge: `max_in_flight_frames`
-- 統計値は `src/stats.rs` の `Counter` 型 (`AtomicU64` の薄いラッパー) で実装され、`stats()` がロックフリーかつ軽量である (参照返しで値の詰め替えがない)
+- 統計値は `src/stats.rs` の `Counter` 型 (通算値) と `Gauge` 型 (時点値) で実装され、`stats()` がロックフリーかつ軽量である (参照返しで値の詰め替えがない)
 - `Decoder` / `Encoder` は既に `Sync` であり、他スレッド (メトリクス収集スレッド等) から `&Decoder` / `&Encoder` 経由で `stats()` を呼べる
 - 単体テスト or 結合テストがある (`total_create_decoder_count` / `total_encoder_buffer_full_count` のインクリメント検証 + `max_in_flight_frames` の値検証)
 - `CHANGES.md` に `[ADD]` エントリが追加されている
@@ -176,10 +180,10 @@ pub struct EncoderStats {
 
 ### 変更対象ファイル
 
-- `src/stats.rs` — `Counter` 型 (新規追加)。`AtomicU64` の薄いラッパー。doc コメントで将来の `Gauge` 型追加余地を明記
-- `src/lib.rs` — `mod stats;` の追加と `Counter` / `DecoderStats` / `EncoderStats` の re-export 追加
+- `src/stats.rs` — `Counter` 型 (通算値) と `Gauge` 型 (時点値) を新規追加。どちらも `AtomicU64` の薄いラッパー
+- `src/lib.rs` — `mod stats;` の追加と `Counter` / `Gauge` / `DecoderStats` / `EncoderStats` の re-export 追加
 - `src/decode.rs` — `DecoderStats` 定義、`DecoderState` に `stats: Arc<DecoderStats>` フィールド追加、`Decoder` 構造体に `stats: Arc<DecoderStats>` フィールド追加 (Arc で共有)、`Decoder::stats()` 追加 (参照返し)、`decode()` で `total_decode_count` インクリメント、各コールバックで対応するカウンターをインクリメント
-- `src/encode.rs` — `EncoderStats` 定義、`EncoderState` に `stats: Arc<EncoderStats>` フィールド追加、`Encoder` 構造体に `stats: Arc<EncoderStats>` フィールド追加 (Arc で共有)、`Encoder::stats()` 追加 (参照返し)、`max_in_flight_frames` は生成時に `add(frame_interval_p + 2)` で初期化、`encoder buffer is full` 発生箇所でインクリメント
+- `src/encode.rs` — `EncoderStats` 定義、`EncoderState` に `stats: Arc<EncoderStats>` フィールド追加、`Encoder` 構造体に `stats: Arc<EncoderStats>` フィールド追加 (Arc で共有)、`Encoder::stats()` 追加 (参照返し)、`max_in_flight_frames` は生成時に `set(frame_interval_p + 2)` で初期化、`encoder buffer is full` 発生箇所でインクリメント
 - `README.md` / `skills/shiguredo-nvcodec/SKILL.md` — 統計値取得節の追加 + in-flight 制御のレシピ
 - `CHANGES.md` — 追記例:
   - `- [ADD] Decoder::stats() / Encoder::stats() で内部状態 (counter / gauge) を取得できるようにする`

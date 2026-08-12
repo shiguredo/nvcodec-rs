@@ -52,7 +52,8 @@ docs.rs 向けには `DOCS_RS=1 cargo doc --no-deps` でスタブヘッダー経
 | `EncodedFrame<T>` | エンコード済みフレーム | `data()`, `timestamp()`, `picture_type()`, `user_data()`, `into_parts()` |
 | `EncoderCaps` | エンコーダケーパビリティ | `supported_ratecontrol_modes`, `support_yuv444_encode`, `support_yuv422_encode`, `support_meonly_mode`, `width_max/min`, `height_max/min`, `num_max_bframes`, `support_10bit_encode`, `support_lossless_encode`, `support_lookahead`, `support_temporal_aq` |
 | `EncoderStats` | エンコーダ統計値 (全フィールド `Counter`) | counter: `total_encoder_buffer_full_count` / gauge: `max_in_flight_frames` |
-| `Counter` | 統計値のプリミティブ型 (内部で `Arc` を持つ共有可能なカウンター) | `new()`, `get() -> u64`, `inc()`, `add(u64)` |
+| `Counter` | 統計値のプリミティブ型 (通算値。`AtomicU64` の薄いラッパー。共有は `Arc<DecoderStats>` / `Arc<EncoderStats>` で行う) | `new()`, `get() -> u64`, `inc()`, `add(u64)` |
+| `Gauge` | 統計値のプリミティブ型 (時点値。`AtomicU64` の薄いラッパー。共有は `Arc<DecoderStats>` / `Arc<EncoderStats>` で行う) | `new()`, `get() -> u64`, `set(u64)` |
 
 **プリセット定数** (`Preset`): `P1` (最高速) / `P2` / `P3` / `P4` (バランス) / `P5` / `P6` / `P7` (最高品質)
 
@@ -419,9 +420,9 @@ assert_eq!(frame.width(), 1280);  // 自動的に追従
 
 `Decoder::stats()` / `Encoder::stats()` で、デコーダー / エンコーダーの内部状態を統計値として取得できる。
 
-統計値はすべて `Counter` 型で表現され、`get()` で現在値を読み出す。
+統計値は `Counter` 型 (通算値) と `Gauge` 型 (時点値) で表現され、`get()` で現在値を読み出す。`stats()` が返すのは共有カウンターへの参照であり、`get()` を呼ぶたびに最新値が読める (値を保持したい場合は `clone()` でスナップショットを取得)。
 
-- counter: 単調増加する通算値 (デコーダー作成回数、入力フレーム数、"encoder buffer is full" エラー発生回数等)
+- counter: 単調増加する通算値 (デコーダー作成回数、"encoder buffer is full" エラー発生回数等)
 - gauge: ライフサイクル中変わらない静的な値 (in-flight 上限等)
 
 ```rust
@@ -454,7 +455,7 @@ encoder.flush()?;
 ```rust
 let stats = decoder.stats();
 println!(
-    "input frames: {}, output frames: {}, in flight: {}",
+    "decode calls: {}, output frames: {}, in flight: {}",
     stats.total_decode_count.get(),
     stats.total_output_frame_count.get(),
     stats.in_flight_frames()

@@ -25,25 +25,31 @@ pub struct DecoderCaps {
 }
 
 /// デコーダーの統計値
+///
+/// 各フィールドはワーカスレッドと共有するカウンターで、`get()` で現在値を読み出す。
+/// `clone()` は各カウンターを個別に読み取ったスナップショットであり、
+/// フィールド間の一貫性は保証されない。
 #[derive(Debug, Clone, Default)]
 pub struct DecoderStats {
     /// cuvidCreateDecoder の通算成功回数 (初回の create を含む)
     pub total_create_decoder_count: Counter,
 
     /// cuvidReconfigureDecoder の通算成功回数
+    /// (reconfigure 経路は 0024 マージ後に導入予定のため、それまでは常に 0 を返す)
     pub total_reconfigure_decoder_count: Counter,
 
     /// cuvidReconfigureDecoder 呼び出しの通算失敗回数
-    /// (解像度上限超過の事前検証エラーや cuvidCreateDecoder の失敗は含まない)
+    /// (解像度上限超過の事前検証エラーや cuvidCreateDecoder の失敗は含まない。
+    ///  reconfigure 経路は 0024 マージ後に導入予定のため、それまでは常に 0 を返す)
     pub total_reconfigure_failure_count: Counter,
 
-    /// decode() の通算呼び出し回数 (入力フレーム数)
+    /// decode() で正常に送信された通算回数
     pub total_decode_count: Counter,
 
-    /// シーケンスコールバックの通算回数 (解像度変更の回数)
+    /// シーケンスコールバックの通算回数 (初回のシーケンス処理を含む)
     pub total_sequence_callback_count: Counter,
 
-    /// デコードコールバックの通算回数 (cuvidDecodePicture の実行回数)
+    /// デコードコールバックの通算回数 (cuvidDecodePicture の呼び出し試行回数)
     pub total_decode_callback_count: Counter,
 
     /// 出力フレーム数 (表示コールバックの通算回数)
@@ -54,6 +60,10 @@ impl DecoderStats {
     /// 入力されたがまだ出力されていないフレーム数 (in-flight 相当) を返す
     ///
     /// `total_decode_count - total_output_frame_count` で算出する。
+    /// 各カウンターは個別に読み取られるため近似値であり、`decode()` は
+    /// 1 回の呼び出しに複数フレームを渡せるためバッファ内の実フレーム数とは
+    /// 一致しない。デコードエラー等で出力されなかったフレームがあると
+    /// 0 に戻らないことがある。
     pub fn in_flight_frames(&self) -> u64 {
         // 出力フレーム数は入力フレーム数を超えないため通常は負数にならないが、
         // 2 つのカウンターの読み取りは原子的でないため saturating で算出する
@@ -131,7 +141,6 @@ struct DecoderState {
     frame_tx: Sender<Result<RawFrame, Error>>,
     frame_rx: Receiver<Result<RawFrame, Error>>,
 
-    // 統計値 (Decoder 構造体と Arc で共有する)
     stats: Arc<DecoderStats>,
 }
 
@@ -404,7 +413,6 @@ impl<H: DecodeHandler> Decoder<H> {
 
         let state = DecoderState::new(config)?;
 
-        // 統計値をワーカスレッド (DecoderState) と Arc で共有する
         let stats = state.stats.clone();
 
         let worker = std::thread::Builder::new()
@@ -423,8 +431,8 @@ impl<H: DecodeHandler> Decoder<H> {
 
     /// デコーダーの統計値を取得する
     ///
-    /// counter はワーカスレッドがインクリメントした通算値で、
-    /// ロックフリーの atomic load で読み出す。
+    /// 返される参照は共有カウンターへの参照であり、`get()` を呼ぶたびに
+    /// 最新値が読める。保持したい場合は `clone()` でスナップショットを取得する。
     pub fn stats(&self) -> &DecoderStats {
         &self.stats
     }
@@ -1395,7 +1403,7 @@ mod tests {
         assert_eq!(decoder.stats().total_decode_callback_count.get(), 1);
         // 1 フレームが出力される
         assert_eq!(decoder.stats().total_output_frame_count.get(), 1);
-        // flush 済みなので in-flight (入力 - 出力) は 0 になる
+        // 1 バッファに 1 フレームを渡しているため、flush 後の in-flight (入力 - 出力) は 0 になる
         assert_eq!(decoder.stats().in_flight_frames(), 0);
 
         drop(decoder);

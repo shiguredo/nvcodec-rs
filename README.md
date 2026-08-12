@@ -303,9 +303,9 @@ assert_eq!(frame.width(), 1280);  // 自動的に変更される
 
 `Decoder::stats()` / `Encoder::stats()` で、デコーダー / エンコーダーの内部状態を統計値として取得できます。
 
-統計値はすべて `Counter` 型で表現され、`get()` で現在値を読み出します。
+統計値は `Counter` 型 (通算値) と `Gauge` 型 (時点値) で表現され、`get()` で現在値を読み出します。`stats()` が返すのは共有カウンターへの参照であり、`get()` を呼ぶたびに最新値が読めます (値を保持したい場合は `clone()` でスナップショットを取得)。
 
-- counter: 単調増加する通算値 (デコーダー作成回数、入力フレーム数、"encoder buffer is full" エラー発生回数等)
+- counter: 単調増加する通算値 (デコーダー作成回数、"encoder buffer is full" エラー発生回数等)
 - gauge: ライフサイクル中変わらない静的な値 (in-flight 上限等)
 
 ```rust
@@ -338,7 +338,7 @@ encoder.flush()?;
 ```rust
 let stats = decoder.stats();
 println!(
-    "input frames: {}, output frames: {}, in flight: {}",
+    "decode calls: {}, output frames: {}, in flight: {}",
     stats.total_decode_count.get(),
     stats.total_output_frame_count.get(),
     stats.in_flight_frames()

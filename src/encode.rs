@@ -5,7 +5,11 @@ use std::sync::Arc;
 use std::sync::mpsc::{self, Receiver, Sender, SyncSender};
 use std::thread::JoinHandle;
 
-use crate::{CudaLibrary, Error, ReleaseGuard, stats::Counter, sys};
+use crate::{
+    CudaLibrary, Error, ReleaseGuard,
+    stats::{Counter, Gauge},
+    sys,
+};
 
 /// プリセット
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -398,15 +402,18 @@ pub struct EncoderCaps {
 }
 
 /// エンコーダの統計値
+///
+/// 各フィールドはワーカスレッドと共有する統計値で、`get()` で現在値を読み出す。
+/// `clone()` は各フィールドを個別に読み取ったスナップショットであり、
+/// フィールド間の一貫性は保証されない。
 #[derive(Debug, Clone, Default)]
 pub struct EncoderStats {
     /// "encoder buffer is full" エラーの通算発生回数
     pub total_encoder_buffer_full_count: Counter,
 
-    // gauge (encoder のライフサイクル中変わらない静的な値)
     /// "encoder buffer is full" エラーを発生させずに in-flight にできる最大フレーム数
     /// (n_encoder_buffer - 1 = frame_interval_p + 2、生成時に確定する静的な値)
-    pub max_in_flight_frames: Counter,
+    pub max_in_flight_frames: Gauge,
 }
 
 /// エンコーダ再構成パラメータ
@@ -482,7 +489,6 @@ struct EncoderState {
     i_got: usize,
     mapped_inputs: Vec<Option<sys::NV_ENC_INPUT_PTR>>,
 
-    // 統計値 (Encoder 構造体と Arc で共有する)
     stats: Arc<EncoderStats>,
 }
 
@@ -530,12 +536,12 @@ impl EncoderState {
 
             let n_encoder_buffer = config.frame_interval_p as usize + 3;
 
-            // 統計値はすべて 0 で初期化し、max_in_flight_frames に frame_interval_p + 2 を設定する
+            // max_in_flight_frames に frame_interval_p + 2 を設定する
             // (n_encoder_buffer = frame_interval_p + 3 のバッファを 1 つ空けて運用する)
             let stats = Arc::new(EncoderStats::default());
             stats
                 .max_in_flight_frames
-                .add(config.frame_interval_p as u64 + 2);
+                .set(config.frame_interval_p as u64 + 2);
 
             let mut state = Self {
                 lib: lib.clone(),
@@ -1282,7 +1288,6 @@ impl<H: EncodeHandler> Encoder<H> {
 
         let state = EncoderState::new(&config)?;
 
-        // 統計値をワーカスレッド (EncoderState) と Arc で共有する
         let stats = state.stats.clone();
 
         // drain スレッドを起動
@@ -1312,8 +1317,8 @@ impl<H: EncodeHandler> Encoder<H> {
 
     /// エンコーダーの統計値を取得する
     ///
-    /// counter はワーカスレッドがインクリメントした通算値で、
-    /// ロックフリーの atomic load で読み出す。
+    /// 返される参照は共有カウンターへの参照であり、`get()` を呼ぶたびに
+    /// 最新値が読める。保持したい場合は `clone()` でスナップショットを取得する。
     pub fn stats(&self) -> &EncoderStats {
         &self.stats
     }

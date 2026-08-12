@@ -4,7 +4,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 /// 単調増加カウンター
 ///
-/// 統計値はすべてこの型で表現する。`AtomicU64` の薄いラッパーであり、
+/// 通算値を保持する。`AtomicU64` の薄いラッパーであり、
 /// 共有が必要な場合はカウンターを含む構造体 (`DecoderStats` / `EncoderStats` 等) を
 /// `Arc` で包んで行う。ワーカスレッドが `inc()` でインクリメントし、
 /// 利用側が `get()` で読み出す。
@@ -21,8 +21,6 @@ impl Counter {
     }
 
     /// 現在の値を読み出す
-    ///
-    /// relaxed order の atomic load で、単純な `u64` のスナップショットを返す
     pub fn get(&self) -> u64 {
         self.0.load(Ordering::Relaxed)
     }
@@ -33,14 +31,49 @@ impl Counter {
     }
 
     /// カウンターに `n` を加算する
-    ///
-    /// 生成時に確定する値 (例: `max_in_flight_frames`) の初期化に使う
     pub fn add(&self, n: u64) {
         self.0.fetch_add(n, Ordering::Relaxed);
     }
 }
 
 impl Clone for Counter {
+    /// 現在値のスナップショットを取得する
+    ///
+    /// 共有には `Arc` を使うため、`clone()` は独立したスナップショットを返す
+    fn clone(&self) -> Self {
+        Self(AtomicU64::new(self.get()))
+    }
+}
+
+/// 現在値を表すゲージ
+///
+/// 時点値を保持する。`AtomicU64` の薄いラッパーであり、単調増加する
+/// 通算値 ([`Counter`]) と異なり、値を設定して現在値を表す。
+/// 生成時に確定する値や、増減する現在値の保持に使う。
+///
+/// ゲージは純粋な時点値であり、スレッド間の happens-before 関係を
+/// 要求しないため、すべての操作を relaxed order で行う。
+#[derive(Debug, Default)]
+pub struct Gauge(AtomicU64);
+
+impl Gauge {
+    /// 0 で初期化したゲージを生成する
+    pub fn new() -> Self {
+        Self(AtomicU64::new(0))
+    }
+
+    /// 現在の値を読み出す
+    pub fn get(&self) -> u64 {
+        self.0.load(Ordering::Relaxed)
+    }
+
+    /// 値を設定する
+    pub fn set(&self, value: u64) {
+        self.0.store(value, Ordering::Relaxed);
+    }
+}
+
+impl Clone for Gauge {
     /// 現在値のスナップショットを取得する
     ///
     /// 共有には `Arc` を使うため、`clone()` は独立したスナップショットを返す
@@ -90,5 +123,33 @@ mod tests {
         counter.inc();
         assert_eq!(counter.get(), 6);
         assert_eq!(snapshot.get(), 5);
+    }
+
+    /// 生成直後のゲージは 0 である
+    #[test]
+    fn gauge_new_is_zero() {
+        let gauge = Gauge::new();
+        assert_eq!(gauge.get(), 0);
+    }
+
+    /// set() で値を設定できる
+    #[test]
+    fn gauge_set_updates_value() {
+        let gauge = Gauge::new();
+        gauge.set(42);
+        assert_eq!(gauge.get(), 42);
+    }
+
+    /// clone したゲージは現在値のスナップショットであり、以後の変更は互いに影響しない
+    #[test]
+    fn gauge_clone_is_independent_snapshot() {
+        let gauge = Gauge::new();
+        gauge.set(10);
+
+        let snapshot = gauge.clone();
+
+        gauge.set(20);
+        assert_eq!(gauge.get(), 20);
+        assert_eq!(snapshot.get(), 10);
     }
 }
