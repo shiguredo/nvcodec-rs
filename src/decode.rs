@@ -1,6 +1,7 @@
 use std::collections::VecDeque;
 use std::ffi::c_void;
 use std::ptr;
+use std::sync::Arc;
 use std::sync::mpsc::{self, Receiver, Sender, SyncSender};
 use std::thread::JoinHandle;
 
@@ -130,8 +131,8 @@ struct DecoderState {
     frame_tx: Sender<Result<RawFrame, Error>>,
     frame_rx: Receiver<Result<RawFrame, Error>>,
 
-    // 統計値 (Decoder 構造体と clone で共有する)
-    stats: DecoderStats,
+    // 統計値 (Decoder 構造体と Arc で共有する)
+    stats: Arc<DecoderStats>,
 }
 
 unsafe impl Send for DecoderState {}
@@ -247,7 +248,7 @@ impl DecoderState {
                 surface_format: config.surface_format.to_sys(),
                 frame_tx,
                 frame_rx,
-                stats: DecoderStats::default(),
+                stats: Arc::new(DecoderStats::default()),
             });
 
             // 映像パーサーを作成する
@@ -393,7 +394,7 @@ where
 pub struct Decoder<H: DecodeHandler> {
     job_tx: SyncSender<Job<H::UserData>>,
     worker: Option<JoinHandle<()>>,
-    stats: DecoderStats,
+    stats: Arc<DecoderStats>,
 }
 
 impl<H: DecodeHandler> Decoder<H> {
@@ -403,7 +404,7 @@ impl<H: DecodeHandler> Decoder<H> {
 
         let state = DecoderState::new(config)?;
 
-        // 統計用カウンターをワーカスレッド (DecoderState) と共有する
+        // 統計値をワーカスレッド (DecoderState) と Arc で共有する
         let stats = state.stats.clone();
 
         let worker = std::thread::Builder::new()

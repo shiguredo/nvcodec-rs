@@ -1,23 +1,23 @@
 //! 統計値取得用のプリミティブ型
 
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-/// 共有可能な単調増加カウンター
+/// 単調増加カウンター
 ///
-/// 統計値はすべてこの型で表現する。内部で `Arc<AtomicU64>` を持ち、
-/// `clone()` で同じカウンターを共有できる。ワーカスレッドが `inc()` で
-/// インクリメントし、利用側が `get()` で読み出す。
+/// 統計値はすべてこの型で表現する。`AtomicU64` の薄いラッパーであり、
+/// 共有が必要な場合はカウンターを含む構造体 (`DecoderStats` / `EncoderStats` 等) を
+/// `Arc` で包んで行う。ワーカスレッドが `inc()` でインクリメントし、
+/// 利用側が `get()` で読み出す。
 ///
 /// カウンターは純粋な累積値であり、スレッド間の happens-before 関係を
 /// 要求しないため、すべての操作を relaxed order で行う。
-#[derive(Debug, Clone, Default)]
-pub struct Counter(Arc<AtomicU64>);
+#[derive(Debug, Default)]
+pub struct Counter(AtomicU64);
 
 impl Counter {
     /// 0 で初期化したカウンターを生成する
     pub fn new() -> Self {
-        Self(Arc::new(AtomicU64::new(0)))
+        Self(AtomicU64::new(0))
     }
 
     /// 現在の値を読み出す
@@ -37,6 +37,15 @@ impl Counter {
     /// 生成時に確定する値 (例: `max_in_flight_frames`) の初期化に使う
     pub fn add(&self, n: u64) {
         self.0.fetch_add(n, Ordering::Relaxed);
+    }
+}
+
+impl Clone for Counter {
+    /// 現在値のスナップショットを取得する
+    ///
+    /// 共有には `Arc` を使うため、`clone()` は独立したスナップショットを返す
+    fn clone(&self) -> Self {
+        Self(AtomicU64::new(self.get()))
     }
 }
 
@@ -70,16 +79,16 @@ mod tests {
         assert_eq!(counter.get(), 12);
     }
 
-    /// clone したカウンターは同じ値を共有する
+    /// clone したカウンターは現在値のスナップショットであり、以後の変更は互いに影響しない
     #[test]
-    fn counter_clone_shares_value() {
+    fn counter_clone_is_independent_snapshot() {
         let counter = Counter::new();
-        let counter_clone = counter.clone();
+        counter.add(5);
 
-        counter_clone.inc();
+        let snapshot = counter.clone();
+
         counter.inc();
-
-        assert_eq!(counter_clone.get(), 2);
-        assert_eq!(counter.get(), 2);
+        assert_eq!(counter.get(), 6);
+        assert_eq!(snapshot.get(), 5);
     }
 }

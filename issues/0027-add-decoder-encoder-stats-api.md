@@ -131,10 +131,10 @@ pub struct EncoderStats {
 
 ### 実装方式
 
-- **counter**: 新規 `src/stats.rs` に `Counter` 型 (`Arc<AtomicU64>` の薄いラッパー、`new()` / `get()` / `inc()` / `add()`、すべて relaxed order) を追加する。`Counter` は `clone()` で同じカウンターを共有できるため、`DecoderState` / `EncoderState` (worker スレッド側) と `Decoder` / `Encoder` (pub 構造体側) は `Arc<Counter>` ではなく `Counter` を直接持つ。worker スレッド側が `inc()` でインクリメントする
+- **counter**: 新規 `src/stats.rs` に `Counter` 型 (`AtomicU64` の薄いラッパー、`new()` / `get()` / `inc()` / `add()`、すべて relaxed order) を追加する。共有は `DecoderState` / `EncoderState` (worker スレッド側) と `Decoder` / `Encoder` (pub 構造体側) が `Arc<DecoderStats>` / `Arc<EncoderStats>` を共有することで行う。worker スレッド側が `inc()` でインクリメントする
 - **gauge (静的)**: `max_in_flight_frames` は生成時に確定する値だが、統一性のため `Counter` 型で表現し、生成時に `add(frame_interval_p + 2)` で初期化する
 - **gauge (動的)**: 現状スコープ外だが、追加する場合は `Counter` と同様に `src/stats.rs` に `Gauge` 型 (`AtomicU64` / `AtomicU32` の薄いラッパー) を追加して対応する想定
-- **呼び出しスレッド**: `Decoder` / `Encoder` はフィールド (`SyncSender` / `Sender` / `Option<JoinHandle>` / `Counter`) がすべて `Sync` のため、自動導出で既に `Sync` である (unsafe impl の追加は不要)。`stats()` は `&self` で共有している `DecoderStats` / `EncoderStats` への参照を返すため、`Arc<Decoder>` / `Arc<Encoder>` をメトリクス収集スレッド等へ共有すれば他スレッドから呼べる
+- **呼び出しスレッド**: `Decoder` / `Encoder` はフィールド (`SyncSender` / `Sender` / `Option<JoinHandle>` / `Arc<DecoderStats>` / `Arc<EncoderStats>`) がすべて `Sync` のため、自動導出で既に `Sync` である (unsafe impl の追加は不要)。`stats()` は `&self` で共有している `DecoderStats` / `EncoderStats` への参照を返すため、`Arc<Decoder>` / `Arc<Encoder>` をメトリクス収集スレッド等へ共有すれば他スレッドから呼べる
 
 いずれも以下の要件を満たす:
 
@@ -164,7 +164,7 @@ pub struct EncoderStats {
 - `Encoder::stats() -> &EncoderStats` が pub で追加され、以下の 2 項目が取得できる:
   - counter: `total_encoder_buffer_full_count`
   - gauge: `max_in_flight_frames`
-- 統計値は `src/stats.rs` の `Counter` 型 (`Arc<AtomicU64>` の薄いラッパー) で実装され、`stats()` がロックフリーかつ軽量である (参照返しで値の詰め替えがない)
+- 統計値は `src/stats.rs` の `Counter` 型 (`AtomicU64` の薄いラッパー) で実装され、`stats()` がロックフリーかつ軽量である (参照返しで値の詰め替えがない)
 - `Decoder` / `Encoder` は既に `Sync` であり、他スレッド (メトリクス収集スレッド等) から `&Decoder` / `&Encoder` 経由で `stats()` を呼べる
 - 単体テスト or 結合テストがある (`total_create_decoder_count` / `total_encoder_buffer_full_count` のインクリメント検証 + `max_in_flight_frames` の値検証)
 - `CHANGES.md` に `[ADD]` エントリが追加されている
@@ -176,10 +176,10 @@ pub struct EncoderStats {
 
 ### 変更対象ファイル
 
-- `src/stats.rs` — `Counter` 型 (新規追加)。`Arc<AtomicU64>` の薄いラッパーで、`clone()` で共有する。doc コメントで将来の `Gauge` 型追加余地を明記
+- `src/stats.rs` — `Counter` 型 (新規追加)。`AtomicU64` の薄いラッパー。doc コメントで将来の `Gauge` 型追加余地を明記
 - `src/lib.rs` — `mod stats;` の追加と `Counter` / `DecoderStats` / `EncoderStats` の re-export 追加
-- `src/decode.rs` — `DecoderStats` 定義、`DecoderState` に `stats: DecoderStats` フィールド追加、`Decoder` 構造体に `stats: DecoderStats` フィールド追加 (clone で共有)、`Decoder::stats()` 追加 (参照返し)、`decode()` で `total_decode_count` インクリメント、各コールバックで対応するカウンターをインクリメント
-- `src/encode.rs` — `EncoderStats` 定義、`EncoderState` に `stats: EncoderStats` フィールド追加、`Encoder` 構造体に `stats: EncoderStats` フィールド追加 (clone で共有)、`Encoder::stats()` 追加 (参照返し)、`max_in_flight_frames` は生成時に `add(frame_interval_p + 2)` で初期化、`encoder buffer is full` 発生箇所でインクリメント
+- `src/decode.rs` — `DecoderStats` 定義、`DecoderState` に `stats: Arc<DecoderStats>` フィールド追加、`Decoder` 構造体に `stats: Arc<DecoderStats>` フィールド追加 (Arc で共有)、`Decoder::stats()` 追加 (参照返し)、`decode()` で `total_decode_count` インクリメント、各コールバックで対応するカウンターをインクリメント
+- `src/encode.rs` — `EncoderStats` 定義、`EncoderState` に `stats: Arc<EncoderStats>` フィールド追加、`Encoder` 構造体に `stats: Arc<EncoderStats>` フィールド追加 (Arc で共有)、`Encoder::stats()` 追加 (参照返し)、`max_in_flight_frames` は生成時に `add(frame_interval_p + 2)` で初期化、`encoder buffer is full` 発生箇所でインクリメント
 - `README.md` / `skills/shiguredo-nvcodec/SKILL.md` — 統計値取得節の追加 + in-flight 制御のレシピ
 - `CHANGES.md` — 追記例:
   - `- [ADD] Decoder::stats() / Encoder::stats() で内部状態 (counter / gauge) を取得できるようにする`

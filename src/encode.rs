@@ -1,6 +1,7 @@
 use std::collections::VecDeque;
 use std::ffi::c_void;
 use std::ptr;
+use std::sync::Arc;
 use std::sync::mpsc::{self, Receiver, Sender, SyncSender};
 use std::thread::JoinHandle;
 
@@ -481,8 +482,8 @@ struct EncoderState {
     i_got: usize,
     mapped_inputs: Vec<Option<sys::NV_ENC_INPUT_PTR>>,
 
-    // 統計値 (Encoder 構造体と clone で共有する)
-    stats: EncoderStats,
+    // 統計値 (Encoder 構造体と Arc で共有する)
+    stats: Arc<EncoderStats>,
 }
 
 unsafe impl Send for EncoderState {}
@@ -531,7 +532,7 @@ impl EncoderState {
 
             // 統計値はすべて 0 で初期化し、max_in_flight_frames に frame_interval_p + 2 を設定する
             // (n_encoder_buffer = frame_interval_p + 3 のバッファを 1 つ空けて運用する)
-            let stats = EncoderStats::default();
+            let stats = Arc::new(EncoderStats::default());
             stats
                 .max_in_flight_frames
                 .add(config.frame_interval_p as u64 + 2);
@@ -1221,7 +1222,7 @@ pub struct Encoder<H: EncodeHandler> {
     job_tx: Sender<Job<H::UserData>>,
     worker: Option<JoinHandle<()>>,
     drain_handle: Option<JoinHandle<()>>,
-    stats: EncoderStats,
+    stats: Arc<EncoderStats>,
 }
 
 /// drain スレッドへのリクエスト
@@ -1281,7 +1282,7 @@ impl<H: EncodeHandler> Encoder<H> {
 
         let state = EncoderState::new(&config)?;
 
-        // 統計用カウンターをワーカスレッド (EncoderState) と共有する
+        // 統計値をワーカスレッド (EncoderState) と Arc で共有する
         let stats = state.stats.clone();
 
         // drain スレッドを起動
