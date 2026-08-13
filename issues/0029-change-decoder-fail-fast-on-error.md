@@ -2,6 +2,7 @@
 
 - Created: 2026-08-07
 - Branch: feature/change-decoder-fail-fast-on-error
+- Polished: 2026-08-13
 
 ## 目的
 
@@ -53,7 +54,8 @@
 `cuvidParseVideoData` はコールバック失敗を汎用 CUDA エラーに潰す。診断のため、`DecoderState` に `callback_error: Option<Error>` を持たせる。
 
 - 3 コールバックラッパーは失敗時に `frame_tx.send(Err(e))` せず、slot が空なら最初の 1 件だけ格納する
-- FFI コールバックは `cuvidParseVideoData` 内でワーカーと同じスレッドから同期的に呼ばれるため `Mutex` は付けない
+- slot 格納後もコールバックは従来どおり失敗 (`0`) を返し続ける。slot 格納でパーサーを成功 (`1`) に切り替えてはいけない。成功を返すと `cuvidParseVideoData` (= `DecoderState::decode`) が Ok になり、`decode` の Err 経路で slot を読み出せなくなるため、slot のエラーが通知されず終端にも入らない
+- FFI コールバックは `cuvidParseVideoData` 内でワーカーと同じスレッドから同期的に呼ばれるため `Mutex` は付けない。`handle_picture_display` は現状 `&DecoderState` (共有参照) しか持たないため、slot への書き込みは `Cell<Option<Error>>` を使うか、`handle_picture_display_inner` を `&mut DecoderState` に変更するかで解消する (同期実行で競合しないためどちらでもよい。実装時に選ぶ)
 - `DecoderState::decode` が `Err` なら、slot があればそれを、なければ `decode` の戻り値を 1 回だけ通知して終端する
 
 失敗した `decode` と同じ parse 内で既に `frame_tx` に乗った Ok フレームは破棄してよい。デコーダーはこれ以上使えないため、不完全な出力を届けるより終端を優先する。失敗パケットの `user_data` も `pending_user_data` に積まない。
