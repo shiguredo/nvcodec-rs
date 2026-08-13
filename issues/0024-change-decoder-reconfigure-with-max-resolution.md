@@ -132,7 +132,7 @@ Step 1 で `format.display_area` を検証するのは、`state.width` / `state.
 
 - **0027**: `Decoder` / `Encoder` 統計値 API を追加する — 実装検証時の `#[cfg(test)]` カウンター (`create_decoder_count` / `reconfigure_decoder_count`) を pub 化して統一 API に統合する
 - **0028**: `ulNumDecodeSurfaces` を codec 別推奨値に引き上げる — 参照フレーム数の多い HEVC / VP9 / AV1 で DPB 不足リスクを低減する
-- **0029**: デコーダーのコールバックエラー通知を frame_rx から分離する — 二重通知バグと `drain_frames` scorched-earth バグを同時解消する
+- **0029**: デコードエラー後の `Decoder` を終端状態にする — 二重通知と `drain_frames` scorched-earth を、エラー後継続をやめることで解消する
 
 ## 関連 issue
 
@@ -142,4 +142,4 @@ Step 1 で `format.display_area` を検証するのは、`state.width` / `state.
   - 「問題 1: 順序」は依然として `max_coded_*` = `None` のフォールバック経路に残るため、0017 は pending を維持する
 - 0027: `Decoder` / `Encoder` 統計値 API 追加 (本 issue の実装検証から派生)
 - 0028: `ulNumDecodeSurfaces` codec 別推奨値化 (本 issue の実装検証から派生)
-- 0029: デコーダーのコールバックエラー通知の frame_rx 分離 (本 issue の実装検証から派生)
+- 0029: デコードエラー後の Decoder 終端 (本 issue の実装検証から派生)
