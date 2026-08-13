@@ -856,6 +856,11 @@ where
 
 /// コールバックの失敗を `callback_error` slot に格納する (診断用)。
 /// 最初の 1 件だけ保持し、後続の失敗は破棄する。
+///
+/// スレッド競合は起きない。パーサーコールバックは nvcuvid.h の保証により
+/// `cuvidParseVideoData` 内で呼び出し元と同じスレッドから同期的に呼ばれ、
+/// かつ `cuvidParseVideoData` はワーカースレッドの `decode` / `send_eos` からのみ呼ばれる。
+/// そのため `callback_error` の読み書きはすべてワーカースレッド上で完結し、Mutex は不要である。
 fn store_callback_error(state: &mut DecoderState, e: Error) {
     if state.callback_error.is_none() {
         state.callback_error = Some(e);
