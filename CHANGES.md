@@ -13,6 +13,10 @@
 
 - [CHANGE] MSRV (rust-version) を 1.93 に上げる
   - @voluntas
+- [CHANGE] デコードエラー後の Decoder を終端状態にし、以降のデコードを行わないようにする
+  - 同一エラーの二重通知と、drain_frames が Err で pending_user_data を全消しする挙動を解消する
+  - 復旧は Decoder を作り直す
+  - @sile
 - [ADD] Decoder::stats() / Encoder::stats() で内部状態 (counter / gauge) を取得できるようにする
   - @sile
 
