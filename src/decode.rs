@@ -287,7 +287,7 @@ impl DecoderState {
     /// 圧縮された映像フレームをデコードする
     ///
     /// 内部でコールバックが失敗した場合、その具体的エラーが返る。
-    /// 終端するかは呼び出し側 (`run_worker`) の責務である。
+    /// エラー後のデコーダー停止 (終端状態への遷移) は呼び出し側 (`run_worker`) の責務である。
     pub fn decode(&mut self, data: &[u8]) -> Result<(), Error> {
         // [NOTE]
         // cuvidParseVideoData は内部でデータをコピーまたは即座に処理するため、
@@ -302,9 +302,9 @@ impl DecoderState {
             packet.timestamp = 0;
 
             let parse_result = self.lib.cuvid_parse_video_data(self.parser, &mut packet);
-            // コールバックが slot に格納した具体的エラーがあれば、
+            // コールバックが callback_error フィールドに格納した具体的エラーがあれば、
             // cuvidParseVideoData が返す汎用 CUDA エラーより優先して通知する。
-            // コールバックは slot 格納後も失敗 (0) を返し続けるため、通常は両方失敗する。
+            // コールバックは callback_error 格納後も失敗 (0) を返し続けるため、通常は両方失敗する。
             self.prefer_callback_error(parse_result)
         }
     }
@@ -332,7 +332,6 @@ impl DecoderState {
         Ok(())
     }
 
-    /// `callback_error` があればそれを、なければ `result` を返す
     fn prefer_callback_error<T>(&mut self, result: Result<T, Error>) -> Result<T, Error> {
         if let Some(e) = self.callback_error.take() {
             Err(e)
@@ -379,6 +378,8 @@ enum Job<T> {
 ///
 /// デコード処理が完了するたびに [`DecodeHandler::on_decoded`] が呼ばれる。
 /// 一度 `Err` が渡されたら、そのデコーダーは終端状態になる。
+/// 終端状態とは、それ以降はデコードせず、送信されたデータに対して終端を表す `Err` を
+/// コールバックするだけの状態である。
 /// 最初の `Err` で [`Decoder`] を捨て、復旧は新しいインスタンスを作ること。
 ///
 /// 終端時点で出力待ちだったフレーム (pending) にコールバックは届かない。
@@ -390,7 +391,7 @@ pub trait DecodeHandler: Send + 'static {
     type Error: From<crate::Error> + Send + 'static;
     /// デコード完了時に呼ばれる
     ///
-    /// `Err` ならデコーダーは終端する。ユーザーデータは `Ok` のときだけ付く。
+    /// `Err` ならデコーダーは終端する。
     fn on_decoded(&mut self, result: Result<DecodedFrame<Self::UserData>, Self::Error>);
 }
 
@@ -606,7 +607,7 @@ unsafe extern "C" fn handle_video_sequence(
     match handle_video_sequence_inner(state, unsafe { &*format }) {
         Ok(val) => val,
         Err(e) => {
-            // 具体的エラーを slot に格納し、パーサーには失敗 (0) を伝える
+            // 具体的エラーを callback_error フィールドに格納し、パーサーには失敗 (0) を伝える
             store_callback_error(state, e);
             0
         }
