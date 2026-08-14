@@ -136,8 +136,10 @@ struct DecoderState {
     surface_width: u32,
     surface_height: u32,
     surface_format: u32,
-    frame_tx: Sender<Result<RawFrame, Error>>,
-    frame_rx: Receiver<Result<RawFrame, Error>>,
+    frame_tx: Sender<RawFrame>,
+    frame_rx: Receiver<RawFrame>,
+    // 読み書きはワーカースレッドのみ（パーサーコールバックも同スレッド）なので Mutex 不要
+    callback_error: Option<Error>,
     stats: Arc<DecoderStats>,
 }
 
@@ -254,6 +256,7 @@ impl DecoderState {
                 surface_format: config.surface_format.to_sys(),
                 frame_tx,
                 frame_rx,
+                callback_error: None,
                 stats: Arc::new(DecoderStats::default()),
             });
 
@@ -282,6 +285,9 @@ impl DecoderState {
     }
 
     /// 圧縮された映像フレームをデコードする
+    ///
+    /// 内部でコールバックが失敗した場合、その具体的エラーが返る。
+    /// エラー後のデコーダー停止 (終端状態への遷移) は呼び出し側 (`run_worker`) の責務である。
     pub fn decode(&mut self, data: &[u8]) -> Result<(), Error> {
         // [NOTE]
         // cuvidParseVideoData は内部でデータをコピーまたは即座に処理するため、
@@ -295,12 +301,17 @@ impl DecoderState {
             packet.flags = sys::CUvideopacketflags_CUVID_PKT_ENDOFPICTURE as u64;
             packet.timestamp = 0;
 
-            self.lib.cuvid_parse_video_data(self.parser, &mut packet)?;
+            let parse_result = self.lib.cuvid_parse_video_data(self.parser, &mut packet);
+            // コールバックが callback_error フィールドに格納した具体的エラーがあれば、
+            // cuvidParseVideoData が返す汎用 CUDA エラーより優先して通知する。
+            // コールバックは callback_error 格納後も失敗 (0) を返し続けるため、通常は両方失敗する。
+            self.prefer_callback_error(parse_result)
         }
-
-        Ok(())
     }
 
+    /// EOS を送り、残っているデコード処理の完了を待つ
+    ///
+    /// コールバック失敗時は `callback_error` を優先して返す（[`DecoderState::decode`] と同じ）。
     pub fn send_eos(&mut self) -> Result<(), Error> {
         unsafe {
             // EOS をデコーダーに伝える
@@ -310,7 +321,8 @@ impl DecoderState {
             packet.flags = sys::CUvideopacketflags_CUVID_PKT_ENDOFSTREAM as u64;
             packet.timestamp = 0;
 
-            self.lib.cuvid_parse_video_data(self.parser, &mut packet)?;
+            let parse_result = self.lib.cuvid_parse_video_data(self.parser, &mut packet);
+            self.prefer_callback_error(parse_result)?;
 
             // パーサーは非同期でデータを処理するので、
             // すべてのデコード操作が完了するまでここで待機（同期）する
@@ -320,9 +332,17 @@ impl DecoderState {
         Ok(())
     }
 
+    fn prefer_callback_error<T>(&mut self, result: Result<T, Error>) -> Result<T, Error> {
+        if let Some(e) = self.callback_error.take() {
+            Err(e)
+        } else {
+            result
+        }
+    }
+
     /// デコード済みのフレームを取り出す
-    pub fn next_frame(&mut self) -> Result<Option<RawFrame>, Error> {
-        self.frame_rx.try_recv().ok().transpose()
+    fn next_frame(&self) -> Option<RawFrame> {
+        self.frame_rx.try_recv().ok()
     }
 }
 
@@ -357,6 +377,13 @@ enum Job<T> {
 /// デコード結果を通知するためのハンドラー
 ///
 /// デコード処理が完了するたびに [`DecodeHandler::on_decoded`] が呼ばれる。
+/// 一度 [`DecodeHandler::on_decoded`] に `Err` を渡したら、そのデコーダーは終端状態になる。
+/// 終端状態とは、それ以降はデコードせず、送信されたデータに対して終端を表す `Err` を
+/// コールバックするだけの状態である。
+/// 最初の `Err` で [`Decoder`] を捨て、復旧は新しいインスタンスを作ること。
+///
+/// 終端時点で出力待ちだったフレームにコールバックは呼び出されない。
+/// 終端後に送った [`Decoder::decode`] には、`Err` が渡される。
 pub trait DecodeHandler: Send + 'static {
     /// ユーザーデータ型
     type UserData: Send + 'static;
@@ -397,6 +424,17 @@ where
 ///
 /// 内部で専用のワーカースレッドを起動し、非同期でデコードを行う。
 /// デコードが完了すると、コンストラクタで渡したハンドラがワーカースレッド上で即座に呼び出される。
+///
+/// このインスタンスは一度 [`DecodeHandler::on_decoded`] に `Err` を渡した時点で終端状態になる。
+/// 終端状態とは、それ以降はデコードせず、送信されたデータに対して終端を表す `Err` を
+/// コールバックするだけの状態である。
+///
+/// 終端時点で出力待ちだったフレームにはコールバックが呼び出されない (捨てられる)。
+/// 終端後の [`Decoder::decode`] は送信は成功するが、内部デコードはせず、
+/// その分について終端を表す `Err` がコールバックされる。
+///
+/// 終端後のこのインスタンスは復旧できない。最初の `Err` でこのインスタンスを捨て、
+/// 新しい `Decoder` を作り直すこと。
 pub struct Decoder<H: DecodeHandler> {
     job_tx: SyncSender<Job<H::UserData>>,
     worker: Option<JoinHandle<()>>,
@@ -438,6 +476,13 @@ impl<H: DecodeHandler> Decoder<H> {
     ///
     /// フレームデータとユーザーデータをワーカースレッドに送信し、即座に戻る。
     /// デコードが完了すると、コンストラクタで渡したコールバックハンドラが呼び出される。
+    ///
+    /// # 注意
+    ///
+    /// デコーダーが終端状態でも送信は成功するが、常に
+    /// [`DecodeHandler::on_decoded`] には `Err` が渡される。
+    /// なお、`decode` の呼び出し回数と `on_decoded` の呼び出し回数は常に一致するとは限らない。
+    /// 終端状態に入る前に送信済みで未出力の分にはコールバックが呼び出されない。
     pub fn decode(&self, data: &[u8], user_data: H::UserData) -> Result<(), Error> {
         self.job_tx
             .send(Job::Decode {
@@ -449,10 +494,18 @@ impl<H: DecodeHandler> Decoder<H> {
         Ok(())
     }
 
-    /// 送信済みの未完了フレームがすべて完了するまで待機する
+    /// 送信済みの未完了フレームがすべて出力されるまで待機する
     ///
-    /// すべての pending フレームのコールバックハンドラが呼び出された後、このメソッドが戻る。
-    /// flush 後も decode を継続できる。
+    /// デコーダーが終端状態でない場合、送信済みの未完了フレームがすべて出力され、
+    /// そのコールバックがすべて呼び出されたあとで戻る。
+    /// このメソッド呼び出し後もデコードは継続できる。
+    ///
+    /// デコーダーが終端状態の場合 (このメソッドの呼び出し中に終端状態に遷移した場合を含む) は、
+    /// 未完了フレームの出力を待たずに戻る。
+    ///
+    /// このメソッドの呼び出し中に終端状態に遷移した場合は、
+    /// その原因 `Err` が [`DecodeHandler::on_decoded`] に渡されたあとで、
+    /// 呼び出し元に処理が戻る。
     pub fn flush(&self) -> Result<(), Error> {
         let (tx, rx) = mpsc::sync_channel(0);
         self.job_tx
@@ -566,7 +619,8 @@ unsafe extern "C" fn handle_video_sequence(
     match handle_video_sequence_inner(state, unsafe { &*format }) {
         Ok(val) => val,
         Err(e) => {
-            let _ = state.frame_tx.send(Err(e));
+            // 具体的エラーを callback_error フィールドに格納し、パーサーには失敗 (0) を伝える
+            store_callback_error(state, e);
             0
         }
     }
@@ -583,7 +637,7 @@ unsafe extern "C" fn handle_picture_decode(
     match handle_picture_decode_inner(state, unsafe { &*pic_params }) {
         Ok(()) => 1,
         Err(e) => {
-            let _ = state.frame_tx.send(Err(e));
+            store_callback_error(state, e);
             0
         }
     }
@@ -596,11 +650,11 @@ unsafe extern "C" fn handle_picture_display(
     if user_data.is_null() || disp_info.is_null() {
         return 0;
     }
-    let state = unsafe { &*(user_data as *const DecoderState) };
+    let state = unsafe { &mut *(user_data as *mut DecoderState) };
     match handle_picture_display_inner(state, unsafe { &*disp_info }) {
         Ok(()) => 1,
         Err(e) => {
-            let _ = state.frame_tx.send(Err(e));
+            store_callback_error(state, e);
             0
         }
     }
@@ -696,7 +750,7 @@ fn handle_picture_display_inner(
 
     state.stats.total_output_frame_count.inc();
     // チャンネル経由で送信 (受信側が破棄されている場合の送信エラーは無視)
-    let _ = state.frame_tx.send(Ok(decoded_frame));
+    let _ = state.frame_tx.send(decoded_frame);
 
     Ok(())
 }
@@ -770,31 +824,74 @@ where
     H: DecodeHandler,
 {
     let mut pending_user_data: VecDeque<H::UserData> = VecDeque::new();
+    // 最初のデコードエラー以降、このデコーダーは終端状態になる
+    let mut terminated = false;
 
     loop {
         match job_rx.recv() {
             Ok(Job::Decode { data, user_data }) => {
+                if terminated {
+                    // 終端後はデコードせず、終端エラーを通知する。
+                    // デコード結果の Ok フレームは以降一切来ない。
+                    handler.on_decoded(Err(terminal_decode_error().into()));
+                    continue;
+                }
+
                 if let Err(e) = state.decode(&data) {
+                    // 最初のデコードエラーで終端に入る。
+                    // ワーカーを return してはいけない (decode() は送信成功で Ok を返すため、
+                    // キュー済みジョブのコールバックが消える)。終端後もジョブを受けて応答する。
+                    //
+                    // 失敗 parse 由来の Ok と先行 pending を混ぜないよう channel を空にする。
+                    // 未完了 pending はコールバックせず捨てる。
+                    // 利用側は最初の Err で Decoder を捨てることを推奨。
+                    // このジョブの user_data は pending に積んでいないためここで破棄される。
+                    terminated = true;
+                    discard_queued_frames(&state);
+                    pending_user_data.clear();
                     handler.on_decoded(Err(e.into()));
                     continue;
                 }
 
                 pending_user_data.push_back(user_data);
-                drain_frames(&mut state, &mut handler, &mut pending_user_data);
+                if !drain_frames(&state, &mut handler, &mut pending_user_data) {
+                    // missing user data（不変条件違反）で終端に入る。
+                    // 原因 Err は drain_frames 内で通知済み。残りはコールバックせず捨てる。
+                    terminated = true;
+                    discard_queued_frames(&state);
+                    pending_user_data.clear();
+                }
             }
             Ok(Job::Flush { done }) => {
-                let _ = state.send_eos();
-
-                drain_frames(&mut state, &mut handler, &mut pending_user_data);
-
+                if !terminated {
+                    // send_eos の任意の Err（callback_error 優先の具体エラー、
+                    // および synchronize 失敗など）で終端する。Decode 経路と対称。
+                    match state.send_eos() {
+                        Ok(()) => {
+                            if !drain_frames(&state, &mut handler, &mut pending_user_data) {
+                                // missing user data（不変条件違反）で終端に入る
+                                terminated = true;
+                                discard_queued_frames(&state);
+                                pending_user_data.clear();
+                            }
+                        }
+                        Err(e) => {
+                            terminated = true;
+                            discard_queued_frames(&state);
+                            pending_user_data.clear();
+                            handler.on_decoded(Err(e.into()));
+                        }
+                    }
+                }
                 let _ = done.send(());
             }
             Ok(Job::Terminate) | Err(_) => {
-                // 残っている非同期処理を完了させる
-                let _ = state.send_eos();
-
-                drain_frames(&mut state, &mut handler, &mut pending_user_data);
-
+                // 終端前は、残っている非同期処理を完了させてから終了する。
+                // 終端後は残フレームを drain せず終了する (DecoderState の Drop で解放)。
+                if !terminated {
+                    let _ = state.send_eos();
+                    drain_frames(&state, &mut handler, &mut pending_user_data);
+                }
                 // state の Drop がここで走り、CUDA リソースが解放される
                 return;
             }
@@ -802,20 +899,49 @@ where
     }
 }
 
+/// コールバックの失敗を `callback_error` に格納する。
+/// 最初の 1 件だけ保持し、後続の失敗は破棄する。
+///
+/// 格納したエラーは [`DecoderState::prefer_callback_error`] 経由で利用者へ返す。
+///
+/// スレッド競合は起きない。パーサーコールバックは nvcuvid.h の保証により
+/// `cuvidParseVideoData` 内で呼び出し元と同じスレッドから同期的に呼ばれ、
+/// かつ `cuvidParseVideoData` はワーカースレッドの `decode` / `send_eos` からのみ呼ばれる。
+/// そのため `callback_error` の読み書きはすべてワーカースレッド上で完結し、Mutex は不要である。
+fn store_callback_error(state: &mut DecoderState, e: Error) {
+    if state.callback_error.is_none() {
+        state.callback_error = Some(e);
+    }
+}
+
+/// 終端後のジョブに返すエラー
+fn terminal_decode_error() -> Error {
+    Error::new_custom("decode", "decoder has already failed")
+}
+
+/// キューに残った Ok フレームをすべて破棄する
+///
+/// 失敗した parse 内で既に `frame_tx` に乗ったフレームを、
+/// 先行 pending と誤ペアリングしないために使う。
+fn discard_queued_frames(state: &DecoderState) {
+    while state.next_frame().is_some() {}
+}
+
 fn drain_frames<H>(
-    state: &mut DecoderState,
+    state: &DecoderState,
     handler: &mut H,
     pending_user_data: &mut VecDeque<H::UserData>,
-) where
+) -> bool
+where
     H: DecodeHandler,
 {
     loop {
         match state.next_frame() {
-            Ok(None) => {
+            None => {
                 // 結果が存在しなくなったなら終了
                 break;
             }
-            Ok(Some(raw)) => {
+            Some(raw) => {
                 if let Some(user_data) = pending_user_data.pop_front() {
                     handler.on_decoded(Ok(DecodedFrame {
                         width: raw.width,
@@ -825,24 +951,18 @@ fn drain_frames<H>(
                         user_data,
                     }));
                 } else {
-                    // デコード結果が存在するのに対応するユーザーデータが存在しない
-                    // これは通常あり得ないはずだけど、エラーを取りこぼさない為に
-                    // エラーのコールバックハンドラを呼ぶ
+                    // デコード結果が存在するのに対応するユーザーデータが存在しない。
+                    // 通常あり得ない不変条件違反なので、継続せず終端にする。
                     handler.on_decoded(Err(
                         Error::new_custom("drain_frames", "missing user data").into()
                     ));
-                    break;
+                    return false;
                 }
-            }
-            // エラーが起きたら全てのユーザーデータを削除して
-            // コールバックハンドラを呼ぶ
-            Err(e) => {
-                pending_user_data.clear();
-                handler.on_decoded(Err(e.into()));
-                break;
             }
         }
     }
+
+    true
 }
 
 #[cfg(test)]

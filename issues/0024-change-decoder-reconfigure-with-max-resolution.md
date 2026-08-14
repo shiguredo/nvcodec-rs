@@ -81,11 +81,14 @@ Step 1 で `format.display_area` を検証するのは、`state.width` / `state.
 
 ### 失敗時の状態遷移
 
-- `display_area` 検証失敗 (Step 1): SDK 呼び出しなしのため `state.decoder` は前デコーダー (あるいは初回コールバックなら null) のまま残る。エラーを利用者に通知する。**現行実装は「create → validate」順で失敗時に古いデコーダーが破棄済み状態で Err を返していた (issue 0017 問題 2)**。本 issue の Step 1 変更でこの半壊状態を回避する
-- max 超過事前検証エラー (Step 2): SDK 呼び出しなしのため `state.decoder` は前デコーダー (あるいは初回コールバックなら null) のまま残る。以降のフレームは古い解像度で処理される (あるいは null なのでデコード不能)。次回コールバックで再度チェックが走る
-- `cuvidCreateDecoder` 失敗 (Step 3/4/5 経路): `state.decoder` は null になる。復旧不能問題 (issue 0017 の「問題 1: 順序」) はこの経路に残る
-- `cuvidReconfigureDecoder` 失敗 (Step 6 経路): NVDEC SDK は失敗後のデコーダー状態を明示していない。安全側に倒し、`state.decoder` は変更せずエラーを利用者に通知する。以降のフレームは古い解像度で処理を続けるので実質的に無効になるが、次の解像度変化のコールバックで再度復旧を試みる余地は残る (`state.decoder` を null にせずに済む点だけがメリット)
-- どの経路でも、`handle_video_sequence_inner` が `Err` を返せば現行の `handle_video_sequence` が `frame_tx.send(Err(...))` で利用者に通知する挙動を維持する
+`handle_video_sequence_inner` が `Err` を返す経路は、いずれも 0029 の終端契約に入る。`handle_video_sequence` は `frame_tx.send(Err(...))` しない。`callback_error` に最初の 1 件だけ格納し、パーサーには失敗 (`0`) を返す。`DecoderState::decode` がその slot を優先して `Err` を返し、`run_worker` が原因 `Err` を 1 回通知して終端する。以降 `DecoderState::decode` は呼ばない。復旧は `Decoder` を作り直す。
+
+各経路で `state.decoder` がどう残るかは次のとおり。終端後は使わないので、古い解像度での継続や次回コールバックでの再試行はしない。
+
+- `display_area` 検証失敗 (Step 1): SDK 呼び出しなしのため `state.decoder` は前デコーダー (あるいは初回コールバックなら null) のまま残る。**現行実装は「create → validate」順で失敗時に古いデコーダーが破棄済み状態で Err を返していた (issue 0017 問題 2)**。本 issue の Step 1 変更でこの半壊状態を回避する
+- max 超過事前検証エラー (Step 2): SDK 呼び出しなしのため `state.decoder` は前デコーダー (あるいは初回コールバックなら null) のまま残る
+- `cuvidCreateDecoder` 失敗 (Step 3/4/5 経路): `state.decoder` は null になる。当該インスタンスは終端するため、0017 の「問題 1: 順序」による継続不能は公開契約上は現れない。destroy 済みで create に失敗した半壊は、作り直しで捨てる
+- `cuvidReconfigureDecoder` 失敗 (Step 6 経路): NVDEC SDK は失敗後のデコーダー状態を明示していない。安全側に倒し、`state.decoder` は変更しない。当該インスタンスは終端するため、次の解像度変化で再試行しない
 
 ### `CudaLibrary` への追加
 
@@ -99,7 +102,7 @@ Step 1 で `format.display_area` を検証するのは、`state.width` / `state.
 - `DecoderConfig` に `max_coded_width: Option<u32>` / `max_coded_height: Option<u32>` が追加され、既存の struct literal 初期化コード (`test_decoder_config`、`README.md`、`skills/shiguredo-nvcodec/SKILL.md` のコード例) がすべて明示的に更新されている
 - `Some(v)` を渡し、解像度のみが変化するストリームで、`pfnSequenceCallback` の 2 回目以降で `cuvidReconfigureDecoder` が呼ばれ `cuvidCreateDecoder` は呼ばれない挙動が確認できる
 - `Some(v)` を渡し、codec / chroma / bit depth / progressive のいずれかが変化した場合に destroy+create パスにフォールバックし、以降 reconfigure 経路に戻れる挙動が確認できる
-- `Some(v)` を渡し、`coded_width` / `coded_height` が `v` を超えたときに `handle_video_sequence` がエラーを利用者に通知することが確認できる (初回コールバック / 2 回目以降のいずれのケースでも)
+- `Some(v)` を渡し、`coded_width` / `coded_height` が `v` を超えたときに原因 `Err` が 1 回通知され、当該 `Decoder` が終端することが確認できる (初回コールバック / 2 回目以降のいずれのケースでも。0029 の終端契約テストは下記メモ)
 - `None` を渡した場合、2026.2.0 と同じ動作 (シーケンス変更ごとに destroy+create) を維持する
 - `display_area` 検証位置を先頭に移した結果、destroy+create 経路でも invalid `display_area` で失敗した場合に古いデコーダーが破棄されないことが確認できる
 - `CHANGES.md` に `[CHANGE]` エントリが追加されている
@@ -133,6 +136,12 @@ Step 1 で `format.display_area` を検証するのは、`state.width` / `state.
 - **0027**: `Decoder` / `Encoder` 統計値 API を追加する — 実装検証時の `#[cfg(test)]` カウンター (`create_decoder_count` / `reconfigure_decoder_count`) を pub 化して統一 API に統合する
 - **0028**: `ulNumDecodeSurfaces` を codec 別推奨値に引き上げる — 参照フレーム数の多い HEVC / VP9 / AV1 で DPB 不足リスクを低減する
 - **0029**: デコードエラー後の `Decoder` を終端状態にする — 二重通知と `drain_frames` scorched-earth を、エラー後継続をやめることで解消する
+
+### 0029 の終端契約テスト（本 issue 実装時に一緒にやる）
+
+0029 の完了条件にある終端契約テスト（エラー後に Ok が来ない・原因 Err は 1 回・後続ジョブに終端 Err・終端後 `flush` が戻る）は、公開 API だけで安定してデコードエラーを起こす手段が現状ないため 0029 単体では未着手。
+
+本 issue の `max_coded_width` / `max_coded_height` 超過による事前検証エラーが、公開 API で安定再現できる Err 誘発手段になる。reconfigure / max 超過のテストを書くタイミングで、上記の終端契約テストも同じ経路で追加する。
 
 ## 関連 issue
 
