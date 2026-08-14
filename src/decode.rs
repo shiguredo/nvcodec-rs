@@ -2235,11 +2235,8 @@ mod tests {
 
         // チャネルから結果を回収する
         let mut results = Vec::new();
-        loop {
-            match rx.try_recv() {
-                Ok(r) => results.push(r),
-                Err(mpsc::TryRecvError::Empty | mpsc::TryRecvError::Disconnected) => break,
-            }
+        while let Ok(r) = rx.try_recv() {
+            results.push(r);
         }
 
         // Ok フレームは 1 件も来ない
@@ -2264,10 +2261,13 @@ mod tests {
         );
 
         // 後続ジョブには終端 Err (decoder has already failed) が通知される
-        let terminated_count = results.iter().filter(|r| match r {
-            Ok(_) => false,
-            Err(e) => e.to_string().contains("decoder has already failed"),
-        }).count();
+        let terminated_count = results
+            .iter()
+            .filter(|r| match r {
+                Ok(_) => false,
+                Err(e) => e.to_string().contains("decoder has already failed"),
+            })
+            .count();
         assert!(
             terminated_count >= 1,
             "後続ジョブに終端 Err が通知されるはず: {results:?}"
