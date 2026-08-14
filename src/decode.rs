@@ -819,80 +819,107 @@ impl<T> DecodedFrame<T> {
     }
 }
 
-fn run_worker<H>(mut state: Box<DecoderState>, mut handler: H, job_rx: Receiver<Job<H::UserData>>)
+/// デコードワーカーのループ状態と処理をまとめる構造体
+///
+/// [`run_worker`] はこの構造体を構築し、ジョブを各メソッドへ dispatch する。
+struct DecodeWorker<H: DecodeHandler> {
+    state: Box<DecoderState>,
+    handler: H,
+    pending_user_data: VecDeque<H::UserData>,
+    // 最初のデコードエラー以降、このデコーダーは終端状態になる
+    terminated: bool,
+}
+
+impl<H: DecodeHandler> DecodeWorker<H> {
+    /// 終端状態へ遷移する
+    ///
+    /// キューに残った Ok フレームを破棄し、未完了 pending をコールバックせず捨てる。
+    /// 失敗した parse 由来の Ok と先行 pending を誤ペアリングしないための処理でもある。
+    fn enter_terminated(&mut self) {
+        self.terminated = true;
+        discard_queued_frames(&self.state);
+        self.pending_user_data.clear();
+    }
+
+    fn handle_decode(&mut self, data: &[u8], user_data: H::UserData) {
+        if self.terminated {
+            // 終端後はデコードせず、終端エラーを通知する。
+            // デコード結果の Ok フレームは以降一切来ない。
+            self.handler.on_decoded(Err(terminal_decode_error().into()));
+            return;
+        }
+
+        if let Err(e) = self.state.decode(data) {
+            // 最初のデコードエラーで終端に入る。
+            // ワーカーを return してはいけない (decode() は送信成功で Ok を返すため、
+            // キュー済みジョブのコールバックが消える)。終端後もジョブを受けて応答する。
+            //
+            // このジョブの user_data は pending に積んでいないためここで破棄される。
+            // 利用側は最初の Err で Decoder を捨てることを推奨。
+            self.enter_terminated();
+            self.handler.on_decoded(Err(e.into()));
+            return;
+        }
+
+        self.pending_user_data.push_back(user_data);
+        if !drain_frames(&self.state, &mut self.handler, &mut self.pending_user_data) {
+            // missing user data（不変条件違反）で終端に入る。
+            // 原因 Err は drain_frames 内で通知済み。残りはコールバックせず捨てる。
+            self.enter_terminated();
+        }
+    }
+
+    fn handle_flush(&mut self, done: SyncSender<()>) {
+        if !self.terminated {
+            // send_eos の任意の Err（callback_error 優先の具体エラー、
+            // および synchronize 失敗など）で終端する。Decode 経路と対称。
+            match self.state.send_eos() {
+                Ok(()) => {
+                    if !drain_frames(&self.state, &mut self.handler, &mut self.pending_user_data) {
+                        // missing user data（不変条件違反）で終端に入る
+                        self.enter_terminated();
+                    }
+                }
+                Err(e) => {
+                    self.enter_terminated();
+                    self.handler.on_decoded(Err(e.into()));
+                }
+            }
+        }
+        let _ = done.send(());
+    }
+
+    /// 残っている非同期処理を完了させてから終了する
+    ///
+    /// 終端前は残フレームを drain し、終端後は残フレームを drain せず終了する。
+    /// `state` の Drop はこのメソッドを呼び出した側で行われる (CUDA リソース解放)。
+    fn finish(&mut self) {
+        if !self.terminated {
+            let _ = self.state.send_eos();
+            drain_frames(&self.state, &mut self.handler, &mut self.pending_user_data);
+        }
+    }
+}
+
+fn run_worker<H>(state: Box<DecoderState>, handler: H, job_rx: Receiver<Job<H::UserData>>)
 where
     H: DecodeHandler,
 {
-    let mut pending_user_data: VecDeque<H::UserData> = VecDeque::new();
-    // 最初のデコードエラー以降、このデコーダーは終端状態になる
-    let mut terminated = false;
+    let mut worker = DecodeWorker {
+        state,
+        handler,
+        pending_user_data: VecDeque::new(),
+        terminated: false,
+    };
 
     loop {
         match job_rx.recv() {
-            Ok(Job::Decode { data, user_data }) => {
-                if terminated {
-                    // 終端後はデコードせず、終端エラーを通知する。
-                    // デコード結果の Ok フレームは以降一切来ない。
-                    handler.on_decoded(Err(terminal_decode_error().into()));
-                    continue;
-                }
-
-                if let Err(e) = state.decode(&data) {
-                    // 最初のデコードエラーで終端に入る。
-                    // ワーカーを return してはいけない (decode() は送信成功で Ok を返すため、
-                    // キュー済みジョブのコールバックが消える)。終端後もジョブを受けて応答する。
-                    //
-                    // 失敗 parse 由来の Ok と先行 pending を混ぜないよう channel を空にする。
-                    // 未完了 pending はコールバックせず捨てる。
-                    // 利用側は最初の Err で Decoder を捨てることを推奨。
-                    // このジョブの user_data は pending に積んでいないためここで破棄される。
-                    terminated = true;
-                    discard_queued_frames(&state);
-                    pending_user_data.clear();
-                    handler.on_decoded(Err(e.into()));
-                    continue;
-                }
-
-                pending_user_data.push_back(user_data);
-                if !drain_frames(&state, &mut handler, &mut pending_user_data) {
-                    // missing user data（不変条件違反）で終端に入る。
-                    // 原因 Err は drain_frames 内で通知済み。残りはコールバックせず捨てる。
-                    terminated = true;
-                    discard_queued_frames(&state);
-                    pending_user_data.clear();
-                }
-            }
-            Ok(Job::Flush { done }) => {
-                if !terminated {
-                    // send_eos の任意の Err（callback_error 優先の具体エラー、
-                    // および synchronize 失敗など）で終端する。Decode 経路と対称。
-                    match state.send_eos() {
-                        Ok(()) => {
-                            if !drain_frames(&state, &mut handler, &mut pending_user_data) {
-                                // missing user data（不変条件違反）で終端に入る
-                                terminated = true;
-                                discard_queued_frames(&state);
-                                pending_user_data.clear();
-                            }
-                        }
-                        Err(e) => {
-                            terminated = true;
-                            discard_queued_frames(&state);
-                            pending_user_data.clear();
-                            handler.on_decoded(Err(e.into()));
-                        }
-                    }
-                }
-                let _ = done.send(());
-            }
+            Ok(Job::Decode { data, user_data }) => worker.handle_decode(&data, user_data),
+            Ok(Job::Flush { done }) => worker.handle_flush(done),
             Ok(Job::Terminate) | Err(_) => {
-                // 終端前は、残っている非同期処理を完了させてから終了する。
-                // 終端後は残フレームを drain せず終了する (DecoderState の Drop で解放)。
-                if !terminated {
-                    let _ = state.send_eos();
-                    drain_frames(&state, &mut handler, &mut pending_user_data);
-                }
+                // チャネル破棄 (Err) 時も、残っている非同期処理を完了させてから終了する。
                 // state の Drop がここで走り、CUDA リソースが解放される
+                worker.finish();
                 return;
             }
         }
