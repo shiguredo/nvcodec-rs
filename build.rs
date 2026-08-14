@@ -622,6 +622,20 @@ pub struct _CUVIDDECODECREATEINFO_display_area { pub left: i16, pub top: i16, pu
 #[repr(C)]
 pub struct _CUVIDDECODECREATEINFO_target_rect { pub left: i16, pub top: i16, pub right: i16, pub bottom: i16 }
 #[repr(C)]
+pub struct CUVIDRECONFIGUREDECODERINFO {
+    pub ulWidth: u32, pub ulHeight: u32,
+    pub ulTargetWidth: u32, pub ulTargetHeight: u32,
+    pub ulNumDecodeSurfaces: u32,
+    pub reserved1: [u32; 12],
+    pub display_area: _CUVIDRECONFIGUREDECODERINFO_display_area,
+    pub target_rect: _CUVIDRECONFIGUREDECODERINFO_target_rect,
+    pub reserved2: [u32; 11],
+}
+#[repr(C)]
+pub struct _CUVIDRECONFIGUREDECODERINFO_display_area { pub left: i16, pub top: i16, pub right: i16, pub bottom: i16 }
+#[repr(C)]
+pub struct _CUVIDRECONFIGUREDECODERINFO_target_rect { pub left: i16, pub top: i16, pub right: i16, pub bottom: i16 }
+#[repr(C)]
 pub struct CUVIDPROCPARAMS {
     pub progressive_frame: i32,
     pub second_field: i32,
