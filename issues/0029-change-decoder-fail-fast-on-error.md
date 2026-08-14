@@ -1,8 +1,11 @@
 # 0029-change-decoder-fail-fast-on-error
 
 - Created: 2026-08-07
+- Completed: 2026-08-14
 - Branch: feature/change-decoder-fail-fast-on-error
 - Polished: 2026-08-13
+
+**本 issue は実装が完了しました。** 一度デコードに失敗した `Decoder` は使えなくなり、復旧は新しい `Decoder` を作る。契約テストは 0024 の `max_coded_*` 超過経路と一緒に後追いする。
 
 ## 目的
 
@@ -102,21 +105,11 @@
 
 ## 解決方法
 
-### 変更対象ファイル
+`src/decode.rs` の `run_worker` に終端フラグを入れ、最初のデコードエラー以降は `DecoderState::decode` を呼ばないようにした。原因エラーは `callback_error` に 1 件だけ格納し、`DecodeHandler::on_decoded` に 1 回通知する。`frame_tx` / `frame_rx` は Ok 専用にし、`drain_frames` が `Err` で `pending_user_data` を全消しする経路を削除した。
 
-- `src/decode.rs`:
-  - `run_worker` に終端状態を追加する
-  - `DecoderState` に `callback_error: Option<Error>` を追加する
-  - 3 コールバックラッパーの `Err` 分岐を slot 格納に変更する
-  - `frame_tx` / `frame_rx` を Ok 専用にする
-  - `drain_frames` の `Err` 分岐を削除する。missing user data は終端にする
-  - rustdoc を更新する
-  - 終端契約のテストは 0024 実装時に追加する
-- `CHANGES.md` — 追記例:
-  - `- [CHANGE] デコードエラー後の Decoder を終端状態にし、以降のデコードを行わないようにする`
-  - `  - 同一エラーの二重通知と、drain_frames が Err で pending_user_data を全消しする挙動を解消する`
-  - `  - 復旧は Decoder を作り直す`
-  - `  - @担当者`
+終端時点の未出力 pending はコールバックせず捨てる。失敗した parse 内で既に乗った Ok フレームは `discard_queued_frames` で捨てる。終端後の `Decoder::decode` は送信成功のまま終端を表す `Err` をコールバックする。終端後の `flush` は pending を待たず `Ok` で戻る。`send_eos` の失敗でも終端する。
+
+`Decoder` / `Decoder::decode` / `DecodeHandler` / `Decoder::flush` の rustdoc を終端契約に合わせて更新した。`CHANGES.md` に `[CHANGE]` を追記した。終端契約のテストは 0024 実装時に `max_coded_*` 超過経路と一緒に追加する。
 
 ## 関連 issue
 
