@@ -378,6 +378,7 @@ enum Job<T> {
 ///
 /// デコード処理が完了するたびに [`DecodeHandler::on_decoded`] が呼ばれる。
 /// 一度 `Err` が渡されたら、そのデコーダーは終端状態になる。復旧は新しい `Decoder` を作ること。
+/// 終端時点で未完了だったジョブにコールバックは届かない。最初の `Err` で `Decoder` を捨てること。
 pub trait DecodeHandler: Send + 'static {
     /// ユーザーデータ型
     type UserData: Send + 'static;
@@ -420,6 +421,7 @@ where
 /// デコードが完了すると、コンストラクタで渡したハンドラがワーカースレッド上で即座に呼び出される。
 ///
 /// 一度 [`DecodeHandler::on_decoded`] に `Err` が渡されたら、このインスタンスは終端状態になる。
+/// 終端時点で未完了だったジョブにコールバックは届かない。最初の `Err` でこのインスタンスを捨てること。
 /// 終端後はデコードが行われず、復旧は新しい `Decoder` を作ること。
 pub struct Decoder<H: DecodeHandler> {
     job_tx: SyncSender<Job<H::UserData>>,
@@ -810,11 +812,7 @@ where
                 if terminated {
                     // 終端後はデコードせず、終端エラーを通知する。
                     // デコード結果の Ok フレームは以降一切来ない。
-                    handler.on_decoded(Err(Error::new_custom(
-                        "decode",
-                        "decoder has already failed",
-                    )
-                    .into()));
+                    handler.on_decoded(Err(terminal_decode_error().into()));
                     continue;
                 }
 
@@ -822,15 +820,24 @@ where
                     // 最初のデコードエラーで終端に入る。
                     // ワーカーを return してはいけない (decode() は送信成功で Ok を返すため、
                     // キュー済みジョブのコールバックが消える)。終端後もジョブを受けて応答する。
+                    //
+                    // 失敗 parse 由来の Ok と先行 pending を混ぜないよう channel を空にする。
+                    // 未完了 pending はコールバックせず捨てる。利用側は最初の Err で Decoder を捨てる。
+                    // このジョブの user_data は pending に積んでいないためここで破棄される。
                     terminated = true;
+                    discard_queued_frames(&mut state);
+                    pending_user_data.clear();
                     handler.on_decoded(Err(e.into()));
                     continue;
                 }
 
                 pending_user_data.push_back(user_data);
                 if !drain_frames(&mut state, &mut handler, &mut pending_user_data) {
-                    // missing user data（不変条件違反）で終端に入る
+                    // missing user data（不変条件違反）で終端に入る。
+                    // 原因 Err は drain_frames 内で通知済み。残りはコールバックせず捨てる。
                     terminated = true;
+                    discard_queued_frames(&mut state);
+                    pending_user_data.clear();
                 }
             }
             Ok(Job::Flush { done }) => {
@@ -842,10 +849,14 @@ where
                             if !drain_frames(&mut state, &mut handler, &mut pending_user_data) {
                                 // missing user data（不変条件違反）で終端に入る
                                 terminated = true;
+                                discard_queued_frames(&mut state);
+                                pending_user_data.clear();
                             }
                         }
                         Err(e) => {
                             terminated = true;
+                            discard_queued_frames(&mut state);
+                            pending_user_data.clear();
                             handler.on_decoded(Err(e.into()));
                         }
                     }
@@ -877,6 +888,19 @@ fn store_callback_error(state: &mut DecoderState, e: Error) {
     if state.callback_error.is_none() {
         state.callback_error = Some(e);
     }
+}
+
+/// 終端後のジョブに返すエラー
+fn terminal_decode_error() -> Error {
+    Error::new_custom("decode", "decoder has already failed")
+}
+
+/// キューに残った Ok フレームをすべて破棄する
+///
+/// 失敗した parse 内で既に `frame_tx` に乗ったフレームを、
+/// 先行 pending と誤ペアリングしないために使う。
+fn discard_queued_frames(state: &mut DecoderState) {
+    while state.next_frame().is_some() {}
 }
 
 fn drain_frames<H>(
