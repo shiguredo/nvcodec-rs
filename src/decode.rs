@@ -287,7 +287,7 @@ impl DecoderState {
     /// 圧縮された映像フレームをデコードする
     ///
     /// 内部でコールバックが失敗した場合、その具体的エラーが返る。
-    /// エラー後のデコーダー停止 (終端状態への遷移) は呼び出し側 (`run_worker`) の責務である。
+    /// エラー後のデコーダー停止 (終端状態への遷移) は呼び出し側 (`DecodeWorker::run`) の責務である。
     pub fn decode(&mut self, data: &[u8]) -> Result<(), Error> {
         // [NOTE]
         // cuvidParseVideoData は内部でデータをコピーまたは即座に処理するため、
@@ -453,7 +453,7 @@ impl<H: DecodeHandler> Decoder<H> {
         let worker = std::thread::Builder::new()
             .name("nvcodec-decoder".into())
             .spawn(move || {
-                run_worker(state, handler, job_rx);
+                DecodeWorker::run(state, handler, job_rx);
             })
             .map_err(|_e| Error::new_custom("Decoder::new", "failed to spawn decoder thread"))?;
 
@@ -821,7 +821,7 @@ impl<T> DecodedFrame<T> {
 
 /// デコードワーカーのループ状態と処理をまとめる構造体
 ///
-/// [`run_worker`] はこの構造体を構築し、ジョブを各メソッドへ dispatch する。
+/// [`DecodeWorker::run`] がエントリポイントで、この構造体を構築しジョブを各メソッドへ dispatch する。
 struct DecodeWorker<H: DecodeHandler> {
     state: Box<DecoderState>,
     handler: H,
@@ -899,28 +899,29 @@ impl<H: DecodeHandler> DecodeWorker<H> {
             drain_frames(&self.state, &mut self.handler, &mut self.pending_user_data);
         }
     }
-}
 
-fn run_worker<H>(state: Box<DecoderState>, handler: H, job_rx: Receiver<Job<H::UserData>>)
-where
-    H: DecodeHandler,
-{
-    let mut worker = DecodeWorker {
-        state,
-        handler,
-        pending_user_data: VecDeque::new(),
-        terminated: false,
-    };
+    /// `job_rx` からジョブを受け取り続けて処理する
+    ///
+    /// ワーカースレッドのエントリポイント。`Job::Terminate` を受け取るか
+    /// チャネルが破棄された (`Err(_)`) ときに、残りの非同期処理を完了させて return する。
+    /// return 時に `state` の Drop が走り、CUDA リソースが解放される。
+    fn run(state: Box<DecoderState>, handler: H, job_rx: Receiver<Job<H::UserData>>) {
+        let mut worker = DecodeWorker {
+            state,
+            handler,
+            pending_user_data: VecDeque::new(),
+            terminated: false,
+        };
 
-    loop {
-        match job_rx.recv() {
-            Ok(Job::Decode { data, user_data }) => worker.handle_decode(&data, user_data),
-            Ok(Job::Flush { done }) => worker.handle_flush(done),
-            Ok(Job::Terminate) | Err(_) => {
-                // チャネル破棄 (Err) 時も、残っている非同期処理を完了させてから終了する。
-                // state の Drop がここで走り、CUDA リソースが解放される
-                worker.finish();
-                return;
+        loop {
+            match job_rx.recv() {
+                Ok(Job::Decode { data, user_data }) => worker.handle_decode(&data, user_data),
+                Ok(Job::Flush { done }) => worker.handle_flush(done),
+                Ok(Job::Terminate) | Err(_) => {
+                    // チャネル破棄 (Err) 時も、残っている非同期処理を完了させてから終了する。
+                    worker.finish();
+                    return;
+                }
             }
         }
     }
