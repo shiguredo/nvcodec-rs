@@ -898,11 +898,10 @@ impl<H: DecodeHandler> DecodeWorker<H> {
         }
     }
 
-    /// `job_rx` からジョブを受け取り続けて処理する
+    /// ワーカースレッドのエントリポイント。`job_rx` からジョブを処理するループを回す
     ///
-    /// ワーカースレッドのエントリポイント。`Job::Terminate` を受け取るか
-    /// チャネルが破棄された (`Err(_)`) ときに、残りの非同期処理を完了させて return する。
-    /// return 時に `state` の Drop が走り、CUDA リソースが解放される。
+    /// `Job::Terminate` を受け取るかチャネルが破棄された (`Err(_)`) ときに、
+    /// [`DecodeWorker::finish`] で残りを完了させて return する。
     fn run(state: Box<DecoderState>, handler: H, job_rx: Receiver<Job<H::UserData>>) {
         let mut worker = DecodeWorker {
             state,
