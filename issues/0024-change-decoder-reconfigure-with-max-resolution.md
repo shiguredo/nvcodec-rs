@@ -134,6 +134,12 @@ Step 1 で `format.display_area` を検証するのは、`state.width` / `state.
 - **0028**: `ulNumDecodeSurfaces` を codec 別推奨値に引き上げる — 参照フレーム数の多い HEVC / VP9 / AV1 で DPB 不足リスクを低減する
 - **0029**: デコードエラー後の `Decoder` を終端状態にする — 二重通知と `drain_frames` scorched-earth を、エラー後継続をやめることで解消する
 
+### 0029 の終端契約テスト（本 issue 実装時に一緒にやる）
+
+0029 の完了条件にある終端契約テスト（エラー後に Ok が来ない・原因 Err は 1 回・後続ジョブに終端 Err・終端後 `flush` が戻る）は、公開 API だけで安定してデコードエラーを起こす手段が現状ないため 0029 単体では未着手。
+
+本 issue の `max_coded_width` / `max_coded_height` 超過による事前検証エラーが、公開 API で安定再現できる Err 誘発手段になる。reconfigure / max 超過のテストを書くタイミングで、上記の終端契約テストも同じ経路で追加する。
+
 ## 関連 issue
 
 - 0006 (closed)
