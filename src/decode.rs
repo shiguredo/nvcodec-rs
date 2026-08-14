@@ -433,6 +433,259 @@ impl DecoderState {
     fn next_frame(&self) -> Option<RawFrame> {
         self.frame_rx.try_recv().ok()
     }
+
+    /// シーケンスコールバック処理 (pfnSequenceCallback から呼ばれる)
+    ///
+    /// デコーダーの生成 / 破棄 / 再構成をまとめて行う。
+    /// 戻り値は parser に渡す成功値 (1) / 失敗値 (0) の元になる整数。
+    fn handle_video_sequence(&mut self, format: &sys::CUVIDEOFORMAT) -> Result<i32, Error> {
+        self.stats.total_sequence_callback_count.inc();
+
+        // display_area の検証は SDK 呼び出しより先に行う
+        // 検証失敗時にデコーダーを破棄済みのままにしないため
+        validate_display_area(format)?;
+
+        // 最大解像度の超過を SDK 呼び出しより先に検証する
+        // 初回コールバックか 2 回目以降かによらず、常に検証する
+        if let (Some(max_width), Some(max_height)) = (self.max_coded_width, self.max_coded_height)
+            && (format.coded_width > max_width || format.coded_height > max_height)
+        {
+            return Err(Error::new_custom_owned(
+                "handle_video_sequence",
+                format!(
+                    "coded size ({}x{}) exceeds max_coded_width / max_coded_height ({}x{})",
+                    format.coded_width, format.coded_height, max_width, max_height
+                ),
+            ));
+        }
+
+        if self.decoder.is_null() {
+            // 初回コールバックではデコーダーを新規作成する
+            // 最大解像度が指定されている場合は ulMaxWidth / ulMaxHeight に設定して
+            // 以降の cuvidReconfigureDecoder による in-place 再構成を可能にする
+            self.create_decoder(format)?;
+            self.save_reconfigure_baseline(format);
+        } else if self.max_coded_width.is_none() || self.max_coded_height.is_none() {
+            // 最大解像度が分からない場合は破棄して再作成する
+            // この経路では判定用ベースラインは使わないため保存値の更新は不要
+            self.destroy_and_recreate_decoder(format)?;
+        } else if self.reconfigure_baseline.changed(format) {
+            // コーデック / クロマフォーマット / ビット深度 / progressive のいずれかが変化した場合
+            // cuvidReconfigureDecoder は same codec 限定のため破棄して再作成する
+            // 最大解像度は引き続き設定し、判定用ベースラインも更新して
+            // 次回以降 reconfigure 経路に戻れるようにする
+            self.destroy_and_recreate_decoder(format)?;
+            self.save_reconfigure_baseline(format);
+        } else {
+            // それ以外は cuvidReconfigureDecoder で in-place に再構成する
+            // パーサーと共有するコンテキストロックを使用する
+            //
+            // ulTargetWidth / ulTargetHeight と display_area は
+            // 作成時に確定した値 (self.create_geometry) をそのまま渡す
+            // (新しい coded サイズをここに渡すと、既に作成時サイズで allocate された
+            //  出力サーフェスとの不整合により cuvidDecodePicture が縮小時に
+            //  CUDA_ERROR_INVALID_VALUE を返す。NVIDIA 公式サンプル
+            //  NvDecoder::ReconfigureDecoder も同様に作成時サイズを維持している)
+            let result = self.lib.with_context(self.ctx, || {
+                let mut reconfigure_info: sys::CUVIDRECONFIGUREDECODERINFO =
+                    unsafe { std::mem::zeroed() };
+                reconfigure_info.ulWidth = format.coded_width;
+                reconfigure_info.ulHeight = format.coded_height;
+                reconfigure_info.ulTargetWidth = self.create_geometry.target_width;
+                reconfigure_info.ulTargetHeight = self.create_geometry.target_height;
+                reconfigure_info.display_area.left = self.create_geometry.display_left;
+                reconfigure_info.display_area.top = self.create_geometry.display_top;
+                reconfigure_info.display_area.right = self.create_geometry.display_right;
+                reconfigure_info.display_area.bottom = self.create_geometry.display_bottom;
+                reconfigure_info.ulNumDecodeSurfaces = format.min_num_decode_surfaces as u32;
+                self.lib
+                    .cuvid_reconfigure_decoder(self.decoder, &mut reconfigure_info)
+            });
+            match result {
+                Ok(()) => {
+                    self.stats.total_reconfigure_decoder_count.inc();
+                }
+                Err(e) => {
+                    self.stats.total_reconfigure_failure_count.inc();
+                    return Err(e);
+                }
+            }
+        }
+
+        self.update_decoder_dimensions(format);
+
+        // シーケンスコールバックの戻り値は decoder の ulNumDecodeSurfaces と
+        // 同じ値でなければならない (parser がこの値で curr_pic_idx を割り当てるため)
+        Ok(format.min_num_decode_surfaces as i32)
+    }
+
+    /// デコーダーを新規作成する
+    ///
+    /// ulMaxWidth / ulMaxHeight には max_coded_width / max_coded_height が
+    /// 指定されている場合はその値を、None の場合は現在の coded_width / coded_height を設定する
+    fn create_decoder(&mut self, format: &sys::CUVIDEOFORMAT) -> Result<(), Error> {
+        // デコーダーの作成情報を設定
+        let mut create_info: sys::CUVIDDECODECREATEINFO = unsafe { std::mem::zeroed() };
+        create_info.CodecType = format.codec;
+        create_info.ChromaFormat = format.chroma_format;
+        create_info.OutputFormat = self.surface_format;
+        create_info.bitDepthMinus8 = format.bit_depth_luma_minus8 as u64;
+        create_info.DeinterlaceMode = if format.progressive_sequence != 0 {
+            sys::cudaVideoDeinterlaceMode_enum_cudaVideoDeinterlaceMode_Weave
+        } else {
+            sys::cudaVideoDeinterlaceMode_enum_cudaVideoDeinterlaceMode_Adaptive
+        };
+        create_info.ulNumOutputSurfaces = 2; // 出力サーフェスの数（ダブルバッファリング用に2を指定）
+        create_info.ulCreationFlags =
+            sys::cudaVideoCreateFlags_enum_cudaVideoCreate_PreferCUVID as u64; // CUVID ハードウェアデコーダーの使用を優先するフラグ
+        create_info.ulNumDecodeSurfaces = format.min_num_decode_surfaces as u64;
+        create_info.ulWidth = format.coded_width as u64;
+        create_info.ulHeight = format.coded_height as u64;
+        create_info.ulMaxWidth = self.max_coded_width.unwrap_or(format.coded_width) as u64;
+        create_info.ulMaxHeight = self.max_coded_height.unwrap_or(format.coded_height) as u64;
+        create_info.ulTargetWidth = format.coded_width as u64;
+        create_info.ulTargetHeight = format.coded_height as u64;
+
+        // display_area は以降の cuvidReconfigureDecoder でも同じ値を再度渡す必要があるため
+        // ここで明示的に設定する (i32 → i16 のキャストは display_area の検証で
+        // 負値 / 逆転を弾いており、実用上の解像度は i16 の上限を超えないため安全)
+        create_info.display_area.left = format.display_area.left as i16;
+        create_info.display_area.top = format.display_area.top as i16;
+        create_info.display_area.right = format.display_area.right as i16;
+        create_info.display_area.bottom = format.display_area.bottom as i16;
+
+        // パーサーと共有するコンテキストロックを使用
+        create_info.vidLock = self.ctx_lock;
+
+        self.lib.with_context(self.ctx, || {
+            self.lib
+                .cuvid_create_decoder(&mut self.decoder, &mut create_info)
+        })?;
+        self.stats.total_create_decoder_count.inc();
+
+        // 作成時ジオメトリを保存する
+        // 以降の cuvidReconfigureDecoder では target / display_area をこの値に固定して渡す
+        self.create_geometry = DecoderCreateGeometry {
+            target_width: format.coded_width,
+            target_height: format.coded_height,
+            display_left: create_info.display_area.left,
+            display_top: create_info.display_area.top,
+            display_right: create_info.display_area.right,
+            display_bottom: create_info.display_area.bottom,
+        };
+
+        Ok(())
+    }
+
+    /// 既存デコーダーを破棄してから再作成する
+    fn destroy_and_recreate_decoder(&mut self, format: &sys::CUVIDEOFORMAT) -> Result<(), Error> {
+        self.lib
+            .with_context(self.ctx, || self.lib.cuvid_destroy_decoder(self.decoder))?;
+        self.decoder = ptr::null_mut();
+        self.create_decoder(format)
+    }
+
+    /// 直近の create / reconfigure 時のコーデック情報をベースラインとして保存する
+    fn save_reconfigure_baseline(&mut self, format: &sys::CUVIDEOFORMAT) {
+        self.reconfigure_baseline = ReconfigureBaseline::from_format(format);
+    }
+
+    /// デコーダーの幅・高さを CUVIDEOFORMAT から更新する
+    fn update_decoder_dimensions(&mut self, format: &sys::CUVIDEOFORMAT) {
+        self.width = (format.display_area.right - format.display_area.left) as u32;
+        self.height = (format.display_area.bottom - format.display_area.top) as u32;
+        self.surface_width = format.coded_width;
+        self.surface_height = format.coded_height;
+    }
+
+    /// ピクチャデコードコールバック処理 (pfnDecodePicture から呼ばれる)
+    fn handle_picture_decode(&mut self, pic_params: &sys::CUVIDPICPARAMS) -> Result<(), Error> {
+        self.stats.total_decode_callback_count.inc();
+        if self.decoder.is_null() {
+            return Err(Error::new_custom(
+                "handle_picture_decode",
+                "decoder not initialized",
+            ));
+        }
+
+        self.lib.with_context(self.ctx, || {
+            self.lib
+                .cuvid_decode_picture(self.decoder, pic_params as *const _ as *mut _)
+        })?;
+
+        Ok(())
+    }
+
+    /// ピクチャ表示コールバック処理 (pfnDisplayPicture から呼ばれる)
+    fn handle_picture_display(&self, disp_info: &sys::CUVIDPARSERDISPINFO) -> Result<(), Error> {
+        if self.decoder.is_null() {
+            return Err(Error::new_custom(
+                "handle_picture_display",
+                "decoder not initialized",
+            ));
+        }
+
+        let decoded_frame = self.lib.with_context(self.ctx, || unsafe {
+            // ビデオ処理パラメーターを設定
+            let mut proc_params: sys::CUVIDPROCPARAMS = std::mem::zeroed();
+            proc_params.progressive_frame = disp_info.progressive_frame;
+            proc_params.top_field_first = disp_info.top_field_first;
+            proc_params.second_field = disp_info.repeat_first_field + 1;
+            proc_params.output_stream = ptr::null_mut();
+
+            // デコード済みフレームをマップ
+            let mut device_ptr = 0u64;
+            let mut pitch = 0u32;
+            self.lib.cuvid_map_video_frame(
+                self.decoder,
+                disp_info.picture_index,
+                &mut device_ptr,
+                &mut pitch,
+                &mut proc_params,
+            )?;
+
+            // 確実にフレームをアンマップするためのガードを作成
+            let _unmap_guard = crate::ReleaseGuard::new(|| {
+                let _ = self.lib.cuvid_unmap_video_frame(self.decoder, device_ptr);
+            });
+
+            // フレームサイズを計算 (NV12 形式: Y プレーン + UV プレーン)
+            // 注意: NVDEC は高さを 2 でアライメントする
+            let aligned_height = (self.surface_height + 1) & !1;
+            let y_size = pitch as usize * self.height as usize;
+            let uv_size = pitch as usize * (self.height as usize).div_ceil(2);
+            let frame_size = y_size + uv_size;
+
+            // フレーム用のホストメモリを割り当て
+            let mut host_data = vec![0u8; frame_size];
+
+            // Y プレーンをコピー
+            self.lib
+                .cu_memcpy_d_to_h(host_data.as_mut_ptr() as *mut c_void, device_ptr, y_size)?;
+
+            // UV プレーンをコピー
+            let uv_offset = pitch as u64 * aligned_height as u64;
+            self.lib.cu_memcpy_d_to_h(
+                host_data[y_size..].as_mut_ptr() as *mut c_void,
+                device_ptr + uv_offset,
+                uv_size,
+            )?;
+
+            // デコード済みフレームを作成
+            Ok(RawFrame {
+                width: self.width,
+                height: self.height,
+                pitch: pitch as usize,
+                data: host_data,
+            })
+        })?;
+
+        self.stats.total_output_frame_count.inc();
+        // チャンネル経由で送信 (受信側が破棄されている場合の送信エラーは無視)
+        let _ = self.frame_tx.send(decoded_frame);
+
+        Ok(())
+    }
 }
 
 impl Drop for DecoderState {
@@ -628,174 +881,6 @@ pub fn query_decoder_caps(codec: DecoderCodec, device_id: i32) -> Result<Decoder
     DecoderState::query_caps(codec, device_id)
 }
 
-fn handle_video_sequence_inner(
-    state: &mut DecoderState,
-    format: &sys::CUVIDEOFORMAT,
-) -> Result<i32, Error> {
-    state.stats.total_sequence_callback_count.inc();
-
-    // display_area の検証は SDK 呼び出しより先に行う
-    // 検証失敗時にデコーダーを破棄済みのままにしないため
-    validate_display_area(format)?;
-
-    // 最大解像度の超過を SDK 呼び出しより先に検証する
-    // 初回コールバックか 2 回目以降かによらず、常に検証する
-    if let (Some(max_width), Some(max_height)) = (state.max_coded_width, state.max_coded_height)
-        && (format.coded_width > max_width || format.coded_height > max_height)
-    {
-        return Err(Error::new_custom_owned(
-            "handle_video_sequence",
-            format!(
-                "coded size ({}x{}) exceeds max_coded_width / max_coded_height ({}x{})",
-                format.coded_width, format.coded_height, max_width, max_height
-            ),
-        ));
-    }
-
-    if state.decoder.is_null() {
-        // 初回コールバックではデコーダーを新規作成する
-        // 最大解像度が指定されている場合は ulMaxWidth / ulMaxHeight に設定して
-        // 以降の cuvidReconfigureDecoder による in-place 再構成を可能にする
-        create_decoder(state, format)?;
-        save_reconfigure_baseline(state, format);
-    } else if state.max_coded_width.is_none() || state.max_coded_height.is_none() {
-        // 最大解像度が分からない場合は破棄して再作成する
-        // この経路では判定用ベースラインは使わないため保存値の更新は不要
-        destroy_and_recreate_decoder(state, format)?;
-    } else if state.reconfigure_baseline.changed(format) {
-        // コーデック / クロマフォーマット / ビット深度 / progressive のいずれかが変化した場合
-        // cuvidReconfigureDecoder は same codec 限定のため破棄して再作成する
-        // 最大解像度は引き続き設定し、判定用ベースラインも更新して
-        // 次回以降 reconfigure 経路に戻れるようにする
-        destroy_and_recreate_decoder(state, format)?;
-        save_reconfigure_baseline(state, format);
-    } else {
-        // それ以外は cuvidReconfigureDecoder で in-place に再構成する
-        // パーサーと共有するコンテキストロックを使用する
-        //
-        // ulTargetWidth / ulTargetHeight と display_area は
-        // 作成時に確定した値 (state.create_geometry) をそのまま渡す
-        // (新しい coded サイズをここに渡すと、既に作成時サイズで allocate された
-        //  出力サーフェスとの不整合により cuvidDecodePicture が縮小時に
-        //  CUDA_ERROR_INVALID_VALUE を返す。NVIDIA 公式サンプル
-        //  NvDecoder::ReconfigureDecoder も同様に作成時サイズを維持している)
-        let result = state.lib.with_context(state.ctx, || {
-            let mut reconfigure_info: sys::CUVIDRECONFIGUREDECODERINFO =
-                unsafe { std::mem::zeroed() };
-            reconfigure_info.ulWidth = format.coded_width;
-            reconfigure_info.ulHeight = format.coded_height;
-            reconfigure_info.ulTargetWidth = state.create_geometry.target_width;
-            reconfigure_info.ulTargetHeight = state.create_geometry.target_height;
-            reconfigure_info.display_area.left = state.create_geometry.display_left;
-            reconfigure_info.display_area.top = state.create_geometry.display_top;
-            reconfigure_info.display_area.right = state.create_geometry.display_right;
-            reconfigure_info.display_area.bottom = state.create_geometry.display_bottom;
-            reconfigure_info.ulNumDecodeSurfaces = format.min_num_decode_surfaces as u32;
-            state
-                .lib
-                .cuvid_reconfigure_decoder(state.decoder, &mut reconfigure_info)
-        });
-        match result {
-            Ok(()) => {
-                state.stats.total_reconfigure_decoder_count.inc();
-            }
-            Err(e) => {
-                state.stats.total_reconfigure_failure_count.inc();
-                return Err(e);
-            }
-        }
-    }
-
-    update_decoder_dimensions(state, format);
-
-    // シーケンスコールバックの戻り値は decoder の ulNumDecodeSurfaces と
-    // 同じ値でなければならない (parser がこの値で curr_pic_idx を割り当てるため)
-    Ok(format.min_num_decode_surfaces as i32)
-}
-
-/// デコーダーを新規作成する
-///
-/// ulMaxWidth / ulMaxHeight には max_coded_width / max_coded_height が
-/// 指定されている場合はその値を、None の場合は現在の coded_width / coded_height を設定する
-fn create_decoder(state: &mut DecoderState, format: &sys::CUVIDEOFORMAT) -> Result<(), Error> {
-    // デコーダーの作成情報を設定
-    let mut create_info: sys::CUVIDDECODECREATEINFO = unsafe { std::mem::zeroed() };
-    create_info.CodecType = format.codec;
-    create_info.ChromaFormat = format.chroma_format;
-    create_info.OutputFormat = state.surface_format;
-    create_info.bitDepthMinus8 = format.bit_depth_luma_minus8 as u64;
-    create_info.DeinterlaceMode = if format.progressive_sequence != 0 {
-        sys::cudaVideoDeinterlaceMode_enum_cudaVideoDeinterlaceMode_Weave
-    } else {
-        sys::cudaVideoDeinterlaceMode_enum_cudaVideoDeinterlaceMode_Adaptive
-    };
-    create_info.ulNumOutputSurfaces = 2; // 出力サーフェスの数（ダブルバッファリング用に2を指定）
-    create_info.ulCreationFlags = sys::cudaVideoCreateFlags_enum_cudaVideoCreate_PreferCUVID as u64; // CUVID ハードウェアデコーダーの使用を優先するフラグ
-    create_info.ulNumDecodeSurfaces = format.min_num_decode_surfaces as u64;
-    create_info.ulWidth = format.coded_width as u64;
-    create_info.ulHeight = format.coded_height as u64;
-    create_info.ulMaxWidth = state.max_coded_width.unwrap_or(format.coded_width) as u64;
-    create_info.ulMaxHeight = state.max_coded_height.unwrap_or(format.coded_height) as u64;
-    create_info.ulTargetWidth = format.coded_width as u64;
-    create_info.ulTargetHeight = format.coded_height as u64;
-
-    // display_area は以降の cuvidReconfigureDecoder でも同じ値を再度渡す必要があるため
-    // ここで明示的に設定する (i32 → i16 のキャストは display_area の検証で
-    // 負値 / 逆転を弾いており、実用上の解像度は i16 の上限を超えないため安全)
-    create_info.display_area.left = format.display_area.left as i16;
-    create_info.display_area.top = format.display_area.top as i16;
-    create_info.display_area.right = format.display_area.right as i16;
-    create_info.display_area.bottom = format.display_area.bottom as i16;
-
-    // パーサーと共有するコンテキストロックを使用
-    create_info.vidLock = state.ctx_lock;
-
-    state.lib.with_context(state.ctx, || {
-        state
-            .lib
-            .cuvid_create_decoder(&mut state.decoder, &mut create_info)
-    })?;
-    state.stats.total_create_decoder_count.inc();
-
-    // 作成時ジオメトリを保存する
-    // 以降の cuvidReconfigureDecoder では target / display_area をこの値に固定して渡す
-    state.create_geometry = DecoderCreateGeometry {
-        target_width: format.coded_width,
-        target_height: format.coded_height,
-        display_left: create_info.display_area.left,
-        display_top: create_info.display_area.top,
-        display_right: create_info.display_area.right,
-        display_bottom: create_info.display_area.bottom,
-    };
-
-    Ok(())
-}
-
-/// 既存デコーダーを破棄してから再作成する
-fn destroy_and_recreate_decoder(
-    state: &mut DecoderState,
-    format: &sys::CUVIDEOFORMAT,
-) -> Result<(), Error> {
-    state
-        .lib
-        .with_context(state.ctx, || state.lib.cuvid_destroy_decoder(state.decoder))?;
-    state.decoder = ptr::null_mut();
-    create_decoder(state, format)
-}
-
-/// 直近の create / reconfigure 時のコーデック情報をベースラインとして保存する
-fn save_reconfigure_baseline(state: &mut DecoderState, format: &sys::CUVIDEOFORMAT) {
-    state.reconfigure_baseline = ReconfigureBaseline::from_format(format);
-}
-
-/// デコーダーの幅・高さを CUVIDEOFORMAT から更新する
-fn update_decoder_dimensions(state: &mut DecoderState, format: &sys::CUVIDEOFORMAT) {
-    state.width = (format.display_area.right - format.display_area.left) as u32;
-    state.height = (format.display_area.bottom - format.display_area.top) as u32;
-    state.surface_width = format.coded_width;
-    state.surface_height = format.coded_height;
-}
-
 /// display_area を検証する
 ///
 /// 壊れたストリームでは signed 整数の display_area が負値や coded サイズを超えることがあるため、
@@ -846,7 +931,7 @@ unsafe extern "C" fn handle_video_sequence(
         return 0;
     }
     let state = unsafe { &mut *(user_data as *mut DecoderState) };
-    match handle_video_sequence_inner(state, unsafe { &*format }) {
+    match state.handle_video_sequence(unsafe { &*format }) {
         Ok(val) => val,
         Err(e) => {
             // 具体的エラーを callback_error フィールドに格納し、パーサーには失敗 (0) を伝える
@@ -864,7 +949,7 @@ unsafe extern "C" fn handle_picture_decode(
         return 0;
     }
     let state = unsafe { &mut *(user_data as *mut DecoderState) };
-    match handle_picture_decode_inner(state, unsafe { &*pic_params }) {
+    match state.handle_picture_decode(unsafe { &*pic_params }) {
         Ok(()) => 1,
         Err(e) => {
             store_callback_error(state, e);
@@ -881,108 +966,13 @@ unsafe extern "C" fn handle_picture_display(
         return 0;
     }
     let state = unsafe { &mut *(user_data as *mut DecoderState) };
-    match handle_picture_display_inner(state, unsafe { &*disp_info }) {
+    match state.handle_picture_display(unsafe { &*disp_info }) {
         Ok(()) => 1,
         Err(e) => {
             store_callback_error(state, e);
             0
         }
     }
-}
-
-fn handle_picture_decode_inner(
-    state: &mut DecoderState,
-    pic_params: &sys::CUVIDPICPARAMS,
-) -> Result<(), Error> {
-    state.stats.total_decode_callback_count.inc();
-    if state.decoder.is_null() {
-        return Err(Error::new_custom(
-            "handle_picture_decode",
-            "decoder not initialized",
-        ));
-    }
-
-    state.lib.with_context(state.ctx, || {
-        state
-            .lib
-            .cuvid_decode_picture(state.decoder, pic_params as *const _ as *mut _)
-    })?;
-
-    Ok(())
-}
-
-fn handle_picture_display_inner(
-    state: &DecoderState,
-    disp_info: &sys::CUVIDPARSERDISPINFO,
-) -> Result<(), Error> {
-    if state.decoder.is_null() {
-        return Err(Error::new_custom(
-            "handle_picture_display",
-            "decoder not initialized",
-        ));
-    }
-
-    let decoded_frame = state.lib.with_context(state.ctx, || unsafe {
-        // ビデオ処理パラメーターを設定
-        let mut proc_params: sys::CUVIDPROCPARAMS = std::mem::zeroed();
-        proc_params.progressive_frame = disp_info.progressive_frame;
-        proc_params.top_field_first = disp_info.top_field_first;
-        proc_params.second_field = disp_info.repeat_first_field + 1;
-        proc_params.output_stream = ptr::null_mut();
-
-        // デコード済みフレームをマップ
-        let mut device_ptr = 0u64;
-        let mut pitch = 0u32;
-        state.lib.cuvid_map_video_frame(
-            state.decoder,
-            disp_info.picture_index,
-            &mut device_ptr,
-            &mut pitch,
-            &mut proc_params,
-        )?;
-
-        // 確実にフレームをアンマップするためのガードを作成
-        let _unmap_guard = crate::ReleaseGuard::new(|| {
-            let _ = state.lib.cuvid_unmap_video_frame(state.decoder, device_ptr);
-        });
-
-        // フレームサイズを計算 (NV12 形式: Y プレーン + UV プレーン)
-        // 注意: NVDEC は高さを 2 でアライメントする
-        let aligned_height = (state.surface_height + 1) & !1;
-        let y_size = pitch as usize * state.height as usize;
-        let uv_size = pitch as usize * (state.height as usize).div_ceil(2);
-        let frame_size = y_size + uv_size;
-
-        // フレーム用のホストメモリを割り当て
-        let mut host_data = vec![0u8; frame_size];
-
-        // Y プレーンをコピー
-        state
-            .lib
-            .cu_memcpy_d_to_h(host_data.as_mut_ptr() as *mut c_void, device_ptr, y_size)?;
-
-        // UV プレーンをコピー
-        let uv_offset = pitch as u64 * aligned_height as u64;
-        state.lib.cu_memcpy_d_to_h(
-            host_data[y_size..].as_mut_ptr() as *mut c_void,
-            device_ptr + uv_offset,
-            uv_size,
-        )?;
-
-        // デコード済みフレームを作成
-        Ok(RawFrame {
-            width: state.width,
-            height: state.height,
-            pitch: pitch as usize,
-            data: host_data,
-        })
-    })?;
-
-    state.stats.total_output_frame_count.inc();
-    // チャンネル経由で送信 (受信側が破棄されている場合の送信エラーは無視)
-    let _ = state.frame_tx.send(decoded_frame);
-
-    Ok(())
 }
 
 /// 内部用のデコード済み映像フレーム
