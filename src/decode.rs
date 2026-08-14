@@ -377,14 +377,19 @@ enum Job<T> {
 /// デコード結果を通知するためのハンドラー
 ///
 /// デコード処理が完了するたびに [`DecodeHandler::on_decoded`] が呼ばれる。
-/// 一度 `Err` が渡されたら、そのデコーダーは終端状態になる。復旧は新しい `Decoder` を作ること。
-/// 終端時点で未完了だったジョブにコールバックは届かない。最初の `Err` で `Decoder` を捨てること。
+/// 一度 `Err` が渡されたら、そのデコーダーは終端状態になる。
+/// 最初の `Err` で [`Decoder`] を捨て、復旧は新しいインスタンスを作ること。
+///
+/// 終端時点で出力待ちだったフレーム (pending) にコールバックは届かない。
+/// 終端後に送った [`Decoder::decode`] には、終端を表す `Err` が届く。
 pub trait DecodeHandler: Send + 'static {
     /// ユーザーデータ型
     type UserData: Send + 'static;
     /// エラー型
     type Error: From<crate::Error> + Send + 'static;
     /// デコード完了時に呼ばれる
+    ///
+    /// `Err` ならデコーダーは終端する。ユーザーデータは `Ok` のときだけ付く。
     fn on_decoded(&mut self, result: Result<DecodedFrame<Self::UserData>, Self::Error>);
 }
 
@@ -421,8 +426,9 @@ where
 /// デコードが完了すると、コンストラクタで渡したハンドラがワーカースレッド上で即座に呼び出される。
 ///
 /// 一度 [`DecodeHandler::on_decoded`] に `Err` が渡されたら、このインスタンスは終端状態になる。
-/// 終端時点で未完了だったジョブにコールバックは届かない。最初の `Err` でこのインスタンスを捨てること。
-/// 終端後はデコードが行われず、復旧は新しい `Decoder` を作ること。
+/// 終端時点の pending にコールバックは届かない。最初の `Err` でこのインスタンスを捨てること。
+/// 終端後の [`Decoder::decode`] は内部デコードをせず、終端 `Err` をコールバックする。
+/// 復旧は新しい `Decoder` を作ること。
 pub struct Decoder<H: DecodeHandler> {
     job_tx: SyncSender<Job<H::UserData>>,
     worker: Option<JoinHandle<()>>,
@@ -465,8 +471,9 @@ impl<H: DecodeHandler> Decoder<H> {
     /// フレームデータとユーザーデータをワーカースレッドに送信し、即座に戻る。
     /// デコードが完了すると、コンストラクタで渡したコールバックハンドラが呼び出される。
     ///
-    /// デコーダーが終端状態でも送信は成功し、後続の [`DecodeHandler::on_decoded`] には
-    /// 終端を表す `Err` が渡される。エラー後の復旧は新しい `Decoder` を作ること。
+    /// デコーダーが終端状態でも送信は成功する。その場合
+    /// [`DecodeHandler::on_decoded`] には終端を表す `Err` が渡される。
+    /// 終端より前に送信済みで未出力の分には、この終端 `Err` は届かない。
     pub fn decode(&self, data: &[u8], user_data: H::UserData) -> Result<(), Error> {
         self.job_tx
             .send(Job::Decode {
@@ -480,11 +487,11 @@ impl<H: DecodeHandler> Decoder<H> {
 
     /// 送信済みの未完了フレームがすべて完了するまで待機する
     ///
-    /// すべての pending フレームのコールバックハンドラが呼び出された後、このメソッドが戻る。
-    /// flush 後も decode を継続できる。
+    /// 成功時は、 pending のコールバックがすべて呼ばれたあと戻る。その後も decode を継続できる。
     ///
-    /// この記述は成功時の話であり、終端状態では当てはまらない。終端状態では
-    /// デコード結果の Ok フレームは来ないため、flush 後もデコードを継続することはできない。
+    /// 終端後 (この flush 中の失敗で終端した場合を含む) は、 pending のコールバックを
+    /// 待たずに `Ok` で戻る。ハングはしない。 decode は再開できない。
+    /// 終端の原因は [`DecodeHandler::on_decoded`] の `Err` で通知済みである。
     pub fn flush(&self) -> Result<(), Error> {
         let (tx, rx) = mpsc::sync_channel(0);
         self.job_tx
