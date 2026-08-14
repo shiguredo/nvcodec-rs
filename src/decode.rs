@@ -286,7 +286,7 @@ impl DecoderState {
     /// 圧縮された映像フレームをデコードする
     ///
     /// 内部でコールバックが失敗した場合、その具体的エラーが返る。
-    /// 一度エラーが返ると、このデコーダーは終端状態になり以降のデコードは行われない。
+    /// 終端するかは呼び出し側 (`run_worker`) の責務である。
     pub fn decode(&mut self, data: &[u8]) -> Result<(), Error> {
         // [NOTE]
         // cuvidParseVideoData は内部でデータをコピーまたは即座に処理するため、
@@ -340,8 +340,8 @@ impl DecoderState {
         }
     }
 
-    /// デコード済みのフレームを取り出す (Ok のみ。エラーは [`DecoderState::callback_error`] で扱う)
-    fn next_frame(&mut self) -> Option<RawFrame> {
+    /// デコード済みのフレームを取り出す
+    fn next_frame(&self) -> Option<RawFrame> {
         self.frame_rx.try_recv().ok()
     }
 }
@@ -832,18 +832,18 @@ where
                     // 未完了 pending はコールバックせず捨てる。利用側は最初の Err で Decoder を捨てる。
                     // このジョブの user_data は pending に積んでいないためここで破棄される。
                     terminated = true;
-                    discard_queued_frames(&mut state);
+                    discard_queued_frames(&state);
                     pending_user_data.clear();
                     handler.on_decoded(Err(e.into()));
                     continue;
                 }
 
                 pending_user_data.push_back(user_data);
-                if !drain_frames(&mut state, &mut handler, &mut pending_user_data) {
+                if !drain_frames(&state, &mut handler, &mut pending_user_data) {
                     // missing user data（不変条件違反）で終端に入る。
                     // 原因 Err は drain_frames 内で通知済み。残りはコールバックせず捨てる。
                     terminated = true;
-                    discard_queued_frames(&mut state);
+                    discard_queued_frames(&state);
                     pending_user_data.clear();
                 }
             }
@@ -853,16 +853,16 @@ where
                     // および synchronize 失敗など）で終端する。Decode 経路と対称。
                     match state.send_eos() {
                         Ok(()) => {
-                            if !drain_frames(&mut state, &mut handler, &mut pending_user_data) {
+                            if !drain_frames(&state, &mut handler, &mut pending_user_data) {
                                 // missing user data（不変条件違反）で終端に入る
                                 terminated = true;
-                                discard_queued_frames(&mut state);
+                                discard_queued_frames(&state);
                                 pending_user_data.clear();
                             }
                         }
                         Err(e) => {
                             terminated = true;
-                            discard_queued_frames(&mut state);
+                            discard_queued_frames(&state);
                             pending_user_data.clear();
                             handler.on_decoded(Err(e.into()));
                         }
@@ -875,7 +875,7 @@ where
                 // 終端後は残フレームを drain せず終了する (DecoderState の Drop で解放)。
                 if !terminated {
                     let _ = state.send_eos();
-                    drain_frames(&mut state, &mut handler, &mut pending_user_data);
+                    drain_frames(&state, &mut handler, &mut pending_user_data);
                 }
                 // state の Drop がここで走り、CUDA リソースが解放される
                 return;
@@ -884,8 +884,10 @@ where
     }
 }
 
-/// コールバックの失敗を `callback_error` slot に格納する (診断用)。
+/// コールバックの失敗を `callback_error` に格納する。
 /// 最初の 1 件だけ保持し、後続の失敗は破棄する。
+///
+/// 格納したエラーは [`DecoderState::prefer_callback_error`] 経由で利用者へ返す。
 ///
 /// スレッド競合は起きない。パーサーコールバックは nvcuvid.h の保証により
 /// `cuvidParseVideoData` 内で呼び出し元と同じスレッドから同期的に呼ばれ、
@@ -906,12 +908,12 @@ fn terminal_decode_error() -> Error {
 ///
 /// 失敗した parse 内で既に `frame_tx` に乗ったフレームを、
 /// 先行 pending と誤ペアリングしないために使う。
-fn discard_queued_frames(state: &mut DecoderState) {
+fn discard_queued_frames(state: &DecoderState) {
     while state.next_frame().is_some() {}
 }
 
 fn drain_frames<H>(
-    state: &mut DecoderState,
+    state: &DecoderState,
     handler: &mut H,
     pending_user_data: &mut VecDeque<H::UserData>,
 ) -> bool

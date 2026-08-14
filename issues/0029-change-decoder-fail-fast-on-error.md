@@ -92,7 +92,7 @@
 - 終端後の `flush()` がハングしない
 - 3 コールバックラッパーが `frame_tx.send(Err(...))` せず、`callback_error: Option<Error>` に最初の 1 件だけ格納する
 - `frame_rx` が Ok のみを流し、`drain_frames` の `Err` 分岐が削除されている
-- 上記契約のテストがある (エラー後に Ok フレームが来ないこと、通知が 1 回であること、後続ジョブにも終端エラーが届くこと、`flush` が戻ること)
+- 上記契約のテストは 0024 実装時に追加する (公開 API で安定誘発できる max 超過経路。本 issue では未着手)
 - `Decoder` / `Decoder::decode` / `DecodeHandler::on_decoded` / `Decoder::flush` の rustdoc が終端契約を説明している
 - `CHANGES.md` に `[CHANGE]` エントリがある
 
@@ -111,7 +111,7 @@
   - `frame_tx` / `frame_rx` を Ok 専用にする
   - `drain_frames` の `Err` 分岐を削除する。missing user data は終端にする
   - rustdoc を更新する
-  - 終端契約のテストを追加する
+  - 終端契約のテストは 0024 実装時に追加する
 - `CHANGES.md` — 追記例:
   - `- [CHANGE] デコードエラー後の Decoder を終端状態にし、以降のデコードを行わないようにする`
   - `  - 同一エラーの二重通知と、drain_frames が Err で pending_user_data を全消しする挙動を解消する`
