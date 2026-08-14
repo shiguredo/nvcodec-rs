@@ -1,7 +1,7 @@
 # 0024-change-decoder-reconfigure-with-max-resolution
 
 - Created: 2026-08-05
-- Branch: feature/change-decoder-reconfigure-with-max-resolution
+- Branch: feature/change-decoder-reconfigure-with-max-coded-size
 - Updated: 2026-08-14
 
 ## 目的
