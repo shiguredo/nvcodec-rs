@@ -22,6 +22,18 @@ impl Error {
         }
     }
 
+    // 動的文字列を含むエラーメッセージで crate 起因のエラーを構築するための関数
+    //
+    // 静的メッセージで足りる場合は new_custom を使うこと
+    pub(crate) fn new_custom_owned(function: &'static str, message: String) -> Self {
+        Self {
+            function,
+            status_code: None,
+            status_name: None,
+            status_message: Some(Cow::Owned(message)),
+        }
+    }
+
     // CUDA 関連のエラーを生成するための関数
     fn new_cuda(code: u32, function: &'static str) -> Self {
         // 可能なら詳細情報を取得する
@@ -236,6 +248,16 @@ mod tests {
         assert_eq!(
             error.to_string(),
             "test_func() failed: custom error message"
+        );
+    }
+
+    #[test]
+    fn test_new_custom_owned_display() {
+        let message = format!("custom error message with {}", "dynamic");
+        let error = Error::new_custom_owned("test_func", message);
+        assert_eq!(
+            error.to_string(),
+            "test_func() failed: custom error message with dynamic"
         );
     }
 

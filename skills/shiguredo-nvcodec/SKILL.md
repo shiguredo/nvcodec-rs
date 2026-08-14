@@ -76,7 +76,7 @@ docs.rs 向けには `DOCS_RS=1 cargo doc --no-deps` でスタブヘッダー経
 | 型 | 説明 | 主要メソッド・フィールド |
 |----|------|------------------------|
 | `Decoder<H: DecodeHandler>` | デコーダー本体。内部で `nvcodec-decoder` ワーカースレッドを起動 | `new(DecoderConfig, H)`, `decode(&[u8], H::UserData)`, `flush()`, `stats()` |
-| `DecoderConfig` | デコーダー設定 | `codec: DecoderCodec`, `device_id`, `max_num_decode_surfaces`, `max_display_delay`, `surface_format: SurfaceFormat` |
+| `DecoderConfig` | デコーダー設定 | `codec: DecoderCodec`, `device_id`, `max_num_decode_surfaces`, `max_display_delay`, `surface_format: SurfaceFormat`, `max_coded_width: Option<u32>`, `max_coded_height: Option<u32>` |
 | `DecoderCodec` | デコーダー対応コーデック | `H264`, `Hevc`, `Av1`, `Vp8`, `Vp9`, `Jpeg` |
 | `SurfaceFormat` | 出力サーフェスフォーマット | `Nv12` のみ (他フォーマット要望時は `DecodedFrame` 拡張が必要) |
 | `DecodedFrame<T>` | デコード済みフレーム (NV12) | `y_plane()`, `uv_plane()`, `y_stride()`, `uv_stride()`, `width()`, `height()`, `user_data()`, `into_parts()` |
@@ -275,6 +275,8 @@ let config = DecoderConfig {
     max_num_decode_surfaces: 20,
     max_display_delay: 0,
     surface_format: SurfaceFormat::Nv12,
+    max_coded_width: None, // 最大解像度を指定すると解像度変更を reconfigure で処理する
+    max_coded_height: None,
 };
 
 let (tx, rx) = mpsc::sync_channel(4);
@@ -393,11 +395,22 @@ encoder.encode(&new_frame, &EncodeOptions {
 
 ### デコーダー
 
-ストリーム中に解像度が変わった場合、内部でパーサーが検出して自動的にデコーダーを再作成する。利用者側の操作は不要。
+ストリーム中に解像度が変わった場合、内部でパーサーが検出して自動的にデコーダーを再構成する。利用者側の操作は不要。
+
+想定される最大解像度を `DecoderConfig` の `max_coded_width` / `max_coded_height` で指定しておくと、解像度変更を `cuvidReconfigureDecoder` による in-place 再構成で処理する (デコーダーの作り直しが発生しないため処理コストが低い)。両方 `None` (デフォルト) の場合は、従来どおり解像度変更ごとにデコーダーを作り直す。
+
+どちらか一方だけを指定するとエラーになるため、両方 `Some` か両方 `None` で指定すること。`max_coded_width` / `max_coded_height` を超える解像度のストリームが来た場合は、デコードエラーになる (指定していない場合は超過しない)。
 
 `DecodedFrame` はフレームごとに `width()` / `height()` を持つので、フレームごとにサイズを確認する。
 
 ```rust
+// 最大解像度を指定して、解像度が変わっても同じデコーダーで継続可能
+let config = DecoderConfig {
+    // ...
+    max_coded_width: Some(1920),
+    max_coded_height: Some(1080),
+    // ...
+};
 decoder.decode(&data_1080p, 0)?;
 let frame = rx.recv()??;
 assert_eq!(frame.width(), 1920);
@@ -411,10 +424,10 @@ assert_eq!(frame.width(), 1280);  // 自動的に追従
 
 | | エンコーダー | デコーダー |
 |---|---|---|
-| 仕組み | `reconfigure()` で明示的に変更 | パーサーが自動検出して再作成 |
-| 利用者の操作 | `ReconfigureParams` で新解像度を指定 | 不要 |
-| 制約 | `max_encode_width` / `max_encode_height` 以内 | なし |
-| 超えた場合 | エンコーダーを作り直す | 自動対応 |
+| 仕組み | `reconfigure()` で明示的に変更 | パーサーが自動検出して再構成 |
+| 利用者の操作 | `ReconfigureParams` で新解像度を指定 | 最大解像度 (`max_coded_width` / `max_coded_height`) を指定するかだけ |
+| 制約 | `max_encode_width` / `max_encode_height` 以内 | `max_coded_width` / `max_coded_height` 以内 (指定した場合) |
+| 超えた場合 | エンコーダーを作り直す | デコードエラーになる (指定した場合) |
 
 ## 統計値の取得
 
