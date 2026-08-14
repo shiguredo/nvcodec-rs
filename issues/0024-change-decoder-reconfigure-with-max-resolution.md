@@ -2,6 +2,7 @@
 
 - Created: 2026-08-05
 - Branch: feature/change-decoder-reconfigure-with-max-resolution
+- Updated: 2026-08-14
 
 ## 目的
 
@@ -81,7 +82,7 @@ Step 1 で `format.display_area` を検証するのは、`state.width` / `state.
 
 ### 失敗時の状態遷移
 
-`handle_video_sequence_inner` が `Err` を返す経路は、いずれも 0029 の終端契約に入る。`handle_video_sequence` は `frame_tx.send(Err(...))` しない。`callback_error` に最初の 1 件だけ格納し、パーサーには失敗 (`0`) を返す。`DecoderState::decode` がその slot を優先して `Err` を返し、`run_worker` が原因 `Err` を 1 回通知して終端する。以降 `DecoderState::decode` は呼ばない。復旧は `Decoder` を作り直す。
+`handle_video_sequence_inner` が `Err` を返す経路は、いずれも実装済みの終端契約に入る。`handle_video_sequence` は `frame_tx.send(Err(...))` しない。`callback_error` に最初の 1 件だけ格納し、パーサーには失敗 (`0`) を返す。`DecoderState::decode` がその slot を優先して `Err` を返し、`DecodeWorker::run` が原因 `Err` を 1 回通知して終端する。以降 `DecoderState::decode` は呼ばない。復旧は `Decoder` を作り直す。
 
 各経路で `state.decoder` がどう残るかは次のとおり。終端後は使わないので、古い解像度での継続や次回コールバックでの再試行はしない。
 
@@ -100,7 +101,7 @@ Step 1 で `format.display_area` を検証するのは、`state.width` / `state.
 ## 完了条件
 
 - `DecoderConfig` に `max_coded_width: Option<u32>` / `max_coded_height: Option<u32>` が追加され、既存の struct literal 初期化コード (`test_decoder_config`、`README.md`、`skills/shiguredo-nvcodec/SKILL.md` のコード例) がすべて明示的に更新されている
-- `Some(v)` を渡し、解像度のみが変化するストリームで、`pfnSequenceCallback` の 2 回目以降で `cuvidReconfigureDecoder` が呼ばれ `cuvidCreateDecoder` は呼ばれない挙動が確認できる
+- `Some(v)` を渡し、解像度のみが変化するストリームで、`pfnSequenceCallback` の 2 回目以降で `cuvidReconfigureDecoder` が呼ばれ `cuvidCreateDecoder` は呼ばれない挙動が確認できる (`Decoder::stats()` の `total_create_decoder_count` が 1 で `total_reconfigure_decoder_count` が 1 以上になることでも確認する)
 - `Some(v)` を渡し、codec / chroma / bit depth / progressive のいずれかが変化した場合に destroy+create パスにフォールバックし、以降 reconfigure 経路に戻れる挙動が確認できる
 - `Some(v)` を渡し、`coded_width` / `coded_height` が `v` を超えたときに原因 `Err` が 1 回通知され、当該 `Decoder` が終端することが確認できる (初回コールバック / 2 回目以降のいずれのケースでも。0029 の終端契約テストは下記メモ)
 - `None` を渡した場合、2026.2.0 と同じ動作 (シーケンス変更ごとに destroy+create) を維持する
@@ -112,7 +113,7 @@ Step 1 で `format.display_area` を検証するのは、`state.width` / `state.
 
 ### 変更対象ファイル
 
-- `src/decode.rs` — `DecoderConfig` フィールド追加、`DecoderState` に判定用ベースライン (コーデック情報) 保存フィールド追加、`DecoderState` に `create_geometry` (`DecoderCreateGeometry`) フィールド追加 (`cuvidCreateDecoder` 成功時に `target_width` / `target_height` / `display_area` を保存し、以降の `cuvidReconfigureDecoder` で参照する)、`handle_video_sequence_inner` の分岐再構成 (`display_area` 検証・max 超過事前検証を先頭に移動、reconfigure / destroy+create の 6 ステップ分岐)、既存の struct literal 初期化コード (`test_decoder_config` 等) の更新
+- `src/decode.rs` — `DecoderConfig` フィールド追加、`DecoderState` に判定用ベースライン (コーデック情報) 保存フィールド追加、`DecoderState` に `create_geometry` (`DecoderCreateGeometry`) フィールド追加 (`cuvidCreateDecoder` 成功時に `target_width` / `target_height` / `display_area` を保存し、以降の `cuvidReconfigureDecoder` で参照する)、`handle_video_sequence_inner` の分岐再構成 (`display_area` 検証・max 超過事前検証を先頭に移動、reconfigure / destroy+create の 6 ステップ分岐)、既存の struct literal 初期化コード (`test_decoder_config` 等) の更新、reconfigure 成功時に `DecoderStats::total_reconfigure_decoder_count` をインクリメント
 - `src/lib.rs` — `CudaLibrary::load` に `cuvidReconfigureDecoder` の存在チェック追加、`cuvid_reconfigure_decoder` ラッパー追加
 - `testdata/resolution-change/{h264.h264, h265.h265, vp8.ivf, vp9.ivf, av1.ivf}` — 320x240 x15 + 256x160 x15 + 320x240 x15 の 3 セグメント構成で新規追加 (HEVC 144x144 / VP9 / AV1 128x128 の hardware 最小デコード解像度を上回るサイズ)
 - `testdata/resolution-change/README.md` — テストデータの構造と解像度選定理由を記載
@@ -131,15 +132,15 @@ Step 1 で `format.display_area` を検証するのは、`state.width` / `state.
 
 ### 派生的な検討事項として切り出した別 issue
 
-本 issue の実装検証で派生的に浮上した検討事項は、意味論を独立議論するために別 issue として起票済み:
+本 issue の実装検証で派生的に浮上した検討事項は、意味論を独立議論するために別 issue として起票済み。以下 3 件のうち、0027 と 0029 は develop にマージ済み (closed) で、0028 のみ pending のまま残っている。
 
-- **0027**: `Decoder` / `Encoder` 統計値 API を追加する — 実装検証時の `#[cfg(test)]` カウンター (`create_decoder_count` / `reconfigure_decoder_count`) を pub 化して統一 API に統合する
-- **0028**: `ulNumDecodeSurfaces` を codec 別推奨値に引き上げる — 参照フレーム数の多い HEVC / VP9 / AV1 で DPB 不足リスクを低減する
-- **0029**: デコードエラー後の `Decoder` を終端状態にする — 二重通知と `drain_frames` scorched-earth を、エラー後継続をやめることで解消する
+- **0027 (closed)**: `Decoder` / `Encoder` 統計値 API を追加する — 実装検証時の `#[cfg(test)]` カウンター (`create_decoder_count` / `reconfigure_decoder_count`) を pub 化して統一 API に統合する。develop マージ済みで `DecoderStats` に `total_reconfigure_decoder_count` / `total_reconfigure_failure_count` が既に存在する。本 issue は `#[cfg(test)]` カウンターを追加せず、この統計値 API で reconfigure 呼び出しを検証し、成功時に `total_reconfigure_decoder_count` をインクリメントする
+- **0028 (pending)**: `ulNumDecodeSurfaces` を codec 別推奨値に引き上げる — 参照フレーム数の多い HEVC / VP9 / AV1 で DPB 不足リスクを低減する。本 issue のスコープ外であり、`ulNumDecodeSurfaces` は `format.min_num_decode_surfaces` のままとする
+- **0029 (closed)**: デコードエラー後の `Decoder` を終端状態にする — 二重通知と `drain_frames` scorched-earth を、エラー後継続をやめることで解消する。develop マージ済みで終端契約は実装済み
 
-### 0029 の終端契約テスト（本 issue 実装時に一緒にやる）
+### 終端契約テスト（本 issue 実装時に一緒にやる）
 
-0029 の完了条件にある終端契約テスト（エラー後に Ok が来ない・原因 Err は 1 回・後続ジョブに終端 Err・終端後 `flush` が戻る）は、公開 API だけで安定してデコードエラーを起こす手段が現状ないため 0029 単体では未着手。
+0029 (closed) の完了条件にある終端契約テスト（エラー後に Ok が来ない・原因 Err は 1 回・後続ジョブに終端 Err・終端後 `flush` が戻る）は、0029 単体の実装時点では公開 API だけで安定してデコードエラーを起こす手段がなかったため未着手となり、本 issue に後回しになっている (0029 の完了条件に明記済み)。
 
 本 issue の `max_coded_width` / `max_coded_height` 超過による事前検証エラーが、公開 API で安定再現できる Err 誘発手段になる。reconfigure / max 超過のテストを書くタイミングで、上記の終端契約テストも同じ経路で追加する。
 
@@ -149,6 +150,6 @@ Step 1 で `format.display_area` を検証するのは、`state.width` / `state.
 - 0017 (pending): destroy-then-create 順序による復旧不能問題。本 issue マージ後の扱い:
   - 「問題 2: `display_area` 検証位置」は本 issue の Step 1 で destroy+create 経路も含めて解消される
   - 「問題 1: 順序」は依然として `max_coded_*` = `None` のフォールバック経路に残るため、0017 は pending を維持する
-- 0027: `Decoder` / `Encoder` 統計値 API 追加 (本 issue の実装検証から派生)
-- 0028: `ulNumDecodeSurfaces` codec 別推奨値化 (本 issue の実装検証から派生)
-- 0029: デコードエラー後の Decoder 終端 (本 issue の実装検証から派生)
+- 0027 (closed): `Decoder` / `Encoder` 統計値 API 追加 (本 issue の実装検証から派生。develop にマージ済みで、本 issue は `total_reconfigure_decoder_count` / `total_reconfigure_failure_count` のインクリメントを追加する)
+- 0028 (pending): `ulNumDecodeSurfaces` codec 別推奨値化 (本 issue の実装検証から派生。本 issue のスコープ外のため pending のまま)
+- 0029 (closed): デコードエラー後の Decoder 終端 (本 issue の実装検証から派生。develop にマージ済みで、終端契約テストのみ本 issue に後回し)
