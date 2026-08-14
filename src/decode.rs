@@ -138,6 +138,7 @@ struct DecoderState {
     surface_format: u32,
     frame_tx: Sender<RawFrame>,
     frame_rx: Receiver<RawFrame>,
+    // 読み書きはワーカースレッドのみ（パーサーコールバックも同スレッド）なので Mutex 不要
     callback_error: Option<Error>,
     stats: Arc<DecoderStats>,
 }
