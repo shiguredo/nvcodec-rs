@@ -390,8 +390,6 @@ pub trait DecodeHandler: Send + 'static {
     /// エラー型
     type Error: From<crate::Error> + Send + 'static;
     /// デコード完了時に呼ばれる
-    ///
-    /// `Err` ならデコーダーは終端する。
     fn on_decoded(&mut self, result: Result<DecodedFrame<Self::UserData>, Self::Error>);
 }
 
@@ -496,13 +494,18 @@ impl<H: DecodeHandler> Decoder<H> {
         Ok(())
     }
 
-    /// 送信済みの未完了フレームがすべて完了するまで待機する
+    /// 送信済みの未完了フレームがすべて出力されるまで待機する
     ///
-    /// 成功時は、 pending のコールバックがすべて呼ばれたあと戻る。その後も decode を継続できる。
+    /// デコーダーが終端状態でない場合、送信済みの未完了フレームがすべて出力され、
+    /// そのコールバックがすべて呼び出されたあとで戻る。
+    /// このメソッド呼び出し後もデコードは継続できる。
     ///
-    /// 終端後 (この flush 中の失敗で終端した場合を含む) は、 pending のコールバックを
-    /// 待たずに `Ok` で戻る。ハングはしない。 decode は再開できない。
-    /// 終端の原因は [`DecodeHandler::on_decoded`] の `Err` で通知済みである。
+    /// デコーダーが終端状態の場合 (このメソッドの呼び出し中に終端状態に遷移した場合を含む) は、
+    /// 未完了フレームの出力を待たずに戻る。
+    ///
+    /// このメソッドの呼び出し中に終端状態に遷移した場合は、
+    /// その原因 `Err` が [`DecodeHandler::on_decoded`] に渡されたあとで、
+    /// 呼び出し元に処理が戻る。
     pub fn flush(&self) -> Result<(), Error> {
         let (tx, rx) = mpsc::sync_channel(0);
         self.job_tx
