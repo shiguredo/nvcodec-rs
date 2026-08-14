@@ -21,7 +21,7 @@
 - [CHANGE] DecoderConfig に max_coded_width / max_coded_height を追加してデコーダーの動的解像度変更を cuvidReconfigureDecoder で行えるようにする
   - 最大解像度を指定すると、ストリーム中の解像度変化をデコーダーの作り直しなしで in-place に再構成する
   - 指定しない場合は従来どおり解像度変更ごとにデコーダーを作り直す
-  - @担当者
+  - @sile
 - [ADD] Decoder::stats() / Encoder::stats() で内部状態 (counter / gauge) を取得できるようにする
   - @sile
 
