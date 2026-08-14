@@ -843,7 +843,8 @@ where
                     // キュー済みジョブのコールバックが消える)。終端後もジョブを受けて応答する。
                     //
                     // 失敗 parse 由来の Ok と先行 pending を混ぜないよう channel を空にする。
-                    // 未完了 pending はコールバックせず捨てる。利用側は最初の Err で Decoder を捨てる。
+                    // 未完了 pending はコールバックせず捨てる。
+                    // 利用側は最初の Err で Decoder を捨てることを推奨。
                     // このジョブの user_data は pending に積んでいないためここで破棄される。
                     terminated = true;
                     discard_queued_frames(&state);
