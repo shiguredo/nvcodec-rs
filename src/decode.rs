@@ -820,8 +820,6 @@ impl<T> DecodedFrame<T> {
 }
 
 /// デコードワーカーのループ状態と処理をまとめる構造体
-///
-/// [`DecodeWorker::run`] がエントリポイントで、この構造体を構築しジョブを各メソッドへ dispatch する。
 struct DecodeWorker<H: DecodeHandler> {
     state: Box<DecoderState>,
     handler: H,
@@ -837,7 +835,7 @@ impl<H: DecodeHandler> DecodeWorker<H> {
     /// 失敗した parse 由来の Ok と先行 pending を誤ペアリングしないための処理でもある。
     fn enter_terminated(&mut self) {
         self.terminated = true;
-        discard_queued_frames(&self.state);
+        self.discard_queued_frames();
         self.pending_user_data.clear();
     }
 
@@ -862,7 +860,7 @@ impl<H: DecodeHandler> DecodeWorker<H> {
         }
 
         self.pending_user_data.push_back(user_data);
-        if !drain_frames(&self.state, &mut self.handler, &mut self.pending_user_data) {
+        if !self.drain_frames() {
             // missing user data（不変条件違反）で終端に入る。
             // 原因 Err は drain_frames 内で通知済み。残りはコールバックせず捨てる。
             self.enter_terminated();
@@ -875,7 +873,7 @@ impl<H: DecodeHandler> DecodeWorker<H> {
             // および synchronize 失敗など）で終端する。Decode 経路と対称。
             match self.state.send_eos() {
                 Ok(()) => {
-                    if !drain_frames(&self.state, &mut self.handler, &mut self.pending_user_data) {
+                    if !self.drain_frames() {
                         // missing user data（不変条件違反）で終端に入る
                         self.enter_terminated();
                     }
@@ -896,7 +894,7 @@ impl<H: DecodeHandler> DecodeWorker<H> {
     fn finish(&mut self) {
         if !self.terminated {
             let _ = self.state.send_eos();
-            drain_frames(&self.state, &mut self.handler, &mut self.pending_user_data);
+            self.drain_frames();
         }
     }
 
@@ -925,6 +923,52 @@ impl<H: DecodeHandler> DecodeWorker<H> {
             }
         }
     }
+
+    /// キューに残った Ok フレームをすべて破棄する
+    ///
+    /// 失敗した parse 内で既に `frame_tx` に乗ったフレームを、
+    /// 先行 pending と誤ペアリングしないために使う。
+    fn discard_queued_frames(&self) {
+        while self.state.next_frame().is_some() {}
+    }
+
+    /// 出力可能なフレームをすべて取り出してコールバックする
+    ///
+    /// `false` を返すのは、デコード結果に対応するユーザーデータが存在しない
+    /// (missing user data) 場合で、通常あり得ない不変条件違反を意味する。
+    /// そのときは継続せず終端にするため、呼び出し側で終端遷移を行う。
+    fn drain_frames(&mut self) -> bool {
+        loop {
+            match self.state.next_frame() {
+                None => {
+                    // 結果が存在しなくなったなら終了
+                    break;
+                }
+                Some(raw) => {
+                    if let Some(user_data) = self.pending_user_data.pop_front() {
+                        self.handler.on_decoded(Ok(DecodedFrame {
+                            width: raw.width,
+                            height: raw.height,
+                            pitch: raw.pitch,
+                            data: raw.data,
+                            user_data,
+                        }));
+                    } else {
+                        // デコード結果が存在するのに対応するユーザーデータが存在しない。
+                        // 通常あり得ない不変条件違反なので、継続せず終端にする。
+                        self.handler.on_decoded(Err(Error::new_custom(
+                            "drain_frames",
+                            "missing user data",
+                        )
+                        .into()));
+                        return false;
+                    }
+                }
+            }
+        }
+
+        true
+    }
 }
 
 /// コールバックの失敗を `callback_error` に格納する。
@@ -945,52 +989,6 @@ fn store_callback_error(state: &mut DecoderState, e: Error) {
 /// 終端後のジョブに返すエラー
 fn terminal_decode_error() -> Error {
     Error::new_custom("decode", "decoder has already failed")
-}
-
-/// キューに残った Ok フレームをすべて破棄する
-///
-/// 失敗した parse 内で既に `frame_tx` に乗ったフレームを、
-/// 先行 pending と誤ペアリングしないために使う。
-fn discard_queued_frames(state: &DecoderState) {
-    while state.next_frame().is_some() {}
-}
-
-fn drain_frames<H>(
-    state: &DecoderState,
-    handler: &mut H,
-    pending_user_data: &mut VecDeque<H::UserData>,
-) -> bool
-where
-    H: DecodeHandler,
-{
-    loop {
-        match state.next_frame() {
-            None => {
-                // 結果が存在しなくなったなら終了
-                break;
-            }
-            Some(raw) => {
-                if let Some(user_data) = pending_user_data.pop_front() {
-                    handler.on_decoded(Ok(DecodedFrame {
-                        width: raw.width,
-                        height: raw.height,
-                        pitch: raw.pitch,
-                        data: raw.data,
-                        user_data,
-                    }));
-                } else {
-                    // デコード結果が存在するのに対応するユーザーデータが存在しない。
-                    // 通常あり得ない不変条件違反なので、継続せず終端にする。
-                    handler.on_decoded(Err(
-                        Error::new_custom("drain_frames", "missing user data").into()
-                    ));
-                    return false;
-                }
-            }
-        }
-    }
-
-    true
 }
 
 #[cfg(test)]
