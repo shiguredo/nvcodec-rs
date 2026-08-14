@@ -301,18 +301,16 @@ impl DecoderState {
             packet.timestamp = 0;
 
             let parse_result = self.lib.cuvid_parse_video_data(self.parser, &mut packet);
-
             // コールバックが slot に格納した具体的エラーがあれば、
             // cuvidParseVideoData が返す汎用 CUDA エラーより優先して通知する。
             // コールバックは slot 格納後も失敗 (0) を返し続けるため、通常は両方失敗する。
-            if let Some(e) = self.callback_error.take() {
-                return Err(e);
-            }
-
-            parse_result
+            self.prefer_callback_error(parse_result)
         }
     }
 
+    /// EOS を送り、残っているデコード処理の完了を待つ
+    ///
+    /// コールバック失敗時は `callback_error` を優先して返す（[`DecoderState::decode`] と同じ）。
     pub fn send_eos(&mut self) -> Result<(), Error> {
         unsafe {
             // EOS をデコーダーに伝える
@@ -322,7 +320,8 @@ impl DecoderState {
             packet.flags = sys::CUvideopacketflags_CUVID_PKT_ENDOFSTREAM as u64;
             packet.timestamp = 0;
 
-            self.lib.cuvid_parse_video_data(self.parser, &mut packet)?;
+            let parse_result = self.lib.cuvid_parse_video_data(self.parser, &mut packet);
+            self.prefer_callback_error(parse_result)?;
 
             // パーサーは非同期でデータを処理するので、
             // すべてのデコード操作が完了するまでここで待機（同期）する
@@ -330,6 +329,15 @@ impl DecoderState {
                 .with_context(self.ctx, || self.lib.cu_ctx_synchronize())?;
         }
         Ok(())
+    }
+
+    /// `callback_error` があればそれを、なければ `result` を返す
+    fn prefer_callback_error<T>(&mut self, result: Result<T, Error>) -> Result<T, Error> {
+        if let Some(e) = self.callback_error.take() {
+            Err(e)
+        } else {
+            result
+        }
     }
 
     /// デコード済みのフレームを取り出す (Ok のみ。エラーは [`DecoderState::callback_error`] で扱う)
@@ -821,21 +829,25 @@ where
 
                 pending_user_data.push_back(user_data);
                 if !drain_frames(&mut state, &mut handler, &mut pending_user_data) {
-                    // missing user data (不変条件違反) で終端に入る
+                    // missing user data（不変条件違反）で終端に入る
                     terminated = true;
                 }
             }
             Ok(Job::Flush { done }) => {
                 if !terminated {
-                    let _ = state.send_eos();
-                    // send_eos 中のコールバック失敗も slot に格納されるため、
-                    // ここで拾って終端する (二重通知・scorched-earth を防ぐ)
-                    if let Some(e) = state.callback_error.take() {
-                        terminated = true;
-                        handler.on_decoded(Err(e.into()));
-                    } else if !drain_frames(&mut state, &mut handler, &mut pending_user_data) {
-                        // missing user data (不変条件違反) で終端に入る
-                        terminated = true;
+                    // send_eos の任意の Err（callback_error 優先の具体エラー、
+                    // および synchronize 失敗など）で終端する。Decode 経路と対称。
+                    match state.send_eos() {
+                        Ok(()) => {
+                            if !drain_frames(&mut state, &mut handler, &mut pending_user_data) {
+                                // missing user data（不変条件違反）で終端に入る
+                                terminated = true;
+                            }
+                        }
+                        Err(e) => {
+                            terminated = true;
+                            handler.on_decoded(Err(e.into()));
+                        }
                     }
                 }
                 let _ = done.send(());
