@@ -288,7 +288,7 @@ impl DecoderState {
     ///
     /// 内部でコールバックが失敗した場合、その具体的エラーが返る。
     /// エラー後のデコーダー停止 (終端状態への遷移) は呼び出し側 (`DecodeWorker::run`) の責務である。
-    pub fn decode(&mut self, data: &[u8]) -> Result<(), Error> {
+    fn decode(&mut self, data: &[u8]) -> Result<(), Error> {
         // [NOTE]
         // cuvidParseVideoData は内部でデータをコピーまたは即座に処理するため、
         // このメソッドの呼び出し直後に data を破棄しても安全
@@ -312,7 +312,7 @@ impl DecoderState {
     /// EOS を送り、残っているデコード処理の完了を待つ
     ///
     /// コールバック失敗時は `callback_error` を優先して返す（[`DecoderState::decode`] と同じ）。
-    pub fn send_eos(&mut self) -> Result<(), Error> {
+    fn send_eos(&mut self) -> Result<(), Error> {
         unsafe {
             // EOS をデコーダーに伝える
             let mut packet: sys::CUVIDSOURCEDATAPACKET = std::mem::zeroed();
