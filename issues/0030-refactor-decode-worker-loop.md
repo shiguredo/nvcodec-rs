@@ -1,7 +1,7 @@
 # 0030-refactor-decode-worker-loop
 
 - Created: 2026-08-14
-- Completed: {YYYY-MM-DD} (例: 2024-07-01)
+- Completed: 2026-08-14
 - Branch: feature/refactor-decode-worker-loop
 - Polished: {YYYY-MM-DD} (例: 2024-07-15)
 - Reporter: @sile
@@ -59,4 +59,14 @@ pending_user_data.clear();
 
 ## 解決方法
 
-`src/decode.rs` の `run_worker` を `DecodeWorker<H>` 構造体に移行する。`enter_terminated` / `handle_decode` / `handle_flush` / `handle_terminate` を実装し、`run_worker` は dispatch のみに簡素化する。
+`src/decode.rs` の `run_worker` を `DecodeWorker<H>` 構造体に移行した。
+
+- `state` / `handler` / `pending_user_data` / `terminated` を `DecodeWorker<H>` のフィールドとしてまとめた
+- 終端遷移を `enter_terminated` メソッド 1 箇所に集約した (従来 4 箇所の重複)
+- ジョブ種別ごとの処理を `handle_decode` / `handle_flush` / `finish` メソッドに分離した
+- `run_worker` free 関数を廃止し、エントリポイントは `DecodeWorker::run` 関連関数にした。`run` はジョブを各メソッドへ dispatch するだけになった
+- `drain_frames` / `discard_queued_frames` を free 関数から `DecodeWorker` のメソッドに移し、3 引数の引き回しを解消した
+- `DecoderState` の不要な `pub` (`decode` / `send_eos`) を外した
+- チャネル破棄 (`Err(_)`) 時も `finish` で後始末して return する
+
+動作は従来と同等。ビルド・clippy・fmt が通る。テストは CUDA 依存のため CI で確認する。
