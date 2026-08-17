@@ -347,8 +347,11 @@ impl DecoderState {
 
     /// シーケンスコールバック処理 (pfnSequenceCallback から呼ばれる)
     ///
-    /// デコーダーの生成 / 破棄 / 再作成をまとめて行う。
-    /// 戻り値は parser に渡す成功値 (1) / 失敗値 (0) の元になる整数。
+    /// 既存デコーダーがあれば破棄し、現在のシーケンスのフォーマットで再作成する。
+    /// また、表示領域の検証と width / height / surface サイズの更新を行う。
+    /// 成功時はデコードサーフェス数を返し、失敗時は `Err` を返す。
+    /// 戻り値のデコードサーフェス数は extern "C" ラッパー経由で parser へ渡され、
+    /// parser はこの値で `CUVIDPICPARAMS.CurrPicIdx` を割り当てる。
     fn handle_video_sequence(&mut self, format: &sys::CUVIDEOFORMAT) -> Result<i32, Error> {
         self.stats.total_sequence_callback_count.inc();
         // デコーダーが既に作成されている場合は破棄して再作成する
@@ -370,7 +373,7 @@ impl DecoderState {
         } else {
             sys::cudaVideoDeinterlaceMode_enum_cudaVideoDeinterlaceMode_Adaptive
         };
-        create_info.ulNumOutputSurfaces = 2; // 出力サーフェスの数（ダブルバッファリング用に2を指定）
+        create_info.ulNumOutputSurfaces = 2; // 出力サーフェスの数（ダブルバッファリング用に 2 を指定）
         create_info.ulCreationFlags =
             sys::cudaVideoCreateFlags_enum_cudaVideoCreate_PreferCUVID as u64; // CUVID ハードウェアデコーダーの使用を優先するフラグ
         create_info.ulNumDecodeSurfaces = format.min_num_decode_surfaces as u64;
@@ -415,6 +418,8 @@ impl DecoderState {
     }
 
     /// ピクチャデコードコールバック処理 (pfnDecodePicture から呼ばれる)
+    ///
+    /// 指定されたピクチャを `cuvidDecodePicture` でデコードする。
     fn handle_picture_decode(&mut self, pic_params: &sys::CUVIDPICPARAMS) -> Result<(), Error> {
         self.stats.total_decode_callback_count.inc();
         if self.decoder.is_null() {
@@ -433,6 +438,9 @@ impl DecoderState {
     }
 
     /// ピクチャ表示コールバック処理 (pfnDisplayPicture から呼ばれる)
+    ///
+    /// デコード済みフレームを mapped output surface からホストメモリへコピーし、
+    /// `frame_tx` チャンネル経由で出力フレームとして送信する。
     fn handle_picture_display(&self, disp_info: &sys::CUVIDPARSERDISPINFO) -> Result<(), Error> {
         if self.decoder.is_null() {
             return Err(Error::new_custom(
