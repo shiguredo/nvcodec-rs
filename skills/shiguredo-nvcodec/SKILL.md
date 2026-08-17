@@ -89,6 +89,8 @@ docs.rs 向けには `DOCS_RS=1 cargo doc --no-deps` でスタブヘッダー経
 
 実際に parser と decoder の両方へ適用する実効サーフェス数は、`min_num_decode_surfaces` と `max_num_decode_surfaces` から次の規則で決定する。実効サーフェス数は常に `max_num_decode_surfaces` 以下になる。
 
+- `min_num_decode_surfaces == 0` は NVDEC からの不正な値としてエラーにする
+- `min_num_decode_surfaces > max_num_decode_surfaces` は上限不足としてエラーにする
 - `min_num_decode_surfaces >= 2` なら、その値を実効サーフェス数として使う
 - `min_num_decode_surfaces == 1` かつ `max_num_decode_surfaces >= 2` なら、実効サーフェス数として 2 を使う
   - sequence callback の戻り値が 1 では parser の DPB 数を更新できないため、2 を使って parser と decoder のサーフェス数を一致させる
