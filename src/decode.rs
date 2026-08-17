@@ -117,14 +117,10 @@ pub struct DecoderConfig {
 
     /// デコードサーフェス数の上限
     ///
-    /// `0` は指定できない。`Decoder::new` が設定エラーとして拒否する。
-    ///
-    /// parser が報告する `CUVIDEOFORMAT.min_num_decode_surfaces` (正しいデコードに必要な
-    /// 最小サーフェス数) がこの上限を超える場合は、`decode()` 中の sequence callback で
-    /// 既存 decoder を破棄する前にエラーを返す。
-    ///
-    /// `min_num_decode_surfaces == 1` かつ `max_num_decode_surfaces >= 2` の場合は、
-    /// parser の DPB 数を更新できる最小値として実効サーフェス数に 2 を使う。
+    /// `0` は指定できず、`Decoder::new` が設定エラーとして拒否する。
+    /// parser が正しいデコードに必要な最小サーフェス数
+    /// (`CUVIDEOFORMAT.min_num_decode_surfaces`) がこの上限を超える場合は、
+    /// `decode()` 中の sequence callback で既存 decoder を破棄する前にエラーを返す。
     /// 実際に割り当てられるサーフェス数は常にこの上限以下になる。
     pub max_num_decode_surfaces: u32,
 
@@ -286,7 +282,7 @@ impl DecoderState {
             // 映像パーサーを作成する
             let mut parser_params: sys::CUVIDPARSERPARAMS = std::mem::zeroed();
             parser_params.CodecType = codec_type;
-            // NVIDIA Video Decoder API Programming Guide 13.0「4.1.1. Creating a parser」に従い、
+            // NVDEC Video Decoder API Programming Guide 13.0「4.1.1. Creating a parser」に従い、
             // sequence header を解析する前の仮値として 1 を設定する。
             // 実際のサーフェス数は sequence callback の戻り値 (実効サーフェス数) で
             // parser の DPB 数を上書きして決定する。
@@ -322,6 +318,11 @@ impl DecoderState {
     /// `third_party/nvcodec/include/nvcuvid.h` の `CUVIDEOFORMAT` と
     /// `PFNVIDSEQUENCECALLBACK` が根拠である。
     ///
+    /// 戻り値は呼び出し側で `sequence callback` の戻り値や `ulNumDecodeSurfaces` に
+    /// 使われる。戻り値は常に u8 の上限 (255) 以下になるため、`as i32` への
+    /// キャストは安全である (実効サーフェス数は `min` か 2 か 1 のいずれかで、
+    /// `min` は `CUVIDEOFORMAT.min_num_decode_surfaces` 由来のため 255 を超えない)。
+    ///
     /// - `PFNVIDSEQUENCECALLBACK` の戻り値が 1 の場合は parser の DPB 数を更新しないため、
     ///   戻り値で parser の DPB 数を上書きするには 2 以上を返す必要がある
     /// - そのため、`min == 1` でも `max >= 2` なら 2 を使って parser の DPB 数を確定させる
@@ -338,8 +339,7 @@ impl DecoderState {
                 format!("min_num_decode_surfaces ({min}) exceeds max_num_decode_surfaces ({max})"),
             ));
         }
-        // 以下で parser と decoder の両方に適用する実効サーフェス数を決定する。
-        // PFNVIDSEQUENCECALLBACK の戻り値が 2 以上の場合のみ parser の DPB 数を更新できる。
+        // PFNVIDSEQUENCECALLBACK の戻り値が 2 以上の場合のみ parser の DPB 数を更新できる
         if min >= 2 {
             // 最小値が 2 以上なら、そのまま使えば parser の DPB 数も同じ値に更新される
             Ok(min)
