@@ -427,6 +427,24 @@ impl DecoderState {
             format.min_num_decode_surfaces as u32,
             self.max_num_decode_surfaces,
         )?;
+        // display_area は signed 整数のため、壊れたストリームで負値になる可能性がある
+        // 既存デコーダーを破棄する前に検証し、不正な場合は fail-fast で終端させる
+        let left = format.display_area.left;
+        let right = format.display_area.right;
+        let top = format.display_area.top;
+        let bottom = format.display_area.bottom;
+        if left < 0
+            || top < 0
+            || right <= left
+            || bottom <= top
+            || right as u32 > format.coded_width
+            || bottom as u32 > format.coded_height
+        {
+            return Err(Error::new_custom(
+                "handle_video_sequence",
+                "invalid display_area in video format",
+            ));
+        }
         // デコーダーが既に作成されている場合は破棄して再作成する
         // ストリーム中の解像度変更に対応するため
         if !self.decoder.is_null() {
@@ -465,23 +483,6 @@ impl DecoderState {
                 .cuvid_create_decoder(&mut self.decoder, &mut create_info)
         })?;
         self.stats.total_create_decoder_count.inc();
-        // display_area は signed 整数のため、壊れたストリームで負値になる可能性がある
-        let left = format.display_area.left;
-        let right = format.display_area.right;
-        let top = format.display_area.top;
-        let bottom = format.display_area.bottom;
-        if left < 0
-            || top < 0
-            || right <= left
-            || bottom <= top
-            || right as u32 > format.coded_width
-            || bottom as u32 > format.coded_height
-        {
-            return Err(Error::new_custom(
-                "handle_video_sequence",
-                "invalid display_area in video format",
-            ));
-        }
         self.width = (right - left) as u32;
         self.height = (bottom - top) as u32;
         self.surface_width = format.coded_width;
