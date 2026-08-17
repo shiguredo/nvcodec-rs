@@ -85,9 +85,9 @@ docs.rs 向けには `DOCS_RS=1 cargo doc --no-deps` でスタブヘッダー経
 
 #### デコードサーフェス数の決定
 
-`DecoderConfig.max_num_decode_surfaces` はデコードサーフェス数の上限を指定する。NVDEC が正しいデコードに必要な最小サーフェス数 (`CUVIDEOFORMAT.min_num_decode_surfaces`) がこの上限を超える場合は、デコードを開始せずエラーを返す。`max_num_decode_surfaces` に 0 は指定できない。
+`DecoderConfig.max_num_decode_surfaces` はデコードサーフェス数の上限を指定する。`0` は指定できず、`Decoder::new` が設定エラーとして拒否する。NVDEC が正しいデコードに必要な最小サーフェス数 (`CUVIDEOFORMAT.min_num_decode_surfaces`) がこの上限を超える場合は、`decode()` 中の sequence callback で既存 decoder を破棄する前にエラーを返す。
 
-実際に parser と decoder の両方へ適用する実効サーフェス数は、`min_num_decode_surfaces` と `max_num_decode_surfaces` から次の規則で決定する。
+実際に parser と decoder の両方へ適用する実効サーフェス数は、`min_num_decode_surfaces` と `max_num_decode_surfaces` から次の規則で決定する。実効サーフェス数は常に `max_num_decode_surfaces` 以下になる。
 
 - `min_num_decode_surfaces >= 2` なら、その値を実効サーフェス数として使う
 - `min_num_decode_surfaces == 1` かつ `max_num_decode_surfaces >= 2` なら、実効サーフェス数として 2 を使う

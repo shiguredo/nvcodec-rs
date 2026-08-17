@@ -21,6 +21,8 @@
 - [ADD] Decoder::stats() / Encoder::stats() で内部状態 (counter / gauge) を取得できるようにする
   - @sile
 - [FIX] Decoder の parser DPB と内部 decode surface の数が一致しない場合がある問題を修正する
+  - `DecoderConfig.max_num_decode_surfaces` に 0 を指定すると `Decoder::new` が設定エラーとして拒否するようになった (従来は受け付けていた)
+  - `min_num_decode_surfaces` が上限を超える場合は、`decode()` 中の sequence callback で既存 decoder を破棄する前にエラーが返るようになった
   - @sile
 
 ### misc

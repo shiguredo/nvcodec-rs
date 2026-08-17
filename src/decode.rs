@@ -117,9 +117,15 @@ pub struct DecoderConfig {
 
     /// デコードサーフェス数の上限
     ///
+    /// `0` は指定できない。`Decoder::new` が設定エラーとして拒否する。
+    ///
     /// parser が報告する `CUVIDEOFORMAT.min_num_decode_surfaces` (正しいデコードに必要な
-    /// 最小サーフェス数) がこの上限を超える場合は、デコードを開始せずエラーを返す。
-    /// 0 は指定できない。
+    /// 最小サーフェス数) がこの上限を超える場合は、`decode()` 中の sequence callback で
+    /// 既存 decoder を破棄する前にエラーを返す。
+    ///
+    /// `min_num_decode_surfaces == 1` かつ `max_num_decode_surfaces >= 2` の場合は、
+    /// parser の DPB 数を更新できる最小値として実効サーフェス数に 2 を使う。
+    /// 実際に割り当てられるサーフェス数は常にこの上限以下になる。
     pub max_num_decode_surfaces: u32,
 
     /// 表示遅延 (0 = 低遅延)
@@ -1082,34 +1088,55 @@ mod tests {
     fn determine_num_decode_surfaces_boundaries() {
         // 最小値も上限も 1 の場合は 1 を使う
         assert_eq!(
-            DecoderState::determine_num_decode_surfaces(1, 1).unwrap(),
+            DecoderState::determine_num_decode_surfaces(1, 1).expect("1 and 1 must be valid"),
             1
         );
         // 最小値が 1 で上限が 2 以上の場合は、parser の DPB 数を更新できる最小値 2 を使う
         assert_eq!(
-            DecoderState::determine_num_decode_surfaces(1, 2).unwrap(),
+            DecoderState::determine_num_decode_surfaces(1, 2).expect("1 and 2 must be valid"),
             2
         );
         assert_eq!(
-            DecoderState::determine_num_decode_surfaces(1, 20).unwrap(),
+            DecoderState::determine_num_decode_surfaces(1, 20).expect("1 and 20 must be valid"),
             2
         );
         // 最小値が 2 以上の場合はその値を使う
         assert_eq!(
-            DecoderState::determine_num_decode_surfaces(2, 2).unwrap(),
+            DecoderState::determine_num_decode_surfaces(2, 2).expect("2 and 2 must be valid"),
             2
         );
         assert_eq!(
-            DecoderState::determine_num_decode_surfaces(8, 20).unwrap(),
+            DecoderState::determine_num_decode_surfaces(8, 20).expect("8 and 20 must be valid"),
             8
         );
-        // 最小値が上限を超える場合はエラーにする
+        // 最小値が上限を超える場合はエラーにする (max == 0 の場合も min > max で弾かれる)
         assert!(DecoderState::determine_num_decode_surfaces(9, 8).is_err());
+        assert!(DecoderState::determine_num_decode_surfaces(1, 0).is_err());
         // 最小値が 0 の場合は NVDEC からの不正な値としてエラーにする
         assert!(DecoderState::determine_num_decode_surfaces(0, 20).is_err());
-        // 上限が 0 の場合は設定エラーとしてエラーにする
-        assert!(DecoderState::determine_num_decode_surfaces(1, 0).is_err());
         assert!(DecoderState::determine_num_decode_surfaces(0, 0).is_err());
+    }
+
+    /// `max_num_decode_surfaces == 0` を `Decoder::new` が設定エラーとして拒否することを検証する
+    ///
+    /// 検証は CUDA ライブラリのロードより前に行われるため、GPU 不要で確認できる。
+    #[test]
+    fn decoder_rejects_zero_max_num_decode_surfaces() {
+        let (tx, _rx) = mpsc::sync_channel::<Result<DecodedFrame<()>, Error>>(4);
+        let mut config = test_decoder_config(DecoderCodec::H264);
+        config.max_num_decode_surfaces = 0;
+        let error = Decoder::new(
+            config,
+            FnDecodeHandler::new(move |frame| {
+                let _ = tx.send(frame);
+            }),
+        )
+        .expect_err("max_num_decode_surfaces == 0 must be rejected");
+        assert!(
+            error
+                .to_string()
+                .contains("max_num_decode_surfaces must be greater than 0")
+        );
     }
 
     /// デコードされた黒フレームの検証を行う

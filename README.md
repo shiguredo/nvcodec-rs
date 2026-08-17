@@ -158,7 +158,7 @@ for frame in rx.try_iter() {
 }
 ```
 
-`DecoderConfig.max_num_decode_surfaces` は、デコードサーフェス数の上限を指定する。NVDEC が正しいデコードに必要な最小サーフェス数 (`CUVIDEOFORMAT.min_num_decode_surfaces`) がこの上限を超える場合は、デコードを開始せずエラーが返る。`max_num_decode_surfaces` に 0 は指定できない。
+`DecoderConfig.max_num_decode_surfaces` は、デコードサーフェス数の上限を指定する。`0` は指定できず、`Decoder::new` が設定エラーとして拒否する。NVDEC が正しいデコードに必要な最小サーフェス数 (`CUVIDEOFORMAT.min_num_decode_surfaces`) がこの上限を超える場合は、`decode()` 中の sequence callback で既存 decoder を破棄する前にエラーが返る。なお、最小サーフェス数が 1 で上限が 2 以上の場合、parser の DPB 数を更新できる最小値として実効サーフェス数に 2 を使う。実際に割り当てられるサーフェス数は常にこの上限以下になる。
 
 ### エンコーダーケーパビリティクエリ
 
