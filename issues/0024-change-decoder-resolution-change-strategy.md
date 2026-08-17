@@ -163,7 +163,7 @@ reconfigure 経路の出力が正しく、再作成を減らす効果を実測�
 ## 実装で判明した事項
 
 - `query_decoder_caps` で得られる codec ごとの hardware 最小デコード解像度を下回るテストデータでは、sequence callback、decoder 作成、reconfigure が成功しても、`cuvidDecodePicture` が `CUDA_ERROR_INVALID_VALUE` を返す。テストデータは全対象 codec の最小値を上回る 256x160 以上を使用する
-- `ulNumDecodeSurfaces` の codec 別推奨値への引き上げは 0028 で扱う。本 issue では `format.min_num_decode_surfaces` を使用する
+- parser の DPB 数と decoder の decode surface 数の同期は 0028 で先に修正する。本 issue の create / reconfigure 経路は、0028 で確定した実効 surface 数を使用する
 - max coded サイズ超過を終端エラーにしなくなるため、0029 から後回しになっていた終端契約テストの安定したエラー誘発手段としては使用できない。終端契約テストは本 issue のスコープに含めない
 
 ## 関連 issue
@@ -171,5 +171,5 @@ reconfigure 経路の出力が正しく、再作成を減らす効果を実測�
 - 0006 (closed): 解像度変更ごとに decoder を再作成する現在の方式を導入した。本 issue は再作成経路をフォールバックとして残す
 - 0017 (pending): destroy-then-create 順序による復旧不能問題。「display_area 検証位置」は本 issue で解消するが、再作成経路自体は残るため、destroy-then-create 順序の問題は残る
 - 0027 (closed): `DecoderStats` を追加した。本 issue は既存の create / reconfigure / failure カウンターで各経路を検証する
-- 0028 (pending): `ulNumDecodeSurfaces` の codec 別推奨値化。本 issue では扱わない
+- 0028 (open): parser の DPB 数と decoder の decode surface 数を同期する。本 issue の reconfigure 経路は、その決定処理を利用する
 - 0029 (closed): デコードエラー後の `Decoder` を終端状態にした。本 issue の再作成フォールバックまで失敗した場合は、この終端契約に従う
