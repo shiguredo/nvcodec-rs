@@ -21,6 +21,11 @@
 - [ADD] Decoder::stats() / Encoder::stats() で内部状態 (counter / gauge) を取得できるようにする
   - @sile
 - [FIX] Decoder の parser DPB と内部 decode surface の数が一致しない場合がある問題を修正する
+  - decode surface はデコード済みフレームを一時的に格納する GPU 上のバッファで、参照フレームを保持するために複数必要。その数のことをデコードサーフェス数と呼ぶ
+  - parser DPB は parser がデコード結果をどのサーフェスへ書き込むかを決めるためのサーフェスの循環リスト
+  - `min_num_decode_surfaces == 1` のとき parser の DPB 数が更新されず、parser と decoder のサーフェス数が一致しないことがあった
+  - 例えば JPEG は `min_num_decode_surfaces == 1` になり得るため、parser の DPB 数が 1 面以上に保たれたまま decoder が 1 面しか確保しないと、parser が存在しないサーフェスを指す picture index を通知し、`cuvidDecodePicture` が `CUDA_ERROR_INVALID_VALUE` で失敗する可能性があった
+  - 両者を同じ実効サーフェス数 (sequence callback の戻り値) で同期するようにした
   - `DecoderConfig.max_num_decode_surfaces` に 0 を指定すると `Decoder::new` が設定エラーとして拒否するようになった (従来は受け付けていた)
   - `min_num_decode_surfaces` が上限を超える場合は、`decode()` 中の sequence callback で既存 decoder を破棄する前にエラーが返るようになった
   - @sile
