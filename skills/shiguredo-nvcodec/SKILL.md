@@ -83,6 +83,21 @@ docs.rs 向けには `DOCS_RS=1 cargo doc --no-deps` でスタブヘッダー経
 | `DecoderCaps` | デコーダケーパビリティ | `is_supported`, `max_width`, `max_height`, `max_mb_count`, `min_width`, `min_height` |
 | `DecoderStats` | デコーダ統計値 (全フィールド `Counter`) | counter: `total_create_decoder_count`, `total_reconfigure_decoder_count`, `total_reconfigure_failure_count`, `total_decode_count`, `total_sequence_callback_count`, `total_decode_callback_count`, `total_output_frame_count` |
 
+#### デコードサーフェス数の決定
+
+`DecoderConfig.max_num_decode_surfaces` はデコードサーフェス数の上限を指定する。`0` は指定できず、`Decoder::new` が設定エラーとして拒否する。NVDEC が正しいデコードに必要な最小サーフェス数 (`CUVIDEOFORMAT.min_num_decode_surfaces`) がこの上限を超える場合は、`decode()` 中の sequence callback で既存 decoder を破棄する前にエラーを返す。
+
+実際に parser と decoder の両方へ適用する実効サーフェス数は、`min_num_decode_surfaces` と `max_num_decode_surfaces` から次の規則で決定する。実効サーフェス数は常に `max_num_decode_surfaces` 以下になる。
+
+- `min_num_decode_surfaces == 0` は NVDEC からの不正な値としてエラーにする
+- `min_num_decode_surfaces > max_num_decode_surfaces` は上限不足としてエラーにする
+- `min_num_decode_surfaces >= 2` なら、その値を実効サーフェス数として使う
+- `min_num_decode_surfaces == 1` かつ `max_num_decode_surfaces >= 2` なら、実効サーフェス数として 2 を使う
+  - sequence callback の戻り値が 1 では parser の DPB 数を更新できないため、2 を使って parser と decoder のサーフェス数を一致させる
+- `min_num_decode_surfaces == 1` かつ `max_num_decode_surfaces == 1` なら、実効サーフェス数として 1 を使う
+
+codec 別の固定サーフェス数は使わない。`min_num_decode_surfaces` を超えるサーフェス数は性能とメモリ使用量の調整であり、正しさのための必須条件ではない。
+
 ### ハンドラートレイト
 
 | トレイト | 説明 |

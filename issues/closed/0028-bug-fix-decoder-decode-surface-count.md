@@ -1,6 +1,7 @@
 # 0028-bug-fix-decoder-decode-surface-count
 
 - Created: 2026-08-07
+- Completed: 2026-08-17
 - Branch: feature/fix-decoder-decode-surface-count
 
 ## 目的
@@ -216,17 +217,45 @@ NVIDIA GPU 実機では少なくとも次を検証する。
 
 ## 解決方法
 
-### 変更対象ファイル
+次のファイルを変更して対応した。
 
-- `src/decode.rs` — parser の仮 surface 数、上限の保持と検証、実効 surface 数の helper、create / callback / reconfigure の適用、単体テストと実機テストを追加する
-- `README.md` — `max_num_decode_surfaces` の上限としての意味と、必要な最小値が上限を超えた場合のエラーを説明する
-- `skills/shiguredo-nvcodec/SKILL.md` — decoder surface 数の決定規則と resource 制約を説明する
-- `CHANGES.md` — 次の `[FIX]` エントリを追加する
+### `src/decode.rs`
+
+- `DecoderState` に `max_num_decode_surfaces` フィールドを追加し、`DecoderConfig.max_num_decode_surfaces` を保持する
+- `DecoderConfig.max_num_decode_surfaces == 0` を `Decoder::new` (`DecoderState::new_with_codec`) で設定エラーとして拒否する
+- parser の `CUVIDPARSERPARAMS.ulMaxNumDecodeSurfaces` を仮値 1 で初期化する (NVDEC Video Decoder API Programming Guide 13.0「4.1.1. Creating a parser」)
+- 実効サーフェス数を決定する private helper `determine_num_decode_surfaces` を追加する
+  - `min_num_decode_surfaces == 0` は不正な値としてエラー
+  - `min_num_decode_surfaces > max_num_decode_surfaces` は上限不足としてエラー
+  - `min_num_decode_surfaces >= 2` はその値
+  - `min_num_decode_surfaces == 1 && max_num_decode_surfaces >= 2` は 2
+  - `min_num_decode_surfaces == 1 && max_num_decode_surfaces == 1` は 1
+- `handle_video_sequence` で、実効サーフェス数を決定と display_area の検証を既存 decoder の破棄・再作成より前に行う
+- decoder 作成時の `ulNumDecodeSurfaces` と sequence callback の戻り値に、同じ実効サーフェス数を使う
+- `DecoderConfig.max_num_decode_surfaces` の rustdoc を上限としての意味に更新する
+- helper の境界値テストと、`max_num_decode_surfaces == 0` 拒否のテストを追加する
+
+### `src/error.rs`
+
+- 動的なメッセージを持つエラーを構築する `Error::new_custom_owned` を追加する (上限不足エラーで min / max の値を伝えるため)
+
+### `README.md` / `skills/shiguredo-nvcodec/SKILL.md`
+
+- `max_num_decode_surfaces` の上限としての意味、0 拒否、上限不足時のエラーを説明する
+- SKILL.md に実効サーフェス数の決定規則と resource 制約を説明するセクションを追加する
+
+### `CHANGES.md`
+
+- `## develop` セクションに次の `[FIX]` エントリを追加する
 
 ```markdown
 - [FIX] Decoder の parser DPB と内部 decode surface の数が一致しない場合がある問題を修正する
+  - `DecoderConfig.max_num_decode_surfaces` に 0 を指定すると `Decoder::new` が設定エラーとして拒否するようになった (従来は受け付けていた)
+  - `min_num_decode_surfaces` が上限を超える場合は、`decode()` 中の sequence callback で既存 decoder を破棄する前にエラーが返るようになった
   - @sile
 ```
+
+`cargo build` / `cargo fmt` / `cargo clippy` は通過している。GPU を使わない単体テスト (helper 境界値・0 拒否) は通過した。NVIDIA GPU 実機での JPEG デコードと既存 codec のリグレッション確認は未実施 (実行環境に GPU がないため)。
 
 ## 関連 issue
 
