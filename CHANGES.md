@@ -20,6 +20,8 @@
   - @sile
 - [ADD] Decoder::stats() / Encoder::stats() で内部状態 (counter / gauge) を取得できるようにする
   - @sile
+- [FIX] Decoder の parser DPB と内部 decode surface の数が一致しない場合がある問題を修正する
+  - @sile
 
 ### misc
 

@@ -115,7 +115,11 @@ pub struct DecoderConfig {
     /// 使用する GPU デバイスの ID
     pub device_id: i32,
 
-    /// デコード用サーフェスの最大数
+    /// デコードサーフェス数の上限
+    ///
+    /// parser が報告する `CUVIDEOFORMAT.min_num_decode_surfaces` (正しいデコードに必要な
+    /// 最小サーフェス数) がこの上限を超える場合は、デコードを開始せずエラーを返す。
+    /// 0 は指定できない。
     pub max_num_decode_surfaces: u32,
 
     /// 表示遅延 (0 = 低遅延)
@@ -131,6 +135,9 @@ struct DecoderState {
     ctx_lock: sys::CUvideoctxlock,
     parser: sys::CUvideoparser,
     decoder: sys::CUvideodecoder,
+    // 利用側が指定したデコードサーフェス数の上限
+    // (sequence callback で parser が要求する最小サーフェス数を検証するために保持する)
+    max_num_decode_surfaces: u32,
     width: u32,
     height: u32,
     surface_width: u32,
@@ -218,6 +225,15 @@ impl DecoderState {
         codec_type: sys::cudaVideoCodec,
         config: DecoderConfig,
     ) -> Result<Box<Self>, Error> {
+        // デコードサーフェス数の上限として 0 は不正な設定なので拒否する
+        // (0 では実効サーフェス数を決定できないため)
+        if config.max_num_decode_surfaces == 0 {
+            return Err(Error::new_custom(
+                "Decoder::new",
+                "max_num_decode_surfaces must be greater than 0",
+            ));
+        }
+
         unsafe {
             let lib = CudaLibrary::load()?;
 
@@ -249,6 +265,7 @@ impl DecoderState {
                 ctx_lock,
                 parser: ptr::null_mut(),
                 decoder: ptr::null_mut(),
+                max_num_decode_surfaces: config.max_num_decode_surfaces,
                 width: 0,
                 height: 0,
                 surface_width: 0,
@@ -263,7 +280,13 @@ impl DecoderState {
             // 映像パーサーを作成する
             let mut parser_params: sys::CUVIDPARSERPARAMS = std::mem::zeroed();
             parser_params.CodecType = codec_type;
-            parser_params.ulMaxNumDecodeSurfaces = config.max_num_decode_surfaces;
+            // NVIDIA Video Decoder API Programming Guide 13.0「4.1.1. Creating a parser」に従い、
+            // sequence header を解析する前の仮値として 1 を設定する。
+            // 実際のサーフェス数は sequence callback の戻り値 (実効サーフェス数) で
+            // parser の DPB 数を上書きして決定する。
+            // なお、sequence callback の戻り値が 1 の場合は parser の DPB 数を更新しないため、
+            // 仮値と実際のサーフェス数を一致させる必要がある場合は実効サーフェス数を 1 に保つ。
+            parser_params.ulMaxNumDecodeSurfaces = 1;
             parser_params.ulMaxDisplayDelay = config.max_display_delay;
             parser_params.pUserData = state.as_mut() as *const _ as *mut c_void;
             parser_params.pfnSequenceCallback = Some(handle_video_sequence);
@@ -281,6 +304,45 @@ impl DecoderState {
             ctx_lock_guard.cancel();
 
             Ok(state)
+        }
+    }
+
+    /// parser と decoder の両方へ適用する実効サーフェス数を決定する
+    ///
+    /// `min` は `CUVIDEOFORMAT.min_num_decode_surfaces`、`max` は
+    /// `DecoderConfig.max_num_decode_surfaces` を表す。
+    ///
+    /// `min_num_decode_surfaces` は正しいデコードに必要な最小サーフェス数であり、
+    /// `third_party/nvcodec/include/nvcuvid.h` の `CUVIDEOFORMAT` と
+    /// `PFNVIDSEQUENCECALLBACK` が根拠である。
+    ///
+    /// - `PFNVIDSEQUENCECALLBACK` の戻り値が 1 の場合は parser の DPB 数を更新しないため、
+    ///   戻り値で parser の DPB 数を上書きするには 2 以上を返す必要がある
+    /// - そのため、`min == 1` でも `max >= 2` なら 2 を使って parser の DPB 数を確定させる
+    fn determine_num_decode_surfaces(min: u32, max: u32) -> Result<u32, Error> {
+        if min == 0 {
+            return Err(Error::new_custom(
+                "determine_num_decode_surfaces",
+                "min_num_decode_surfaces must be greater than 0",
+            ));
+        }
+        if min > max {
+            return Err(Error::new_custom_owned(
+                "determine_num_decode_surfaces",
+                format!("min_num_decode_surfaces ({min}) exceeds max_num_decode_surfaces ({max})"),
+            ));
+        }
+        // 以下で parser と decoder の両方に適用する実効サーフェス数を決定する。
+        // PFNVIDSEQUENCECALLBACK の戻り値が 2 以上の場合のみ parser の DPB 数を更新できる。
+        if min >= 2 {
+            // 最小値が 2 以上なら、そのまま使えば parser の DPB 数も同じ値に更新される
+            Ok(min)
+        } else if max >= 2 {
+            // 最小値が 1 なら、parser の DPB 数を確実に更新できる最小値として 2 を使う
+            Ok(2)
+        } else {
+            // 最小値も上限も 1 なら、parser の初期値と同じ 1 を使う
+            Ok(1)
         }
     }
 
@@ -354,6 +416,11 @@ impl DecoderState {
     /// parser はこの値で `CUVIDPICPARAMS.CurrPicIdx` を割り当てる。
     fn handle_video_sequence(&mut self, format: &sys::CUVIDEOFORMAT) -> Result<i32, Error> {
         self.stats.total_sequence_callback_count.inc();
+        // 実効サーフェス数を決定し、上限不足や不正な値を既存デコーダーを破棄する前に検証する
+        let num_decode_surfaces = Self::determine_num_decode_surfaces(
+            format.min_num_decode_surfaces as u32,
+            self.max_num_decode_surfaces,
+        )?;
         // デコーダーが既に作成されている場合は破棄して再作成する
         // ストリーム中の解像度変更に対応するため
         if !self.decoder.is_null() {
@@ -376,7 +443,7 @@ impl DecoderState {
         create_info.ulNumOutputSurfaces = 2; // 出力サーフェスの数（ダブルバッファリング用に 2 を指定）
         create_info.ulCreationFlags =
             sys::cudaVideoCreateFlags_enum_cudaVideoCreate_PreferCUVID as u64; // CUVID ハードウェアデコーダーの使用を優先するフラグ
-        create_info.ulNumDecodeSurfaces = format.min_num_decode_surfaces as u64;
+        create_info.ulNumDecodeSurfaces = num_decode_surfaces as u64;
         create_info.ulWidth = format.coded_width as u64;
         create_info.ulHeight = format.coded_height as u64;
         create_info.ulMaxWidth = format.coded_width as u64;
@@ -414,7 +481,9 @@ impl DecoderState {
         self.surface_width = format.coded_width;
         self.surface_height = format.coded_height;
 
-        Ok(format.min_num_decode_surfaces as i32)
+        // シーケンスコールバックの戻り値は decoder の ulNumDecodeSurfaces と同じ値にする
+        // (parser がこの値で CUVIDPICPARAMS.CurrPicIdx を割り当てるため、両者を一致させる)
+        Ok(num_decode_surfaces as i32)
     }
 
     /// ピクチャデコードコールバック処理 (pfnDecodePicture から呼ばれる)
@@ -1006,6 +1075,41 @@ mod tests {
             max_display_delay: 0,
             surface_format: SurfaceFormat::Nv12,
         }
+    }
+
+    /// 実効サーフェス数の決定規則の境界値を検証する (GPU 不要)
+    #[test]
+    fn determine_num_decode_surfaces_boundaries() {
+        // 最小値も上限も 1 の場合は 1 を使う
+        assert_eq!(
+            DecoderState::determine_num_decode_surfaces(1, 1).unwrap(),
+            1
+        );
+        // 最小値が 1 で上限が 2 以上の場合は、parser の DPB 数を更新できる最小値 2 を使う
+        assert_eq!(
+            DecoderState::determine_num_decode_surfaces(1, 2).unwrap(),
+            2
+        );
+        assert_eq!(
+            DecoderState::determine_num_decode_surfaces(1, 20).unwrap(),
+            2
+        );
+        // 最小値が 2 以上の場合はその値を使う
+        assert_eq!(
+            DecoderState::determine_num_decode_surfaces(2, 2).unwrap(),
+            2
+        );
+        assert_eq!(
+            DecoderState::determine_num_decode_surfaces(8, 20).unwrap(),
+            8
+        );
+        // 最小値が上限を超える場合はエラーにする
+        assert!(DecoderState::determine_num_decode_surfaces(9, 8).is_err());
+        // 最小値が 0 の場合は NVDEC からの不正な値としてエラーにする
+        assert!(DecoderState::determine_num_decode_surfaces(0, 20).is_err());
+        // 上限が 0 の場合は設定エラーとしてエラーにする
+        assert!(DecoderState::determine_num_decode_surfaces(1, 0).is_err());
+        assert!(DecoderState::determine_num_decode_surfaces(0, 0).is_err());
     }
 
     /// デコードされた黒フレームの検証を行う

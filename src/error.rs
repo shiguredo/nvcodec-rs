@@ -22,6 +22,17 @@ impl Error {
         }
     }
 
+    // new_custom の動的なメッセージ版
+    // (format! 等で組み立てた String をエラーメッセージに使う場合に用いる)
+    pub(crate) fn new_custom_owned(function: &'static str, message: String) -> Self {
+        Self {
+            function,
+            status_code: None,
+            status_name: None,
+            status_message: Some(Cow::Owned(message)),
+        }
+    }
+
     // CUDA 関連のエラーを生成するための関数
     fn new_cuda(code: u32, function: &'static str) -> Self {
         // 可能なら詳細情報を取得する
@@ -236,6 +247,15 @@ mod tests {
         assert_eq!(
             error.to_string(),
             "test_func() failed: custom error message"
+        );
+    }
+
+    #[test]
+    fn test_new_custom_owned_display() {
+        let error = Error::new_custom_owned("test_func", "custom owned message".to_string());
+        assert_eq!(
+            error.to_string(),
+            "test_func() failed: custom owned message"
         );
     }
 
