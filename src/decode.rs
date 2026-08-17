@@ -344,6 +344,172 @@ impl DecoderState {
     fn next_frame(&self) -> Option<RawFrame> {
         self.frame_rx.try_recv().ok()
     }
+
+    /// シーケンスコールバック処理 (pfnSequenceCallback から呼ばれる)
+    ///
+    /// 既存デコーダーがあれば破棄し、現在のシーケンスのフォーマットで再作成する。
+    /// また、表示領域の検証と width / height / surface サイズの更新を行う。
+    /// 成功時はデコードサーフェス数を返し、失敗時は `Err` を返す。
+    /// 戻り値のデコードサーフェス数は extern "C" ラッパー経由で parser へ渡され、
+    /// parser はこの値で `CUVIDPICPARAMS.CurrPicIdx` を割り当てる。
+    fn handle_video_sequence(&mut self, format: &sys::CUVIDEOFORMAT) -> Result<i32, Error> {
+        self.stats.total_sequence_callback_count.inc();
+        // デコーダーが既に作成されている場合は破棄して再作成する
+        // ストリーム中の解像度変更に対応するため
+        if !self.decoder.is_null() {
+            self.lib
+                .with_context(self.ctx, || self.lib.cuvid_destroy_decoder(self.decoder))?;
+            self.decoder = ptr::null_mut();
+        }
+
+        // デコーダーの作成情報を設定
+        let mut create_info: sys::CUVIDDECODECREATEINFO = unsafe { std::mem::zeroed() };
+        create_info.CodecType = format.codec;
+        create_info.ChromaFormat = format.chroma_format;
+        create_info.OutputFormat = self.surface_format;
+        create_info.bitDepthMinus8 = format.bit_depth_luma_minus8 as u64;
+        create_info.DeinterlaceMode = if format.progressive_sequence != 0 {
+            sys::cudaVideoDeinterlaceMode_enum_cudaVideoDeinterlaceMode_Weave
+        } else {
+            sys::cudaVideoDeinterlaceMode_enum_cudaVideoDeinterlaceMode_Adaptive
+        };
+        create_info.ulNumOutputSurfaces = 2; // 出力サーフェスの数（ダブルバッファリング用に 2 を指定）
+        create_info.ulCreationFlags =
+            sys::cudaVideoCreateFlags_enum_cudaVideoCreate_PreferCUVID as u64; // CUVID ハードウェアデコーダーの使用を優先するフラグ
+        create_info.ulNumDecodeSurfaces = format.min_num_decode_surfaces as u64;
+        create_info.ulWidth = format.coded_width as u64;
+        create_info.ulHeight = format.coded_height as u64;
+        create_info.ulMaxWidth = format.coded_width as u64;
+        create_info.ulMaxHeight = format.coded_height as u64;
+        create_info.ulTargetWidth = format.coded_width as u64;
+        create_info.ulTargetHeight = format.coded_height as u64;
+
+        // パーサーと共有するコンテキストロックを使用
+        create_info.vidLock = self.ctx_lock;
+
+        self.lib.with_context(self.ctx, || {
+            self.lib
+                .cuvid_create_decoder(&mut self.decoder, &mut create_info)
+        })?;
+        self.stats.total_create_decoder_count.inc();
+        // display_area は signed 整数のため、壊れたストリームで負値になる可能性がある
+        let left = format.display_area.left;
+        let right = format.display_area.right;
+        let top = format.display_area.top;
+        let bottom = format.display_area.bottom;
+        if left < 0
+            || top < 0
+            || right <= left
+            || bottom <= top
+            || right as u32 > format.coded_width
+            || bottom as u32 > format.coded_height
+        {
+            return Err(Error::new_custom(
+                "handle_video_sequence",
+                "invalid display_area in video format",
+            ));
+        }
+        self.width = (right - left) as u32;
+        self.height = (bottom - top) as u32;
+        self.surface_width = format.coded_width;
+        self.surface_height = format.coded_height;
+
+        Ok(format.min_num_decode_surfaces as i32)
+    }
+
+    /// ピクチャデコードコールバック処理 (pfnDecodePicture から呼ばれる)
+    ///
+    /// 指定されたピクチャを `cuvidDecodePicture` でデコードする。
+    fn handle_picture_decode(&mut self, pic_params: &sys::CUVIDPICPARAMS) -> Result<(), Error> {
+        self.stats.total_decode_callback_count.inc();
+        if self.decoder.is_null() {
+            return Err(Error::new_custom(
+                "handle_picture_decode",
+                "decoder not initialized",
+            ));
+        }
+
+        self.lib.with_context(self.ctx, || {
+            self.lib
+                .cuvid_decode_picture(self.decoder, pic_params as *const _ as *mut _)
+        })?;
+
+        Ok(())
+    }
+
+    /// ピクチャ表示コールバック処理 (pfnDisplayPicture から呼ばれる)
+    ///
+    /// デコード済みフレームを mapped output surface からホストメモリへコピーし、
+    /// `frame_tx` チャンネル経由で出力フレームとして送信する。
+    fn handle_picture_display(&self, disp_info: &sys::CUVIDPARSERDISPINFO) -> Result<(), Error> {
+        if self.decoder.is_null() {
+            return Err(Error::new_custom(
+                "handle_picture_display",
+                "decoder not initialized",
+            ));
+        }
+
+        let decoded_frame = self.lib.with_context(self.ctx, || unsafe {
+            // ビデオ処理パラメーターを設定
+            let mut proc_params: sys::CUVIDPROCPARAMS = std::mem::zeroed();
+            proc_params.progressive_frame = disp_info.progressive_frame;
+            proc_params.top_field_first = disp_info.top_field_first;
+            proc_params.second_field = disp_info.repeat_first_field + 1;
+            proc_params.output_stream = ptr::null_mut();
+
+            // デコード済みフレームをマップ
+            let mut device_ptr = 0u64;
+            let mut pitch = 0u32;
+            self.lib.cuvid_map_video_frame(
+                self.decoder,
+                disp_info.picture_index,
+                &mut device_ptr,
+                &mut pitch,
+                &mut proc_params,
+            )?;
+
+            // 確実にフレームをアンマップするためのガードを作成
+            let _unmap_guard = crate::ReleaseGuard::new(|| {
+                let _ = self.lib.cuvid_unmap_video_frame(self.decoder, device_ptr);
+            });
+
+            // フレームサイズを計算 (NV12 形式: Y プレーン + UV プレーン)
+            // 注意: NVDEC は高さを 2 でアライメントする
+            let aligned_height = (self.surface_height + 1) & !1;
+            let y_size = pitch as usize * self.height as usize;
+            let uv_size = pitch as usize * (self.height as usize).div_ceil(2);
+            let frame_size = y_size + uv_size;
+
+            // フレーム用のホストメモリを割り当て
+            let mut host_data = vec![0u8; frame_size];
+
+            // Y プレーンをコピー
+            self.lib
+                .cu_memcpy_d_to_h(host_data.as_mut_ptr() as *mut c_void, device_ptr, y_size)?;
+
+            // UV プレーンをコピー
+            let uv_offset = pitch as u64 * aligned_height as u64;
+            self.lib.cu_memcpy_d_to_h(
+                host_data[y_size..].as_mut_ptr() as *mut c_void,
+                device_ptr + uv_offset,
+                uv_size,
+            )?;
+
+            // デコード済みフレームを作成
+            Ok(RawFrame {
+                width: self.width,
+                height: self.height,
+                pitch: pitch as usize,
+                data: host_data,
+            })
+        })?;
+
+        self.stats.total_output_frame_count.inc();
+        // チャンネル経由で送信 (受信側が破棄されている場合の送信エラーは無視)
+        let _ = self.frame_tx.send(decoded_frame);
+
+        Ok(())
+    }
 }
 
 impl Drop for DecoderState {
@@ -539,75 +705,6 @@ pub fn query_decoder_caps(codec: DecoderCodec, device_id: i32) -> Result<Decoder
     DecoderState::query_caps(codec, device_id)
 }
 
-fn handle_video_sequence_inner(
-    state: &mut DecoderState,
-    format: &sys::CUVIDEOFORMAT,
-) -> Result<i32, Error> {
-    state.stats.total_sequence_callback_count.inc();
-    // デコーダーが既に作成されている場合は破棄して再作成する
-    // ストリーム中の解像度変更に対応するため
-    if !state.decoder.is_null() {
-        state
-            .lib
-            .with_context(state.ctx, || state.lib.cuvid_destroy_decoder(state.decoder))?;
-        state.decoder = ptr::null_mut();
-    }
-
-    // デコーダーの作成情報を設定
-    let mut create_info: sys::CUVIDDECODECREATEINFO = unsafe { std::mem::zeroed() };
-    create_info.CodecType = format.codec;
-    create_info.ChromaFormat = format.chroma_format;
-    create_info.OutputFormat = state.surface_format;
-    create_info.bitDepthMinus8 = format.bit_depth_luma_minus8 as u64;
-    create_info.DeinterlaceMode = if format.progressive_sequence != 0 {
-        sys::cudaVideoDeinterlaceMode_enum_cudaVideoDeinterlaceMode_Weave
-    } else {
-        sys::cudaVideoDeinterlaceMode_enum_cudaVideoDeinterlaceMode_Adaptive
-    };
-    create_info.ulNumOutputSurfaces = 2; // 出力サーフェスの数（ダブルバッファリング用に2を指定）
-    create_info.ulCreationFlags = sys::cudaVideoCreateFlags_enum_cudaVideoCreate_PreferCUVID as u64; // CUVID ハードウェアデコーダーの使用を優先するフラグ
-    create_info.ulNumDecodeSurfaces = format.min_num_decode_surfaces as u64;
-    create_info.ulWidth = format.coded_width as u64;
-    create_info.ulHeight = format.coded_height as u64;
-    create_info.ulMaxWidth = format.coded_width as u64;
-    create_info.ulMaxHeight = format.coded_height as u64;
-    create_info.ulTargetWidth = format.coded_width as u64;
-    create_info.ulTargetHeight = format.coded_height as u64;
-
-    // パーサーと共有するコンテキストロックを使用
-    create_info.vidLock = state.ctx_lock;
-
-    state.lib.with_context(state.ctx, || {
-        state
-            .lib
-            .cuvid_create_decoder(&mut state.decoder, &mut create_info)
-    })?;
-    state.stats.total_create_decoder_count.inc();
-    // display_area は signed 整数のため、壊れたストリームで負値になる可能性がある
-    let left = format.display_area.left;
-    let right = format.display_area.right;
-    let top = format.display_area.top;
-    let bottom = format.display_area.bottom;
-    if left < 0
-        || top < 0
-        || right <= left
-        || bottom <= top
-        || right as u32 > format.coded_width
-        || bottom as u32 > format.coded_height
-    {
-        return Err(Error::new_custom(
-            "handle_video_sequence",
-            "invalid display_area in video format",
-        ));
-    }
-    state.width = (right - left) as u32;
-    state.height = (bottom - top) as u32;
-    state.surface_width = format.coded_width;
-    state.surface_height = format.coded_height;
-
-    Ok(format.min_num_decode_surfaces as i32)
-}
-
 unsafe extern "C" fn handle_video_sequence(
     user_data: *mut c_void,
     format: *mut sys::CUVIDEOFORMAT,
@@ -616,7 +713,7 @@ unsafe extern "C" fn handle_video_sequence(
         return 0;
     }
     let state = unsafe { &mut *(user_data as *mut DecoderState) };
-    match handle_video_sequence_inner(state, unsafe { &*format }) {
+    match state.handle_video_sequence(unsafe { &*format }) {
         Ok(val) => val,
         Err(e) => {
             // 具体的エラーを callback_error フィールドに格納し、パーサーには失敗 (0) を伝える
@@ -634,7 +731,7 @@ unsafe extern "C" fn handle_picture_decode(
         return 0;
     }
     let state = unsafe { &mut *(user_data as *mut DecoderState) };
-    match handle_picture_decode_inner(state, unsafe { &*pic_params }) {
+    match state.handle_picture_decode(unsafe { &*pic_params }) {
         Ok(()) => 1,
         Err(e) => {
             store_callback_error(state, e);
@@ -651,108 +748,13 @@ unsafe extern "C" fn handle_picture_display(
         return 0;
     }
     let state = unsafe { &mut *(user_data as *mut DecoderState) };
-    match handle_picture_display_inner(state, unsafe { &*disp_info }) {
+    match state.handle_picture_display(unsafe { &*disp_info }) {
         Ok(()) => 1,
         Err(e) => {
             store_callback_error(state, e);
             0
         }
     }
-}
-
-fn handle_picture_decode_inner(
-    state: &mut DecoderState,
-    pic_params: &sys::CUVIDPICPARAMS,
-) -> Result<(), Error> {
-    state.stats.total_decode_callback_count.inc();
-    if state.decoder.is_null() {
-        return Err(Error::new_custom(
-            "handle_picture_decode",
-            "decoder not initialized",
-        ));
-    }
-
-    state.lib.with_context(state.ctx, || {
-        state
-            .lib
-            .cuvid_decode_picture(state.decoder, pic_params as *const _ as *mut _)
-    })?;
-
-    Ok(())
-}
-
-fn handle_picture_display_inner(
-    state: &DecoderState,
-    disp_info: &sys::CUVIDPARSERDISPINFO,
-) -> Result<(), Error> {
-    if state.decoder.is_null() {
-        return Err(Error::new_custom(
-            "handle_picture_display",
-            "decoder not initialized",
-        ));
-    }
-
-    let decoded_frame = state.lib.with_context(state.ctx, || unsafe {
-        // ビデオ処理パラメーターを設定
-        let mut proc_params: sys::CUVIDPROCPARAMS = std::mem::zeroed();
-        proc_params.progressive_frame = disp_info.progressive_frame;
-        proc_params.top_field_first = disp_info.top_field_first;
-        proc_params.second_field = disp_info.repeat_first_field + 1;
-        proc_params.output_stream = ptr::null_mut();
-
-        // デコード済みフレームをマップ
-        let mut device_ptr = 0u64;
-        let mut pitch = 0u32;
-        state.lib.cuvid_map_video_frame(
-            state.decoder,
-            disp_info.picture_index,
-            &mut device_ptr,
-            &mut pitch,
-            &mut proc_params,
-        )?;
-
-        // 確実にフレームをアンマップするためのガードを作成
-        let _unmap_guard = crate::ReleaseGuard::new(|| {
-            let _ = state.lib.cuvid_unmap_video_frame(state.decoder, device_ptr);
-        });
-
-        // フレームサイズを計算 (NV12 形式: Y プレーン + UV プレーン)
-        // 注意: NVDEC は高さを 2 でアライメントする
-        let aligned_height = (state.surface_height + 1) & !1;
-        let y_size = pitch as usize * state.height as usize;
-        let uv_size = pitch as usize * (state.height as usize).div_ceil(2);
-        let frame_size = y_size + uv_size;
-
-        // フレーム用のホストメモリを割り当て
-        let mut host_data = vec![0u8; frame_size];
-
-        // Y プレーンをコピー
-        state
-            .lib
-            .cu_memcpy_d_to_h(host_data.as_mut_ptr() as *mut c_void, device_ptr, y_size)?;
-
-        // UV プレーンをコピー
-        let uv_offset = pitch as u64 * aligned_height as u64;
-        state.lib.cu_memcpy_d_to_h(
-            host_data[y_size..].as_mut_ptr() as *mut c_void,
-            device_ptr + uv_offset,
-            uv_size,
-        )?;
-
-        // デコード済みフレームを作成
-        Ok(RawFrame {
-            width: state.width,
-            height: state.height,
-            pitch: pitch as usize,
-            data: host_data,
-        })
-    })?;
-
-    state.stats.total_output_frame_count.inc();
-    // チャンネル経由で送信 (受信側が破棄されている場合の送信エラーは無視)
-    let _ = state.frame_tx.send(decoded_frame);
-
-    Ok(())
 }
 
 /// 内部用のデコード済み映像フレーム

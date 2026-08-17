@@ -1,7 +1,7 @@
 # 0032-refactor-decoder-callback-methods
 
 - Created: 2026-08-17
-- Completed: {YYYY-MM-DD} (例: 2024-07-01)
+- Completed: 2026-08-17
 - Branch: feature/refactor-decoder-callback-methods
 - Polished: {YYYY-MM-DD} (例: 2024-07-15)
 - Reporter: @sile
@@ -47,9 +47,23 @@ extern "C" ラッパーは `state.method(...)` の形でメソッドを呼ぶよ
 
 ## 解決方法
 
-`src/decode.rs` のみを変更する。
+`src/decode.rs` のみを変更して対応した。
 
-フリー関数 `handle_video_sequence_inner` / `handle_picture_decode_inner` / `handle_picture_display_inner` を削除し、`DecoderState` の `impl` ブロックへ同名メソッドとして追加する。extern "C" ラッパー `handle_video_sequence` / `handle_picture_decode` / `handle_picture_display` の本体を、メソッド呼び出しへ変更する。
+- フリー関数 `handle_video_sequence_inner` / `handle_picture_decode_inner` / `handle_picture_display_inner` を削除し、`DecoderState` の `impl` ブロックへメソッドとして追加した
+  - `DecoderState::handle_video_sequence(&mut self, format)`
+  - `DecoderState::handle_picture_decode(&mut self, pic_params)`
+  - `DecoderState::handle_picture_display(&self, disp_info)`
+- extern "C" ラッパー `handle_video_sequence` / `handle_picture_decode` / `handle_picture_display` の本体を、メソッド呼び出しへ変更した
+- 挙動は変えず、decoder の破棄と再作成という develop の現状経路を維持した
+- 各メソッドの docstring を補強し、戻り値契約（`handle_video_sequence` は成功時にデコードサーフェス数を返す）を正確に記載した
+- メソッド化に伴い、既存コメントの全角半角スペース違反も是正した
+
+`cargo build` / `cargo fmt` / `cargo clippy` は通過している。挙動が変わらないことは review-diff-code の機械的等価性検証で確認した。
+
+## 関連 issue
+
+- 0024: reconfigure と decoder 再作成のハイブリッド化。本 issue のメソッド化を前提に reconfigure 経路を実装する
+- 0028: parser と decoder の surface 数を同期する。本 issue のメソッド化を前提に surface 数決定 helper を組み込む
 
 ## 関連 issue
 
