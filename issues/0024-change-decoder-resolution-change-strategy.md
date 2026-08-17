@@ -92,15 +92,40 @@ decoder 再作成は既存の destroy + create 経路を利用する。`cuvidCre
 
 `src/lib.rs` の `CudaLibrary::load` で `cuvidReconfigureDecoder` の存在を確認し、`cuvid_create_decoder` / `cuvid_destroy_decoder` と同じ形式の `cuvid_reconfigure_decoder` ラッパーを追加する。
 
-### 出力ジオメトリ問題との依存関係
+### 出力ジオメトリ契約との依存関係
 
-現在の実装案には、reconfigure 時の `ulTargetWidth` / `ulTargetHeight` と `display_area` を作成時の値に固定する一方で、`DecodedFrame` の寸法と NV12 コピー位置を新しい coded / display サイズから計算する不整合がある。黒一色のテストデータでは、メタデータと Y / UV のコピー位置が実際の出力サーフェスと一致していることを検証できない。
+issue 0031 は、develop ブランチに既に存在する display area の不整合を修正し、`DecodedFrame` の寸法、stride、Y / UV データに関する出力契約を確定する。
 
-この問題は、出力サイズの公開契約とテストデータを独立して検討する必要があるため、別 issue に切り出す。本 issue の reconfigure 実装は、その issue で出力ジオメトリの扱いが確定し、実機のパターン映像テストで正しさを確認した後に完了させる。
+issue 0031 は reconfigure 実装に依存せず、develop ブランチの decoder 再作成経路だけで完了できるようにする。
+
+本 issue は、issue 0031 で確定した出力契約を reconfigure 経路へ適用する責務を持つ。
+
+現在の reconfigure 実装案には、`CUVIDRECONFIGUREDECODERINFO.ulTargetWidth` / `ulTargetHeight` と `display_area` を decoder 作成時の値に固定する一方で、`DecodedFrame` の寸法と NV12 コピー位置を新しい coded サイズと display area から計算する不整合がある。
+
+たとえば 320x240 の target surface を維持したまま 256x160 へ reconfigure すると、mapped output surface の UV プレーンは target 高さ 240 の後ろから始まる。一方、新しい coded 高さ 160 から UV オフセットを計算すると、Y プレーンの途中を UV データとしてコピーする可能性がある。
+
+この不整合は未マージの reconfigure 実装に固有であり、develop ブランチの既存不具合としては扱わない。ただし、本 issue を develop ブランチへマージする前に解消する。
+
+reconfigure 経路では、decoder session の作成時ジオメトリと、現在の sequence の coded サイズおよび display area を別々に管理する。
+
+少なくとも次を実機で比較する。
+
+1. 新しい coded サイズと display area に合わせて target サイズも更新する
+2. NVIDIA 公式サンプルと同様に、作成時の target サイズと display area を維持する
+
+作成時の target サイズを維持する場合は、UV プレーン開始位置を実際の mapped output surface の高さから計算し、その surface から現在の display area に対応する Y / UV データを取り出す。
+
+新しい target サイズへ更新する場合も、`cuvidReconfigureDecoder`、後続の `cuvidDecodePicture`、`cuvidMapVideoFrame` が対象 codec と GPU / driver で成功することを確認する。
+
+どちらの方式でも、利用側から見える解像度を作成時サイズへ暗黙に固定してはならない。
+
+reconfigure で issue 0031 の出力契約を維持できない条件は、decoder 再作成へフォールバックする。
+
+黒一色のテストデータではコピー元の不一致を検出できないため、issue 0031 で用意したパターン映像を使用し、既知の座標にある Y / U / V の値まで検証する。
 
 ### 公開設定の判断チェックポイント
 
-reconfigure 経路と出力ジオメトリ問題の実装・調査後に、次の観点を確認する。
+reconfigure 経路と reconfigure 固有の出力ジオメトリ処理の実装・調査後に、次の観点を確認する。
 
 - reconfigure 失敗後に decoder を安全に破棄し、現在の sequence から再作成して継続できるか
 - 解像度変更前後で `DecodedFrame` の寸法、stride、Y / UV のコピー位置と内容が正しいか
@@ -131,7 +156,10 @@ reconfigure 経路の出力が正しく、再作成を減らす効果を実測�
 - 安全な再作成フォールバックを採用できない場合は、常時 reconfigure を採用せず、reconfigure を選択した経路の終端条件が公開 API と文書に明記されている
 - `format.display_area` などの事前検証に失敗した場合は、既存 decoder が破棄されない
 - `DecoderStats::total_create_decoder_count` / `total_reconfigure_decoder_count` / `total_reconfigure_failure_count` が各経路を正しく反映する
-- 出力ジオメトリを扱う別 issue が完了し、解像度変更前後の Y / UV データがパターン映像で検証されている
+- issue 0031 で `DecodedFrame` の出力契約と develop ブランチの実装が確定している
+- reconfigure 経路で、作成時 target surface と現在の sequence のジオメトリが区別して管理されている
+- reconfigure 前後の寸法、stride、Y / UV データがパターン映像で検証され、issue 0031 の出力契約と一致している
+- reconfigure で出力契約を維持できない条件が、decoder 再作成へフォールバックする条件として明文化されている
 - 公開設定を追加する場合は、その設定で常に decoder を再作成する経路も既存の解像度変更テストで検証されている
 - `README.md` と `skills/shiguredo-nvcodec/SKILL.md` が、利用側の最大解像度指定を要求せず、最終決定した reconfigure 方針を説明している
 - `CHANGES.md` の `develop` セクションに、最終的な公開 API と挙動に対応するエントリが追加されている
@@ -142,7 +170,7 @@ reconfigure 経路の出力が正しく、再作成を減らす効果を実測�
 
 ### 変更対象ファイル
 
-- `src/decode.rs` — session ごとの coded サイズ上限、reconfigure 適用判定、再作成フォールバック、統計値更新、実機テストを追加する。`DecoderConfig` の `max_coded_width` / `max_coded_height` とその検証は追加しない。調査結果によっては reconfigure の利用方針を選択する公開設定を追加する
+- `src/decode.rs` — session ごとの coded サイズ上限、reconfigure 適用判定、作成時 target surface と現在の sequence のジオメトリ管理、出力契約を維持する NV12 コピー処理、再作成フォールバック、統計値更新、実機テストを追加する。`DecoderConfig` の `max_coded_width` / `max_coded_height` とその検証は追加しない。調査結果によっては reconfigure の利用方針を選択する公開設定を追加する
 - `src/lib.rs` — `cuvidReconfigureDecoder` の存在確認とラッパーを追加する
 - `build.rs` — docs.rs 用スタブに `CUVIDRECONFIGUREDECODERINFO` を追加する
 - `testdata/resolution-change/` — 解像度変化テストデータを使用し、縮小と上限超過後の縮小を検証する
@@ -173,3 +201,4 @@ reconfigure 経路の出力が正しく、再作成を減らす効果を実測�
 - 0027 (closed): `DecoderStats` を追加した。本 issue は既存の create / reconfigure / failure カウンターで各経路を検証する
 - 0028 (open): parser の DPB 数と decoder の decode surface 数を同期する。本 issue の reconfigure 経路は、その決定処理を利用する
 - 0029 (closed): デコードエラー後の `Decoder` を終端状態にした。本 issue の再作成フォールバックまで失敗した場合は、この終端契約に従う
+- 0031 (open): develop ブランチの display area の不整合を修正し、`DecodedFrame` の出力契約を確定する。本 issue は、その契約を reconfigure 経路へ適用する
