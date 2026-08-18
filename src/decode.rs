@@ -1458,25 +1458,15 @@ mod tests {
         // 10bit HEVC (bit_depth_luma_minus8 = 2) の入力が、handle_video_sequence の
         // 検証で明示的エラーとして拒否され、Decoder が終端状態に遷移することを確認する。
         //
-        // この VPS / SPS は ffmpeg (libx265, pix_fmt=yuv420p10le) で生成した 10bit HEVC の
-        // VPS / SPS NAL を抽出したもので、bit_depth_luma_minus8 = 2 を含む。
-        // SPS 解析で handle_video_sequence が呼ばれた時点でエラーになることを期待する
-        // (フレームデータは不要)。
-        let vps = vec![
-            64, 1, 12, 1, 255, 255, 2, 32, 0, 0, 3, 0, 144, 0, 0, 3, 0, 0, 3, 0, 60, 149, 152, 9,
-        ];
-        let sps = vec![
-            66, 1, 1, 2, 32, 0, 0, 3, 0, 144, 0, 0, 3, 0, 0, 3, 0, 60, 160, 10, 8, 15, 19, 101,
-            149, 154, 73, 50, 188, 5, 160, 32, 0, 0, 3, 0, 32, 0, 0, 3, 3, 33,
-        ];
-
-        // NAL ユニットを結合 (Annex B 形式: start code 0x00000001 を使用)
-        let mut h265_data = Vec::new();
-        let start_code = [0u8, 0, 0, 1];
-        h265_data.extend_from_slice(&start_code);
-        h265_data.extend_from_slice(&vps);
-        h265_data.extend_from_slice(&start_code);
-        h265_data.extend_from_slice(&sps);
+        // 出力サーフェスは 8bit NV12 のみ対応のため、10bit 入力は P010 相当の
+        // 出力サーフェスになり、コピー処理 (8bit 前提) と整合しない。
+        // そのため、デコードを開始せずに fail-fast で拒否する。
+        //
+        // ffmpeg (libx265, pix_fmt=yuv420p10le) で生成した 10bit HEVC の完全なストリーム
+        // (VPS / SPS / PPS / フレームデータを含む) を使う。SPS やパラメータセットのみでは
+        // NVDEC のパーサーがシーケンス解析を完結させず handle_video_sequence が呼ばれない
+        // ため、シーケンス解析を確実に発火させるには完全なストリームが必要である。
+        let h265_data = include_bytes!("../testdata/10bit/black10.h265");
 
         let config = test_decoder_config(DecoderCodec::Hevc);
         let (tx, rx) = mpsc::sync_channel::<Result<DecodedFrame<()>, Error>>(4);
@@ -1488,9 +1478,9 @@ mod tests {
         )
         .expect("Failed to create h265 decoder");
 
-        // デコードを実行 (SPS 解析時に handle_video_sequence が呼ばれ、10bit のため拒否される)
+        // デコードを実行 (シーケンス解析時に handle_video_sequence が呼ばれ、10bit のため拒否される)
         decoder
-            .decode(&h265_data, ())
+            .decode(h265_data, ())
             .expect("Failed to decode H.265 data");
 
         // フィニッシュ処理をテスト
