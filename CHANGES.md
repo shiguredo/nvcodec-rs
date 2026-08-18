@@ -20,6 +20,16 @@
   - @sile
 - [ADD] Decoder::stats() / Encoder::stats() で内部状態 (counter / gauge) を取得できるようにする
   - @sile
+- [FIX] Decoder の display area と DecodedFrame の画素領域が一致しない問題を修正する
+  - display area の left / top が非ゼロの場合、公開する寸法は表示領域の寸法 (crop 後) なのに、画素データは mapped output surface の左上を起点にコピーされていた
+  - コピー元を表示領域の左上に合わせることで、`width()` / `height()` と Y / UV データを表示領域に一致させた
+  - `DecodedFrame` の出力契約 (寸法・stride・Y/UV データは表示領域に一致する) を rustdoc に明記した
+  - 奇数幅 (width が奇数) のストリームでは、NV12 の UV 行バイト幅を `ceil(width/2)*2` としてコピーするようにした (修正前は最後のクロマ 1 組がコピーされず 0 埋めのままだった)
+  - display area の left / top が奇数の入力を、デコード不可の入力として Decoder を終端させるようになった (従来は画素が不整合のままデコードされていた)
+  - 原点 0 の解像度変化ストリームによる再作成経路の回帰テストを追加した
+  - 奇数幅の JPEG による UV 行バイト幅の回帰テストを追加した
+  - 非ゼロ原点 (left / top が非ゼロ) の画素一致は NVIDIA GPU 実機未確認のため、検証待ち
+  - @sile
 - [FIX] Decoder の parser DPB と内部 decode surface の数が一致しない場合がある問題を修正する
   - decode surface はデコード済みフレームを一時的に格納する GPU 上のバッファで、参照フレームを保持するために複数必要。その数のことをデコードサーフェス数と呼ぶ
   - parser DPB は parser がデコード結果をどのサーフェスへ書き込むかを決めるためのサーフェスの循環リスト

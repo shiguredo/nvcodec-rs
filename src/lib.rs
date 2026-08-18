@@ -140,11 +140,6 @@ impl CudaLibrary {
                         Error::new_custom("CudaLibrary::load", "cuMemcpyHtoD_v2 not found")
                     })?;
 
-                let _: unsafe extern "C" fn(*mut c_void, sys::CUdeviceptr, usize) -> u32 =
-                    cuda_lib.get(b"cuMemcpyDtoH_v2").map_err(|_| {
-                        Error::new_custom("CudaLibrary::load", "cuMemcpyDtoH_v2 not found")
-                    })?;
-
                 // デバイス列挙関連
                 let _: unsafe extern "C" fn(*mut c_int) -> u32 =
                     cuda_lib.get(b"cuDeviceGetCount").map_err(|_| {
@@ -433,23 +428,6 @@ impl CudaLibrary {
                 .expect("cuMemcpyHtoD_v2 should exist (checked in load())");
             let status = f(dst_device, src_host, byte_count);
             Error::check_cuda(status, "cuMemcpyHtoD_v2")
-        }
-    }
-
-    /// デバイスからホストへメモリをコピーする
-    fn cu_memcpy_d_to_h(
-        &self,
-        dst_host: *mut c_void,
-        src_device: sys::CUdeviceptr,
-        byte_count: usize,
-    ) -> Result<(), Error> {
-        unsafe {
-            let f: unsafe extern "C" fn(*mut c_void, sys::CUdeviceptr, usize) -> u32 = self
-                .cuda_lib
-                .get(b"cuMemcpyDtoH_v2")
-                .expect("cuMemcpyDtoH_v2 should exist (checked in load())");
-            let status = f(dst_host, src_device, byte_count);
-            Error::check_cuda(status, "cuMemcpyDtoH_v2")
         }
     }
 

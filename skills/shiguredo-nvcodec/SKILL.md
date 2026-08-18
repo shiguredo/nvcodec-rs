@@ -412,6 +412,8 @@ encoder.encode(&new_frame, &EncodeOptions {
 
 `DecodedFrame` はフレームごとに `width()` / `height()` を持つので、フレームごとにサイズを確認する。
 
+フレームの寸法と画素データは、そのフレームの表示領域 (display area) に一致する。`width()` / `height()` は表示領域の寸法を返す。画素データは行矩形ではなく各行が stride を持つバッファで、Y は `y_plane()[y * y_stride() + x]`、UV はインターリーブされたクロマを `uv_plane()` からアクセスする。`uv_stride()` は `width()` より大きいことがある。詳細な出力契約は `DecodedFrame` の rustdoc を参照する。
+
 ```rust
 decoder.decode(&data_1080p, 0)?;
 let frame = rx.recv()??;

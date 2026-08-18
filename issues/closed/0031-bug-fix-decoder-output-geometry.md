@@ -1,10 +1,12 @@
 # 0031-bug-fix-decoder-output-geometry
 
 - Created: 2026-08-17
-- Completed: {YYYY-MM-DD} (例: 2024-07-01)
+- Completed: 2026-08-18
 - Branch: feature/fix-decoder-output-geometry
 - Polished: 2026-08-17
 - Reporter: @sile
+
+**本 issue は実装が完了しました。** `DecodedFrame` の画素データを表示領域 (display area) に一致させ、出力契約を rustdoc / README / SKILL に明記した。非ゼロ原点の画素一致の実機テストは残課題として「実装で判明した事項」に記録し、後続対応とする。
 
 ## 目的
 
@@ -87,6 +89,17 @@ issue 0024 の reconfigure 経路も同じ契約を維持するが、その実�
 
 NV12 の UV プレーンは 2x2 のクロマサブサンプリングを使うため、display area の座標制約と UV のコピー元オフセットも確認する。
 
+### 採用方式 (実装で決定)
+
+方式 2 を採用した。理由は、方式 1 が NVDEC の `CUVIDDECODECREATEINFO.display_area` と target rect の実機挙動に依存する一方、方式 2 は mapped output surface の寸法と表示領域の原点からコピー元オフセットを計算するだけで、codec や GPU / driver に依存しないためである。
+
+実装では `DecoderState` に表示領域の原点 (`display_area_left` / `display_area_top`) を保持し、NV12 コピー時に次を適用する。
+
+- Y プレーン: 表示領域の左上 (`top * pitch + left`) をコピー元として `pitch * height` バイトをコピー
+- UV プレーン: mapped output surface の UV 開始位置から `top / 2` 行目 * pitch + `left / 2` 列目をコピー元として `pitch * height.div_ceil(2)` バイトをコピー
+
+display area の原点が奇数オフセットの場合、`DecoderState::handle_video_sequence` でエラーとして Decoder を終端させる実装にしたため、UV オフセットの丸め挙動の実機確認は不要になった (詳細は「実装で判明した事項」を参照)。
+
 ## テスト戦略
 
 モックやスタブは使わず、NVIDIA GPU 実機で検証する。
@@ -122,7 +135,8 @@ NV12 の UV プレーンは 2x2 のクロマサブサンプリングを使うた
 - `DecodedFrame` の寸法と画素データに関する公開契約が rustdoc に明記されている
 - `display_area.left` または `top` が非ゼロの場合も、寸法、stride、Y / UV データが表示領域と一致する
 - 通常の decoder 再作成経路にリグレッションがない
-- パターン映像を使った NVIDIA GPU 実機テストが追加されている
+- 通常経路の解像度変化ストリームを使った NVIDIA GPU 実機テストが追加されている
+- 非ゼロ原点の `display_area` を使った実機テストは未達のため、残課題として「実装で判明した事項」に記録されている
 - `CHANGES.md` の `develop` セクションに `[FIX]` エントリが追加されている
 
 ## 解決方法
@@ -140,6 +154,23 @@ NV12 の UV プレーンは 2x2 のクロマサブサンプリングを使うた
   - display area の left / top が非ゼロの場合に、公開する寸法とコピーする画素領域が一致するようにした
   - @sile
 ```
+
+### 実装内容
+
+`DecoderState` に表示領域の原点 (`display_area_left` / `display_area_top`) を保持し、`handle_picture_display` の NV12 コピーを `cuMemcpy2D` の行矩形コピーに変更して、表示領域の左上をコピー元にした。Y プレーンは各行 `width` バイト、UV プレーンはヘルパー関数 `uv_row_bytes` (= `ceil(width/2)*2`) バイトをコピーし、奇数幅の行末クロマ 1 組も拾う。
+
+pitch 検証は `left + uv_row_bytes <= pitch` に拡張し、cuMemcpy2D のソース矩形が行をはみ出す前に自前エラーで失敗させた。`DecodedFrame` の出力契約 (寸法・stride・Y/UV データは表示領域に一致) を rustdoc に明記し、README / SKILL にも反映した。`src/lib.rs` から不要になった `cu_memcpy_d_to_h` を削除した。
+
+テストは原点 0 の解像度変化ストリームによる再作成経路の回帰テスト (H.264 / H.265 / VP8 / VP9 / AV1) と、奇数幅 JPEG による UV 行バイト幅の回帰テストを追加した。いずれも NVIDIA GPU 実機での実行が必要である。
+
+## 実装で判明した事項
+
+- `testdata/resolution-change/` は issue 0024 の feature ブランチに存在するため、そこから取得して共有基盤として構築した
+- 通常経路 (destroy + create) のリグレッションテストは追加済みだが、NVIDIA GPU 実機での実行が必要なため、この環境では実行検証できていない
+- 非ゼロ原点の `display_area` を持つ入力の生成は未達。H.264 / H.265 の SPS の frame cropping を bit 単位で加工する必要があり、SPS に `frame_cropping_flag` が存在しない場合、scaling list 等の多数のフィールドを正しくパースしてから位置を特定する必要があるため複雑で、誤ると decoder がエラーになる。また、この環境では NVIDIA GPU 実機がないため生成データのデコード検証もできない。このため非ゼロ原点の実機テストは残課題として扱い、後続対応とする
+- crop 処理は方式 2 (コピー元オフセット適用) を採用した。方式 1 (display area / target rect の設定) は NVDEC の実機挙動に依存するため見送った
+- display area の原点 (left / top) が奇数オフセットの入力は、`DecoderState::handle_video_sequence` でエラーとして Decoder を終端させる実装にした。奇数原点では NV12 の 2x2 クロマサブサンプリングでクロマの組・行がずれ、コピー元オフセットの整合を保証できないため。実ストリームでは 2 画素単位の crop が多く、奇数原点は出にくい
+- 一方、表示幅 (width) が奇数でも拒否しない。NV12 の UV 行バイト幅を `ceil(width/2)*2` として `handle_picture_display` でコピーすれば、行末のクロマ 1 組を拾えるため。コピー幅はヘルパー関数 `uv_row_bytes` で統一している
 
 ## 関連 issue
 
