@@ -276,7 +276,7 @@ encoder.reconfigure(ReconfigureParams {
 
 `DecodedFrame` はフレームごとに `width()` / `height()` を持っているので、フレームごとにサイズを確認してください。
 
-フレームの寸法と画素データは、そのフレームの表示領域 (display area) に一致します。`width()` / `height()` は表示領域の寸法を返します。画素データは行矩形ではなく各行が stride を持つバッファで、Y は各行の先頭 `width()` バイト (全体で `y_stride() * height()` バイト)、UV は各行の先頭 `width().div_ceil(2) * 2` バイト (全体で `uv_stride() * height().div_ceil(2)` バイト) です。Y の画素へは `y_plane()[y * y_stride() + x]`、UV のクロマへは `0..width().div_ceil(2)` の 2 バイト組、または行の先頭 `width().div_ceil(2) * 2` バイトでアクセスしてください。奇数幅 (width が奇数) では UV 行バイト幅が width + 1 になるため、x in 0..width で UV を走査してはいけません。表示領域の原点 (left / top) が非ゼロの入力 (フレームの crop) での画素一致は NVIDIA GPU 実機未確認のため、検証待ちです。
+フレームの寸法と画素データは、そのフレームの表示領域 (display area) に一致します。`width()` / `height()` は表示領域の寸法を返します。画素データは行矩形ではなく各行が stride を持つバッファで、Y は `y_plane()[y * y_stride() + x]`、UV はインターリーブされたクロマを `uv_plane()` からアクセスしてください。`uv_stride()` は `width()` より大きいことがあります。詳細な出力契約は `DecodedFrame` の rustdoc を参照してください。
 
 ```rust
 // 解像度が変わっても同じデコーダーで継続可能
