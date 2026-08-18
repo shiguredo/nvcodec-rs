@@ -42,7 +42,7 @@
 - [FIX] 10bit 以上の入力をデコード不可として Decoder を終端させるようになる
   - 出力サーフェスは 8bit NV12 のみ対応なのに 10bit ストリーム (`bit_depth_luma_minus8 != 0`) を拒否しておらず、10bit 入力で Y / UV のバイト幅計算が崩れて不正な画素データが返っていた
   - `handle_video_sequence` で `bit_depth_luma_minus8 != 0` を検証し、該当する入力は明示的なエラーで Decoder を終端させるようにした
-  - 10bit 対応 (P016 等) は出力フォーマットの拡張を伴うため別 issue とする
+  - 本変更では 10bit 対応 (P016 等) は出力フォーマットの拡張を伴うため扱わない
   - @sile
 
 ### misc
