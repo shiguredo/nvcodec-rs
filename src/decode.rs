@@ -460,6 +460,18 @@ impl DecoderState {
                 "invalid display_area in video format",
             ));
         }
+        // 出力サーフェスは 8bit NV12 のみ対応のため、10bit 以上の入力
+        // (bit_depth_luma_minus8 != 0) は受け付けない。
+        // 10bit 入力だと出力サーフェスは P010 相当 (各サンプル 2 バイト) になる一方、
+        // handle_picture_display のコピー処理は 8bit 前提 (1 画素 1 バイト) で実装されており、
+        // Y / UV のバイト幅計算が崩れて不正な画素データになる。そのため明示的に拒否する。
+        // 10bit 対応 (P016 等) は出力フォーマットの拡張を伴うため本関数では扱わない。
+        if format.bit_depth_luma_minus8 != 0 {
+            return Err(Error::new_custom(
+                "handle_video_sequence",
+                "bit_depth_luma_minus8 must be 0 (only 8bit output is supported)",
+            ));
+        }
         // デコーダーが既に作成されている場合は破棄して再作成する
         // ストリーム中の解像度変更に対応するため
         if !self.decoder.is_null() {
@@ -1433,6 +1445,70 @@ mod tests {
             .expect("Decoding error occurred");
 
         assert_black_frame(&frame, 640, 480);
+
+        drop(decoder);
+    }
+
+    #[test]
+    fn test_decode_h265_10bit_rejected() {
+        // 10bit HEVC (bit_depth_luma_minus8 = 2) の入力が、handle_video_sequence の
+        // 検証で明示的エラーとして拒否され、Decoder が終端することを確認する。
+        //
+        // 出力サーフェスは 8bit NV12 のみ対応のため、10bit 入力は P010 相当の
+        // 出力サーフェスになり、コピー処理 (8bit 前提) と整合しない。
+        // そのため、デコードを開始せずに fail-fast で拒否する。
+        //
+        // この VPS / SPS は ffmpeg (libx265, pix_fmt=yuv420p10le) で生成した 10bit HEVC の
+        // VPS / SPS NAL を抽出したもので、bit_depth_luma_minus8 = 2 を含む。
+        // SPS 解析で handle_video_sequence が呼ばれた時点でエラーになることを期待する
+        // (フレームデータは不要)。
+        let vps = vec![
+            64, 1, 12, 1, 255, 255, 2, 32, 0, 0, 3, 0, 144, 0, 0, 3, 0, 0, 3, 0, 60, 149, 152, 9,
+        ];
+        let sps = vec![
+            66, 1, 1, 2, 32, 0, 0, 3, 0, 144, 0, 0, 3, 0, 0, 3, 0, 60, 160, 10, 8, 15, 19, 101,
+            149, 154, 73, 50, 188, 5, 160, 32, 0, 0, 3, 0, 32, 0, 0, 3, 3, 33,
+        ];
+
+        // NAL ユニットを結合 (Annex B 形式: start code 0x00000001 を使用)
+        let mut h265_data = Vec::new();
+        let start_code = [0u8, 0, 0, 1];
+        h265_data.extend_from_slice(&start_code);
+        h265_data.extend_from_slice(&vps);
+        h265_data.extend_from_slice(&start_code);
+        h265_data.extend_from_slice(&sps);
+
+        let config = test_decoder_config(DecoderCodec::Hevc);
+        let (tx, rx) = mpsc::sync_channel::<Result<DecodedFrame<()>, Error>>(4);
+        let decoder = Decoder::new(
+            config,
+            FnDecodeHandler::new(move |frame| {
+                let _ = tx.send(frame);
+            }),
+        )
+        .expect("Failed to create h265 decoder");
+
+        // デコードを実行 (SPS 解析時に handle_video_sequence が呼ばれ、10bit のため拒否される)
+        decoder
+            .decode(&h265_data, ())
+            .expect("Failed to decode H.265 data");
+
+        // フィニッシュ処理をテスト
+        decoder.flush().expect("flush failed");
+
+        // 10bit 入力は拒否されるため、on_decoded に Err が渡される (Decoder は終端する)
+        let result = rx.recv().expect("No decoded result available");
+
+        match result {
+            Ok(_) => panic!("10bit input must be rejected but a frame was decoded"),
+            Err(e) => {
+                // 10bit 拒否の具体的エラーが通知されることを確認する
+                assert!(
+                    e.to_string().contains("bit_depth_luma_minus8 must be 0"),
+                    "unexpected error: {e}"
+                );
+            }
+        }
 
         drop(decoder);
     }
