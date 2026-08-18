@@ -1858,8 +1858,9 @@ mod tests {
         .expect("デコーダーの作成に失敗した");
 
         for frame in frames {
-            // シーケンスコールバックのエラーは decode の戻り値にも伝播するが、
-            // 具体的な内容はハンドラ経由で通知されるため戻り値は確認しない
+            // decode() の戻り値はジョブ送信の成否だけを表す。
+            // シーケンスエラーはコールバック経由で errors に集まり、送信失敗は
+            // decoded_frames.len() の検証で検出されるため、ここでは戻り値を確認しない。
             let _ = decoder.decode(frame, ());
         }
         let _ = decoder.flush();
@@ -1963,8 +1964,7 @@ mod tests {
     }
 
     #[test]
-    fn test_decode_h264_resolution_change_without_max_coded_width_height() {
-        // max_coded_width / max_coded_height を指定しない場合 (通常経路) は
+    fn test_decode_h264_resolution_change_destroy_and_recreate() {
         // destroy + create で解像度変化に対応することを確認する
         let data = include_bytes!("../testdata/resolution-change/h264.h264");
         let frames = split_annexb_frames(data, |nal| (nal & 0x1f) == 1 || (nal & 0x1f) == 5);
@@ -1973,8 +1973,7 @@ mod tests {
     }
 
     #[test]
-    fn test_decode_h265_resolution_change_without_max_coded_width_height() {
-        // max_coded_width / max_coded_height を指定しない場合 (通常経路) は
+    fn test_decode_h265_resolution_change_destroy_and_recreate() {
         // destroy + create で解像度変化に対応することを確認する
         let data = include_bytes!("../testdata/resolution-change/h265.h265");
         let frames = split_annexb_frames(data, |nal| nal >> 1 <= 31);
@@ -1983,8 +1982,7 @@ mod tests {
     }
 
     #[test]
-    fn test_decode_vp8_resolution_change_without_max_coded_width_height() {
-        // max_coded_width / max_coded_height を指定しない場合 (通常経路) は
+    fn test_decode_vp8_resolution_change_destroy_and_recreate() {
         // destroy + create で解像度変化に対応することを確認する
         let data = include_bytes!("../testdata/resolution-change/vp8.ivf");
         let frames = split_ivf_frames(data);
@@ -1993,8 +1991,7 @@ mod tests {
     }
 
     #[test]
-    fn test_decode_vp9_resolution_change_without_max_coded_width_height() {
-        // max_coded_width / max_coded_height を指定しない場合 (通常経路) は
+    fn test_decode_vp9_resolution_change_destroy_and_recreate() {
         // destroy + create で解像度変化に対応することを確認する
         let data = include_bytes!("../testdata/resolution-change/vp9.ivf");
         let frames = split_ivf_frames(data);
@@ -2003,8 +2000,7 @@ mod tests {
     }
 
     #[test]
-    fn test_decode_av1_resolution_change_without_max_coded_width_height() {
-        // max_coded_width / max_coded_height を指定しない場合 (通常経路) は
+    fn test_decode_av1_resolution_change_destroy_and_recreate() {
         // destroy + create で解像度変化に対応することを確認する
         let data = include_bytes!("../testdata/resolution-change/av1.ivf");
         let frames = split_ivf_frames(data);
