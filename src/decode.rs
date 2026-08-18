@@ -440,12 +440,17 @@ impl DecoderState {
         let right = format.display_area.right;
         let top = format.display_area.top;
         let bottom = format.display_area.bottom;
+        // NV12 は 2x2 のクロマサブサンプリングのため、原点 (left / top) が奇数だと
+        // UV プレーンのクロマの組・行がずれる。奇数はエラーにして、UV オフセットの整合を
+        // 保証する (実ストリームでは 2 画素単位の crop が多く、奇数は出にくい)。
+        let odd_origin = left % 2 != 0 || top % 2 != 0;
         if left < 0
             || top < 0
             || right <= left
             || bottom <= top
             || right as u32 > format.coded_width
             || bottom as u32 > format.coded_height
+            || odd_origin
         {
             return Err(Error::new_custom(
                 "handle_video_sequence",
@@ -560,6 +565,17 @@ impl DecoderState {
             let _unmap_guard = crate::ReleaseGuard::new(|| {
                 let _ = self.lib.cuvid_unmap_video_frame(self.decoder, device_ptr);
             });
+
+            // map 後の pitch を検証する
+            // pitch == 0 だと空プレーンと非ゼロ寸法が共存し、cuMemcpy2D が失敗する。
+            // pitch < width も cuMemcpy2D が失敗する (通常は pitch >= coded_width)。
+            // 失敗理由を CUDA ステータス任せにせず、自前エラーで分かりやすくする。
+            if pitch == 0 || (pitch as usize) < (self.width as usize) {
+                return Err(Error::new_custom(
+                    "handle_picture_display",
+                    "invalid pitch from cuvidMapVideoFrame",
+                ));
+            }
 
             // フレームサイズを計算 (NV12 形式: Y プレーン + UV プレーン)
             // 注意: NVDEC は高さを 2 でアライメントする
@@ -896,15 +912,16 @@ struct RawFrame {
 /// # 出力契約
 ///
 /// フレームの寸法と画素データは、その picture の表示領域 (display area) に一致する。
+/// 画素データは行矩形ではなく、各行が stride を持つバッファに格納される。
 ///
 /// - [`DecodedFrame::width`] / [`DecodedFrame::height`] は表示領域の寸法を返す
-/// - [`DecodedFrame::y_plane`] は表示領域の Y データだけを返す
-/// - [`DecodedFrame::uv_plane`] は表示領域の UV データだけを返す
-/// - [`DecodedFrame::y_stride`] / [`DecodedFrame::uv_stride`] が返す stride と各行の配置が一致する
-/// - coded サイズの padding や display area の crop が画素データに正しく反映される
+/// - Y データは各行の先頭 `width()` バイトで、全体は `y_stride() * height()` バイト
+/// - UV データは各行の先頭 `width()` バイトで、全体は `uv_stride() * height().div_ceil(2)` バイト
+/// - 画素へは `y_plane()[y * y_stride() + x]` のように stride を使ってアクセスする
+/// - coded サイズの padding は stride の余りとして扱い、`y_plane()` / `uv_plane()` には含まれる
 ///
-/// display area の原点 (left / top) が非ゼロの入力でも、上記の契約を満たす。
-/// コーデックや GPU / driver による実際の挙動は NVIDIA GPU 実機で確認する。
+/// display area の原点 (left / top) が非ゼロの場合の画素一致は NVIDIA GPU 実機未確認のため、
+/// この契約のうち非ゼロ原点での画素一致は検証待ちである。
 #[derive(Debug, Clone)]
 pub struct DecodedFrame<T> {
     width: u32,
