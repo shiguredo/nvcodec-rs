@@ -96,7 +96,7 @@ NV12 の UV プレーンは 2x2 のクロマサブサンプリングを使うた
 - Y プレーン: 表示領域の左上 (`top * pitch + left`) をコピー元として `pitch * height` バイトをコピー
 - UV プレーン: mapped output surface の UV 開始位置から `top / 2` 行目 * pitch + `left / 2` 列目をコピー元として `pitch * height.div_ceil(2)` バイトをコピー
 
-display area の原点が奇数オフセットの場合の UV オフセットの丸め挙動は、実機 (NVIDIA GPU) で確認する必要がある。
+display area の原点が奇数オフセットの場合、`DecoderState::handle_video_sequence` でエラーとして Decoder を終端させる実装にしたため、UV オフセットの丸め挙動の実機確認は不要になった (詳細は「実装で判明した事項」を参照)。
 
 ## テスト戦略
 
@@ -159,6 +159,8 @@ display area の原点が奇数オフセットの場合の UV オフセットの
 - 通常経路 (destroy + create) のリグレッションテストは追加済みだが、NVIDIA GPU 実機での実行が必要なため、この環境では実行検証できていない
 - 非ゼロ原点の `display_area` を持つ入力の生成は未達。H.264 / H.265 の SPS の frame cropping を bit 単位で加工する必要があり、SPS に `frame_cropping_flag` が存在しない場合、scaling list 等の多数のフィールドを正しくパースしてから位置を特定する必要があるため複雑で、誤ると decoder がエラーになる。また、この環境では NVIDIA GPU 実機がないため生成データのデコード検証もできない。このため非ゼロ原点の実機テストは残課題として扱い、後続対応とする
 - crop 処理は方式 2 (コピー元オフセット適用) を採用した。方式 1 (display area / target rect の設定) は NVDEC の実機挙動に依存するため見送った
+- display area の原点 (left / top) が奇数オフセットの入力は、`DecoderState::handle_video_sequence` でエラーとして Decoder を終端させる実装にした。奇数原点では NV12 の 2x2 クロマサブサンプリングでクロマの組・行がずれ、コピー元オフセットの整合を保証できないため。実ストリームでは 2 画素単位の crop が多く、奇数原点は出にくい
+- 一方、表示幅 (width) が奇数でも拒否しない。NV12 の UV 行バイト幅を `ceil(width/2)*2` として `handle_picture_display` でコピーすれば、行末のクロマ 1 組を拾えるため。コピー幅はヘルパー関数 `uv_row_bytes` で統一している
 
 ## 関連 issue
 
