@@ -1,7 +1,7 @@
 # 0034-bug-reject-10bit-decode
 
 - Created: 2026-08-18
-- Completed: {YYYY-MM-DD} (例: 2024-07-01)
+- Completed: 2026-08-18
 - Branch: feature/fix-reject-10bit-decode
 - Polished: {YYYY-MM-DD} (例: 2024-07-15)
 
@@ -31,3 +31,9 @@
 ## 解決方法
 
 - `src/decode.rs` の `handle_video_sequence` の検証に、`format.bit_depth_luma_minus8 != 0` のチェックを追加する
+- 10bit 以上の入力は既存の奇数原点の拒否と同様に fail-fast でエラーを返し、Decoder を終端させるようにした
+  - 検証は既存デコーダーの破棄より前に配置し、リソースを破棄せずに拒否する
+- エラーメッセージは `bit_depth_luma_minus8 must be 0 (only 8bit output is supported)` とした
+- GPU 実機の統合テスト `test_decode_h265_10bit_rejected` を追加した
+  - ffmpeg (libx265, pix_fmt=yuv420p10le) で生成した 10bit HEVC の VPS / SPS を入力し、`handle_video_sequence` がエラーを返して Decoder が終端することを確認する
+- `CHANGES.md` に [FIX] エントリを追記した
