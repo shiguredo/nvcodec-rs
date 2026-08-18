@@ -142,6 +142,11 @@ struct DecoderState {
     max_num_decode_surfaces: u32,
     width: u32,
     height: u32,
+    // display_area の原点 (left / top)。
+    // 非ゼロの場合、mapped output surface 上の表示領域はこの位置から始まるため、
+    // コピー元オフセットの計算に使う。
+    display_area_left: u32,
+    display_area_top: u32,
     surface_width: u32,
     surface_height: u32,
     surface_format: u32,
@@ -270,6 +275,8 @@ impl DecoderState {
                 max_num_decode_surfaces: config.max_num_decode_surfaces,
                 width: 0,
                 height: 0,
+                display_area_left: 0,
+                display_area_top: 0,
                 surface_width: 0,
                 surface_height: 0,
                 surface_format: config.surface_format.to_sys(),
@@ -485,6 +492,11 @@ impl DecoderState {
         self.stats.total_create_decoder_count.inc();
         self.width = (right - left) as u32;
         self.height = (bottom - top) as u32;
+        // display_area の原点を保持する。非ゼロの場合は mapped output surface 上の
+        // 表示領域がこの位置から始まるため、handle_picture_display でコピー元オフセットとして使う。
+        // 検証済みのため負値にはならない。
+        self.display_area_left = left as u32;
+        self.display_area_top = top as u32;
         self.surface_width = format.coded_width;
         self.surface_height = format.coded_height;
 
@@ -559,15 +571,30 @@ impl DecoderState {
             // フレーム用のホストメモリを割り当て
             let mut host_data = vec![0u8; frame_size];
 
+            // display_area の原点が非ゼロの場合、表示領域は mapped output surface の
+            // 左上ではなく display_area の位置から始まる。公開する寸法 (width / height) は
+            // 表示領域の寸法なので、コピー元も表示領域の左上に合わせる。
+            //
+            // Y プレーンのコピー元オフセットは、表示領域の top 行目 * pitch + left 列目。
+            // UV プレーンは NV12 の 2x2 クロマサブサンプリングのため、mapped output surface の
+            // UV 開始位置 (coded 高さを 2 でアラインした位置) から top / 2 行目 * pitch + left / 2 列目。
+            let y_src_offset =
+                self.display_area_top as usize * pitch as usize + self.display_area_left as usize;
+            let uv_src_offset = pitch as usize * aligned_height as usize
+                + (self.display_area_top as usize / 2) * pitch as usize
+                + (self.display_area_left as usize / 2);
+
             // Y プレーンをコピー
-            self.lib
-                .cu_memcpy_d_to_h(host_data.as_mut_ptr() as *mut c_void, device_ptr, y_size)?;
+            self.lib.cu_memcpy_d_to_h(
+                host_data.as_mut_ptr() as *mut c_void,
+                device_ptr + y_src_offset as u64,
+                y_size,
+            )?;
 
             // UV プレーンをコピー
-            let uv_offset = pitch as u64 * aligned_height as u64;
             self.lib.cu_memcpy_d_to_h(
                 host_data[y_size..].as_mut_ptr() as *mut c_void,
-                device_ptr + uv_offset,
+                device_ptr + uv_src_offset as u64,
                 uv_size,
             )?;
 
@@ -843,6 +870,19 @@ struct RawFrame {
 }
 
 /// デコードされた映像フレーム (NV12 形式)
+///
+/// # 出力契約
+///
+/// フレームの寸法と画素データは、その picture の表示領域 (display area) に一致する。
+///
+/// - [`DecodedFrame::width`] / [`DecodedFrame::height`] は表示領域の寸法を返す
+/// - [`DecodedFrame::y_plane`] は表示領域の Y データだけを返す
+/// - [`DecodedFrame::uv_plane`] は表示領域の UV データだけを返す
+/// - [`DecodedFrame::y_stride`] / [`DecodedFrame::uv_stride`] が返す stride と各行の配置が一致する
+/// - coded サイズの padding や display area の crop が画素データに正しく反映される
+///
+/// display area の原点 (left / top) が非ゼロの入力でも、上記の契約を満たす。
+/// コーデックや GPU / driver による実際の挙動は NVIDIA GPU 実機で確認する。
 #[derive(Debug, Clone)]
 pub struct DecodedFrame<T> {
     width: u32,
@@ -877,11 +917,15 @@ impl<T> DecodedFrame<T> {
     }
 
     /// フレームの幅を返す
+    ///
+    /// 表示領域 (display area) の幅を返す。coded サイズではなく、crop 後の表示寸法である。
     pub fn width(&self) -> usize {
         self.width as usize
     }
 
     /// フレームの高さを返す
+    ///
+    /// 表示領域 (display area) の高さを返す。coded サイズではなく、crop 後の表示寸法である。
     pub fn height(&self) -> usize {
         self.height as usize
     }
@@ -1685,5 +1729,247 @@ mod tests {
         assert_eq!(decoder.stats().in_flight_frames(), 0);
 
         drop(decoder);
+    }
+
+    /// Annex-B ストリームをアクセスユニット (フレーム) 単位に分割する
+    ///
+    /// NAL ユニットの開始コード (00 00 01 / 00 00 00 01) を検出し、
+    /// VCL NAL (スライス) の直前で区切ることで 1 フレーム = 1 アクセスユニットにする
+    /// (テスト用ストリームは 1 フレーム = 1 スライスのため)
+    fn split_annexb_frames(data: &[u8], is_vcl: fn(u8) -> bool) -> Vec<&[u8]> {
+        // NAL ユニットの開始位置を列挙する
+        // 4 バイト開始コード (00 00 00 01) は 3 バイト目も 3 バイト開始コード (00 00 01) に
+        // マッチするため、直前のバイトが 0 なら 4 バイト開始コードとして扱う
+        let mut nal_starts = Vec::new();
+        let mut i = 0;
+        while i + 3 < data.len() {
+            if data[i] == 0 && data[i + 1] == 0 && data[i + 2] == 1 {
+                if i > 0 && data[i - 1] == 0 {
+                    nal_starts.push(i - 1);
+                } else {
+                    nal_starts.push(i);
+                }
+                i += 3;
+            } else {
+                i += 1;
+            }
+        }
+        // VCL NAL の開始位置がアクセスユニットの境界になる
+        let vcl_starts: Vec<usize> = nal_starts
+            .iter()
+            .copied()
+            .filter(|&s| {
+                let header =
+                    if s + 4 < data.len() && data[s] == 0 && data[s + 1] == 0 && data[s + 2] == 0 {
+                        data[s + 4]
+                    } else {
+                        data[s + 3]
+                    };
+                is_vcl(header)
+            })
+            .collect();
+        let mut frames = Vec::new();
+        for (i, &start) in vcl_starts.iter().enumerate() {
+            // 先頭フレームには先行する非 VCL NAL (SEI / SPS / PPS / VPS など) が
+            // 含まれるため、ストリーム先頭から開始する
+            let start = if i == 0 { 0 } else { start };
+            let end = vcl_starts.get(i + 1).copied().unwrap_or(data.len());
+            frames.push(&data[start..end]);
+        }
+        frames
+    }
+
+    /// IVF コンテナをフレーム単位に分割する
+    ///
+    /// IVF のフレームヘッダ (サイズ 4 バイト + タイムスタンプ 8 バイト) を
+    /// 辿ってペイロード (1 フレーム = 1 ピクチャ) を取り出す
+    fn split_ivf_frames(data: &[u8]) -> Vec<&[u8]> {
+        // ヘッダ (32 バイト) を読み飛ばす
+        let mut offset = 32;
+        let mut frames = Vec::new();
+        while offset + 12 <= data.len() {
+            let size = u32::from_le_bytes(
+                data[offset..offset + 4]
+                    .try_into()
+                    .expect("決して失敗しないはず"),
+            ) as usize;
+            offset += 12;
+            frames.push(&data[offset..offset + size]);
+            offset += size;
+        }
+        frames
+    }
+
+    /// テストデータを 1 フレームずつデコードして、フレームとエラーを収集する
+    ///
+    /// 戻り値は (デコードされたフレーム, エラー, total_create_decoder_count)。
+    /// 通常の decoder 再作成 (destroy + create) 経路の検証に使う。
+    fn decode_resolution_change_data(
+        codec: DecoderCodec,
+        frames: &[&[u8]],
+    ) -> (Vec<DecodedFrame<()>>, Vec<Error>, u64) {
+        let config = test_decoder_config(codec);
+        let (tx, rx) = mpsc::channel();
+        let decoder = Decoder::new(
+            config,
+            FnDecodeHandler::new(move |frame| {
+                let _ = tx.send(frame);
+            }),
+        )
+        .expect("デコーダーの作成に失敗した");
+
+        for frame in frames {
+            // シーケンスコールバックのエラーは decode の戻り値にも伝播するが、
+            // 具体的な内容はハンドラ経由で通知されるため戻り値は確認しない
+            let _ = decoder.decode(frame, ());
+        }
+        let _ = decoder.flush();
+
+        // destroy + create 経路ではシーケンス変更ごとに cuvidCreateDecoder が呼ばれる
+        let create_count = decoder.stats().total_create_decoder_count.get();
+
+        // チャネルからフレームとエラーを回収する
+        let mut decoded_frames = Vec::new();
+        let mut errors = Vec::new();
+        loop {
+            match rx.try_recv() {
+                Ok(Ok(frame)) => decoded_frames.push(frame),
+                Ok(Err(e)) => errors.push(e),
+                Err(mpsc::TryRecvError::Empty | mpsc::TryRecvError::Disconnected) => break,
+            }
+        }
+        (decoded_frames, errors, create_count)
+    }
+
+    /// 通常の decoder 再作成 (destroy + create) 経路で 45 フレームすべてがデコードされることを確認する
+    ///
+    /// 320x240 x30 + 256x160 x15 の解像度変化ストリームを、シーケンス変更ごとの
+    /// decoder 再作成で欠落なくデコードできることを確認する。display_delay = 0 のため
+    /// シーケンス変更時に in-flight フレームが存在せず、フレームロスは発生しないことを期待する。
+    fn assert_resolution_change_frames_destroy_and_recreate(codec: DecoderCodec, frames: &[&[u8]]) {
+        let (decoded_frames, errors, create_count) = decode_resolution_change_data(codec, frames);
+
+        // エラーが 1 件も通知されないことを確認する
+        assert!(
+            errors.is_empty(),
+            "予期しないエラーが通知された: {errors:?}"
+        );
+
+        // destroy + create 経路では、シーケンス変更ごとに cuvidCreateDecoder が呼ばれる
+        assert!(
+            create_count >= 2,
+            "シーケンス変更ごとに cuvidCreateDecoder が呼ばれるはず (codec: {codec:?}): {create_count}"
+        );
+
+        // 全フレームがデコードされることを確認する
+        assert_eq!(
+            decoded_frames.len(),
+            frames.len(),
+            "全フレームがデコードされるはず (codec: {codec:?}): {}",
+            decoded_frames.len()
+        );
+
+        // 各フレームの寸法を検証する
+        let mut size_counts = std::collections::HashMap::new();
+        for frame in &decoded_frames {
+            size_counts
+                .entry((frame.width(), frame.height()))
+                .and_modify(|c| *c += 1)
+                .or_insert(1);
+        }
+        assert_eq!(size_counts.get(&(320, 240)), Some(&30), "codec: {codec:?}");
+        assert_eq!(size_counts.get(&(256, 160)), Some(&15), "codec: {codec:?}");
+        assert_eq!(size_counts.len(), 2, "codec: {codec:?}");
+    }
+
+    #[test]
+    fn test_split_annexb_frames_h264() {
+        // H.264 テストデータは 45 アクセスユニットに分割される
+        let data = include_bytes!("../testdata/resolution-change/h264.h264");
+        let frames = split_annexb_frames(data, |nal| (nal & 0x1f) == 1 || (nal & 0x1f) == 5);
+        assert_eq!(frames.len(), 45, "h264 フレーム数");
+
+        // 先頭フレームには SPS (NAL type 7) が含まれる
+        assert!(
+            frames[0]
+                .windows(4)
+                .any(|w| w[..3] == [0, 0, 1] && (w[3] & 0x1f) == 7),
+            "先頭フレームに SPS が含まれるはず"
+        );
+    }
+
+    #[test]
+    fn test_split_annexb_frames_h265() {
+        // H.265 テストデータは 45 アクセスユニットに分割される
+        let data = include_bytes!("../testdata/resolution-change/h265.h265");
+        let frames = split_annexb_frames(data, |nal| nal >> 1 <= 31);
+        assert_eq!(frames.len(), 45, "h265 フレーム数");
+
+        // 先頭フレームには VPS (NAL type 32) が含まれる
+        assert!(
+            frames[0].windows(4).any(|w| w == [0, 0, 1, 0x40]),
+            "先頭フレームに VPS が含まれるはず"
+        );
+    }
+
+    #[test]
+    fn test_split_ivf_frames() {
+        // IVF テストデータは 45 フレームに分割される
+        let vp8_data = include_bytes!("../testdata/resolution-change/vp8.ivf");
+        assert_eq!(split_ivf_frames(vp8_data).len(), 45, "vp8 フレーム数");
+        let vp9_data = include_bytes!("../testdata/resolution-change/vp9.ivf");
+        assert_eq!(split_ivf_frames(vp9_data).len(), 45, "vp9 フレーム数");
+        let av1_data = include_bytes!("../testdata/resolution-change/av1.ivf");
+        assert_eq!(split_ivf_frames(av1_data).len(), 45, "av1 フレーム数");
+    }
+
+    #[test]
+    fn test_decode_h264_resolution_change_without_max_coded_width_height() {
+        // max_coded_width / max_coded_height を指定しない場合 (通常経路) は
+        // destroy + create で解像度変化に対応することを確認する
+        let data = include_bytes!("../testdata/resolution-change/h264.h264");
+        let frames = split_annexb_frames(data, |nal| (nal & 0x1f) == 1 || (nal & 0x1f) == 5);
+        assert_eq!(frames.len(), 45, "h264 フレーム数");
+        assert_resolution_change_frames_destroy_and_recreate(DecoderCodec::H264, &frames);
+    }
+
+    #[test]
+    fn test_decode_h265_resolution_change_without_max_coded_width_height() {
+        // max_coded_width / max_coded_height を指定しない場合 (通常経路) は
+        // destroy + create で解像度変化に対応することを確認する
+        let data = include_bytes!("../testdata/resolution-change/h265.h265");
+        let frames = split_annexb_frames(data, |nal| nal >> 1 <= 31);
+        assert_eq!(frames.len(), 45, "h265 フレーム数");
+        assert_resolution_change_frames_destroy_and_recreate(DecoderCodec::Hevc, &frames);
+    }
+
+    #[test]
+    fn test_decode_vp8_resolution_change_without_max_coded_width_height() {
+        // max_coded_width / max_coded_height を指定しない場合 (通常経路) は
+        // destroy + create で解像度変化に対応することを確認する
+        let data = include_bytes!("../testdata/resolution-change/vp8.ivf");
+        let frames = split_ivf_frames(data);
+        assert_eq!(frames.len(), 45, "vp8 フレーム数");
+        assert_resolution_change_frames_destroy_and_recreate(DecoderCodec::Vp8, &frames);
+    }
+
+    #[test]
+    fn test_decode_vp9_resolution_change_without_max_coded_width_height() {
+        // max_coded_width / max_coded_height を指定しない場合 (通常経路) は
+        // destroy + create で解像度変化に対応することを確認する
+        let data = include_bytes!("../testdata/resolution-change/vp9.ivf");
+        let frames = split_ivf_frames(data);
+        assert_eq!(frames.len(), 45, "vp9 フレーム数");
+        assert_resolution_change_frames_destroy_and_recreate(DecoderCodec::Vp9, &frames);
+    }
+
+    #[test]
+    fn test_decode_av1_resolution_change_without_max_coded_width_height() {
+        // max_coded_width / max_coded_height を指定しない場合 (通常経路) は
+        // destroy + create で解像度変化に対応することを確認する
+        let data = include_bytes!("../testdata/resolution-change/av1.ivf");
+        let frames = split_ivf_frames(data);
+        assert_eq!(frames.len(), 45, "av1 フレーム数");
+        assert_resolution_change_frames_destroy_and_recreate(DecoderCodec::Av1, &frames);
     }
 }
