@@ -1,10 +1,12 @@
 # 0031-bug-fix-decoder-output-geometry
 
 - Created: 2026-08-17
-- Completed: {YYYY-MM-DD} (例: 2024-07-01)
+- Completed: 2026-08-18
 - Branch: feature/fix-decoder-output-geometry
 - Polished: 2026-08-17
 - Reporter: @sile
+
+**本 issue は実装が完了しました。** `DecodedFrame` の画素データを表示領域 (display area) に一致させ、出力契約を rustdoc / README / SKILL に明記した。非ゼロ原点の画素一致の実機テストは残課題として「実装で判明した事項」に記録し、後続対応とする。
 
 ## 目的
 
@@ -152,6 +154,14 @@ display area の原点が奇数オフセットの場合、`DecoderState::handle_
   - display area の left / top が非ゼロの場合に、公開する寸法とコピーする画素領域が一致するようにした
   - @sile
 ```
+
+### 実装内容
+
+`DecoderState` に表示領域の原点 (`display_area_left` / `display_area_top`) を保持し、`handle_picture_display` の NV12 コピーを `cuMemcpy2D` の行矩形コピーに変更して、表示領域の左上をコピー元にした。Y プレーンは各行 `width` バイト、UV プレーンはヘルパー関数 `uv_row_bytes` (= `ceil(width/2)*2`) バイトをコピーし、奇数幅の行末クロマ 1 組も拾う。
+
+pitch 検証は `left + uv_row_bytes <= pitch` に拡張し、cuMemcpy2D のソース矩形が行をはみ出す前に自前エラーで失敗させた。`DecodedFrame` の出力契約 (寸法・stride・Y/UV データは表示領域に一致) を rustdoc に明記し、README / SKILL にも反映した。`src/lib.rs` から不要になった `cu_memcpy_d_to_h` を削除した。
+
+テストは原点 0 の解像度変化ストリームによる再作成経路の回帰テスト (H.264 / H.265 / VP8 / VP9 / AV1) と、奇数幅 JPEG による UV 行バイト幅の回帰テストを追加した。いずれも NVIDIA GPU 実機での実行が必要である。
 
 ## 実装で判明した事項
 
