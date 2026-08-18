@@ -276,6 +276,8 @@ encoder.reconfigure(ReconfigureParams {
 
 `DecodedFrame` はフレームごとに `width()` / `height()` を持っているので、フレームごとにサイズを確認してください。
 
+フレームの寸法と画素データは、そのフレームの表示領域 (display area) に一致します。`width()` / `height()` は表示領域の寸法を返し、`y_plane()` / `uv_plane()` は表示領域に対応する Y / UV データだけを返します。表示領域の原点 (left / top) が非ゼロの入力 (フレームの crop) でも、この契約を満たします。
+
 ```rust
 // 解像度が変わっても同じデコーダーで継続可能
 let (tx, rx) = mpsc::sync_channel(4);

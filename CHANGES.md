@@ -11,6 +11,12 @@
 
 ## develop
 
+- [FIX] Decoder の display area と DecodedFrame の画素領域が一致しない問題を修正する
+  - display area の left / top が非ゼロの場合、公開する寸法は表示領域の寸法 (crop 後) なのに、画素データは mapped output surface の左上を起点にコピーされていた
+  - コピー元を表示領域の左上に合わせることで、`width()` / `height()` と Y / UV データを表示領域に一致させた
+  - `DecodedFrame` の出力契約 (寸法・stride・Y/UV データは表示領域に一致する) を rustdoc に明記した
+  - 通常の decoder 再作成経路のリグレッションテストを追加した
+  - @sile
 - [CHANGE] MSRV (rust-version) を 1.93 に上げる
   - @voluntas
 - [CHANGE] 一度デコードエラーが起きた Decoder インスタンスは使用不能にし、以降のデコードを行わないようにする
