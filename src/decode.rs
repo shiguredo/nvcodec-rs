@@ -568,35 +568,57 @@ impl DecoderState {
             let uv_size = pitch as usize * (self.height as usize).div_ceil(2);
             let frame_size = y_size + uv_size;
 
-            // フレーム用のホストメモリを割り当て
+            // フレーム用のホストメモリを割り当て (Y プレーン + UV プレーン、各プレーン内は pitch ストライド)
             let mut host_data = vec![0u8; frame_size];
 
             // display_area の原点が非ゼロの場合、表示領域は mapped output surface の
             // 左上ではなく display_area の位置から始まる。公開する寸法 (width / height) は
             // 表示領域の寸法なので、コピー元も表示領域の左上に合わせる。
             //
-            // Y プレーンのコピー元オフセットは、表示領域の top 行目 * pitch + left 列目。
-            // UV プレーンは NV12 の 2x2 クロマサブサンプリングのため、mapped output surface の
-            // UV 開始位置 (coded 高さを 2 でアラインした位置) から top / 2 行目 * pitch + left / 2 列目。
-            let y_src_offset =
-                self.display_area_top as usize * pitch as usize + self.display_area_left as usize;
-            let uv_src_offset = pitch as usize * aligned_height as usize
-                + (self.display_area_top as usize / 2) * pitch as usize
-                + (self.display_area_left as usize / 2);
+            // 1D 連続コピーだと、各行の行末パディングが次行や UV プレーンへ食い込む。
+            // 特に非ゼロ left かつ表示下端が coded いっぱい (bottom == aligned_height) のとき、
+            // Y コピーの末尾が UV プレーン開始位置を越えたり、UV コピーの末尾がマッピング外へ
+            // 伸びたりする。そこで cuMemcpy2D を使い、行矩形 (WidthInBytes だけ) を
+            // 表示領域の行数分だけコピーして、パディングを含めない。
+            //
+            // - Y プレーン: 表示領域の top 行目 * pitch + left 列目から、width バイト x height 行
+            // - UV プレーン: NV12 の 2x2 クロマサブサンプリングのため、mapped output surface の
+            //   UV 開始位置 (coded 高さを 2 でアラインした位置) から top / 2 行目、
+            //   left / 2 画素分 (left バイト) 進めた位置から、width バイト x height.div_ceil(2) 行
+            let width = self.width as usize;
+            let height = self.height as usize;
+            let y_src_y = self.display_area_top as usize;
+            let y_src_x = self.display_area_left as usize;
+            let uv_src_y = aligned_height as usize + (self.display_area_top as usize / 2);
+            let uv_src_x = self.display_area_left as usize; // left / 2 画素 x 2 バイト
 
             // Y プレーンをコピー
-            self.lib.cu_memcpy_d_to_h(
-                host_data.as_mut_ptr() as *mut c_void,
-                device_ptr + y_src_offset as u64,
-                y_size,
-            )?;
+            let mut y_copy: sys::CUDA_MEMCPY2D = std::mem::zeroed();
+            y_copy.srcMemoryType = sys::CUmemorytype_enum_CU_MEMORYTYPE_DEVICE;
+            y_copy.srcDevice = device_ptr;
+            y_copy.srcPitch = pitch as usize;
+            y_copy.srcY = y_src_y;
+            y_copy.srcXInBytes = y_src_x;
+            y_copy.dstMemoryType = sys::CUmemorytype_enum_CU_MEMORYTYPE_HOST;
+            y_copy.dstHost = host_data.as_mut_ptr() as *mut c_void;
+            y_copy.dstPitch = pitch as usize;
+            y_copy.WidthInBytes = width;
+            y_copy.Height = height;
+            self.lib.cu_memcpy_2d(&y_copy)?;
 
             // UV プレーンをコピー
-            self.lib.cu_memcpy_d_to_h(
-                host_data[y_size..].as_mut_ptr() as *mut c_void,
-                device_ptr + uv_src_offset as u64,
-                uv_size,
-            )?;
+            let mut uv_copy: sys::CUDA_MEMCPY2D = std::mem::zeroed();
+            uv_copy.srcMemoryType = sys::CUmemorytype_enum_CU_MEMORYTYPE_DEVICE;
+            uv_copy.srcDevice = device_ptr;
+            uv_copy.srcPitch = pitch as usize;
+            uv_copy.srcY = uv_src_y;
+            uv_copy.srcXInBytes = uv_src_x;
+            uv_copy.dstMemoryType = sys::CUmemorytype_enum_CU_MEMORYTYPE_HOST;
+            uv_copy.dstHost = host_data[y_size..].as_mut_ptr() as *mut c_void;
+            uv_copy.dstPitch = pitch as usize;
+            uv_copy.WidthInBytes = width;
+            uv_copy.Height = height.div_ceil(2);
+            self.lib.cu_memcpy_2d(&uv_copy)?;
 
             // デコード済みフレームを作成
             Ok(RawFrame {
