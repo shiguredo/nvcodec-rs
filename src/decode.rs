@@ -130,7 +130,7 @@ pub struct DecoderConfig {
     /// 出力サーフェスフォーマット (NVDEC: OutputFormat)
     ///
     /// 現在は [`SurfaceFormat::Nv12`] (8bit) のみ。10bit 以上の入力は
-    /// [`Decoder::decode`] 中に拒否され、Decoder は終端する。
+    /// [`Decoder::decode`] 中に拒否され、Decoder は終端状態に遷移する。
     pub surface_format: SurfaceFormat,
 }
 
@@ -1456,7 +1456,7 @@ mod tests {
     #[test]
     fn test_decode_h265_10bit_rejected() {
         // 10bit HEVC (bit_depth_luma_minus8 = 2) の入力が、handle_video_sequence の
-        // 検証で明示的エラーとして拒否され、Decoder が終端することを確認する。
+        // 検証で明示的エラーとして拒否され、Decoder が終端状態に遷移することを確認する。
         //
         // この VPS / SPS は ffmpeg (libx265, pix_fmt=yuv420p10le) で生成した 10bit HEVC の
         // VPS / SPS NAL を抽出したもので、bit_depth_luma_minus8 = 2 を含む。
@@ -1496,7 +1496,7 @@ mod tests {
         // フィニッシュ処理をテスト
         decoder.flush().expect("flush failed");
 
-        // 10bit 入力は拒否されるため、on_decoded に Err が渡される (Decoder は終端する)
+        // 10bit 入力は拒否されるため、on_decoded に Err が渡される (Decoder は終端状態に遷移する)
         let result = rx.recv().expect("No decoded result available");
 
         match result {
