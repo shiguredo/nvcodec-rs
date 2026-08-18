@@ -412,7 +412,7 @@ encoder.encode(&new_frame, &EncodeOptions {
 
 `DecodedFrame` はフレームごとに `width()` / `height()` を持つので、フレームごとにサイズを確認する。
 
-フレームの寸法と画素データは、そのフレームの表示領域 (display area) に一致する。`width()` / `height()` は表示領域の寸法を返す。画素データは行矩形ではなく各行が stride を持つバッファで、Y は各行の先頭 `width()` バイト (全体で `y_stride() * height()` バイト)、UV は各行の先頭 `width()` バイト (全体で `uv_stride() * height().div_ceil(2)` バイト) である。画素へは `y_plane()[y * y_stride() + x]` のように stride を使ってアクセスする。表示領域の原点 (left / top) が非ゼロの入力 (フレームの crop) での画素一致は NVIDIA GPU 実機未確認のため、検証待ちである。
+フレームの寸法と画素データは、そのフレームの表示領域 (display area) に一致する。`width()` / `height()` は表示領域の寸法を返す。画素データは行矩形ではなく各行が stride を持つバッファで、Y は各行の先頭 `width()` バイト (全体で `y_stride() * height()` バイト)、UV は各行の先頭 `width().div_ceil(2) * 2` バイト (全体で `uv_stride() * height().div_ceil(2)` バイト) である。Y の画素へは `y_plane()[y * y_stride() + x]`、UV のクロマへは `0..width().div_ceil(2)` の 2 バイト組、または行の先頭 `width().div_ceil(2) * 2` バイトでアクセスする。奇数幅 (width が奇数) では UV 行バイト幅が width + 1 になるため、x in 0..width で UV を走査してはいけない。表示領域の原点 (left / top) が非ゼロの入力 (フレームの crop) での画素一致は NVIDIA GPU 実機未確認のため、検証待ちである。
 
 ```rust
 decoder.decode(&data_1080p, 0)?;

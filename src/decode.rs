@@ -441,8 +441,11 @@ impl DecoderState {
         let top = format.display_area.top;
         let bottom = format.display_area.bottom;
         // NV12 は 2x2 のクロマサブサンプリングのため、原点 (left / top) が奇数だと
-        // UV プレーンのクロマの組・行がずれる。奇数はエラーにして、UV オフセットの整合を
+        // UV プレーンのクロマの組・行がずれる。奇数原点はエラーにして、UV オフセットの整合を
         // 保証する (実ストリームでは 2 画素単位の crop が多く、奇数は出にくい)。
+        //
+        // 一方、表示幅 (width) が奇数でも拒否しない。奇数幅では UV 行のバイト幅を
+        // ceil(width/2)*2 としてコピーすれば行末のクロマ 1 組を拾えるため (handle_picture_display 参照)。
         let odd_origin = left % 2 != 0 || top % 2 != 0;
         if left < 0
             || top < 0
@@ -566,11 +569,21 @@ impl DecoderState {
                 let _ = self.lib.cuvid_unmap_video_frame(self.decoder, device_ptr);
             });
 
+            // 表示領域の寸法と、NV12 の UV 行バイト幅を求める
+            let width = self.width as usize;
+            let height = self.height as usize;
+            let uv_row_bytes = uv_row_bytes(width);
+
             // map 後の pitch を検証する
             // pitch == 0 だと空プレーンと非ゼロ寸法が共存し、cuMemcpy2D が失敗する。
-            // pitch < width も cuMemcpy2D が失敗する (通常は pitch >= coded_width)。
+            // cuMemcpy2D のソース矩形は srcXInBytes + WidthInBytes <= srcPitch が必要で、
+            // UV では srcXInBytes = left、WidthInBytes = uv_row_bytes なので
+            // left + uv_row_bytes <= pitch を要する。これが崩れると行末のクロマが
+            // 行をはみ出して cuMemcpy2D が失敗する (通常は pitch >= coded_width で満たされる)。
             // 失敗理由を CUDA ステータス任せにせず、自前エラーで分かりやすくする。
-            if pitch == 0 || (pitch as usize) < (self.width as usize) {
+            // なお left + uv_row_bytes > pitch は、left >= 0 の下で pitch < uv_row_bytes を
+            // 包含し、uv_row_bytes >= width より Y コピー (left + width) も包含する。
+            if pitch == 0 || (self.display_area_left as usize) + uv_row_bytes > (pitch as usize) {
                 return Err(Error::new_custom(
                     "handle_picture_display",
                     "invalid pitch from cuvidMapVideoFrame",
@@ -580,8 +593,8 @@ impl DecoderState {
             // フレームサイズを計算 (NV12 形式: Y プレーン + UV プレーン)
             // 注意: NVDEC は高さを 2 でアライメントする
             let aligned_height = (self.surface_height + 1) & !1;
-            let y_size = pitch as usize * self.height as usize;
-            let uv_size = pitch as usize * (self.height as usize).div_ceil(2);
+            let y_size = pitch as usize * height;
+            let uv_size = pitch as usize * height.div_ceil(2);
             let frame_size = y_size + uv_size;
 
             // フレーム用のホストメモリを割り当て (Y プレーン + UV プレーン、各プレーン内は pitch ストライド)
@@ -592,17 +605,14 @@ impl DecoderState {
             // 表示領域の寸法なので、コピー元も表示領域の左上に合わせる。
             //
             // 1D 連続コピーだと、各行の行末パディングが次行や UV プレーンへ食い込む。
-            // 特に非ゼロ left かつ表示下端が coded いっぱい (bottom == aligned_height) のとき、
-            // Y コピーの末尾が UV プレーン開始位置を越えたり、UV コピーの末尾がマッピング外へ
-            // 伸びたりする。そこで cuMemcpy2D を使い、行矩形 (WidthInBytes だけ) を
-            // 表示領域の行数分だけコピーして、パディングを含めない。
+            // そこで cuMemcpy2D を使い、行矩形 (WidthInBytes だけ) を表示領域の行数分だけ
+            // コピーして、パディングを含めない。
             //
             // - Y プレーン: 表示領域の top 行目 * pitch + left 列目から、width バイト x height 行
             // - UV プレーン: NV12 の 2x2 クロマサブサンプリングのため、mapped output surface の
             //   UV 開始位置 (coded 高さを 2 でアラインした位置) から top / 2 行目、
-            //   left / 2 画素分 (left バイト) 進めた位置から、width バイト x height.div_ceil(2) 行
-            let width = self.width as usize;
-            let height = self.height as usize;
+            //   left / 2 画素分 (left バイト) 進めた位置から、uv_row_bytes バイト x height.div_ceil(2) 行。
+            //   uv_row_bytes は ceil(width/2)*2 で、奇数幅では width + 1 (行末のクロマ 1 組を拾う)。
             let y_src_y = self.display_area_top as usize;
             let y_src_x = self.display_area_left as usize;
             let uv_src_y = aligned_height as usize + (self.display_area_top as usize / 2);
@@ -632,7 +642,7 @@ impl DecoderState {
             uv_copy.dstMemoryType = sys::CUmemorytype_enum_CU_MEMORYTYPE_HOST;
             uv_copy.dstHost = host_data[y_size..].as_mut_ptr() as *mut c_void;
             uv_copy.dstPitch = pitch as usize;
-            uv_copy.WidthInBytes = width;
+            uv_copy.WidthInBytes = uv_row_bytes;
             uv_copy.Height = height.div_ceil(2);
             self.lib.cu_memcpy_2d(&uv_copy)?;
 
@@ -907,6 +917,15 @@ struct RawFrame {
     data: Vec<u8>,
 }
 
+/// NV12 の UV 行のバイト幅を返す
+///
+/// クロマサブサンプリング 2x2 で U/V インターリーブのため、luma width 画素に対し
+/// クロマサンプルは ceil(width/2) 個 (各 2 バイト) で、行バイト幅は ceil(width/2)*2。
+/// 偶数 width では width、奇数 width では width + 1 になる。
+fn uv_row_bytes(width: usize) -> usize {
+    width.div_ceil(2) * 2
+}
+
 /// デコードされた映像フレーム (NV12 形式)
 ///
 /// # 出力契約
@@ -916,8 +935,9 @@ struct RawFrame {
 ///
 /// - [`DecodedFrame::width`] / [`DecodedFrame::height`] は表示領域の寸法を返す
 /// - Y データは各行の先頭 `width()` バイトで、全体は `y_stride() * height()` バイト
-/// - UV データは各行の先頭 `width()` バイトで、全体は `uv_stride() * height().div_ceil(2)` バイト
-/// - 画素へは `y_plane()[y * y_stride() + x]` のように stride を使ってアクセスする
+/// - UV データは各行の先頭 `width().div_ceil(2) * 2` バイトで、全体は `uv_stride() * height().div_ceil(2)` バイト
+/// - 画素へは Y: `y_plane()[y * y_stride() + x]` (x in 0..width)、UV: クロマは `0..width().div_ceil(2)` の 2 バイト組、または行の先頭 `width().div_ceil(2) * 2` バイトを読む
+/// - 奇数幅 (width が奇数) では UV 行バイト幅が width + 1 になるため、利用側は x in 0..width で UV を走査してはならない
 /// - coded サイズの padding は stride の余りとして扱い、`y_plane()` / `uv_plane()` には含まれる
 ///
 /// display area の原点 (left / top) が非ゼロの場合の画素一致は NVIDIA GPU 実機未確認のため、
@@ -1235,7 +1255,7 @@ mod tests {
         );
 
         assert!(frame.y_stride() >= frame.width());
-        assert!(frame.uv_stride() >= frame.width());
+        assert!(frame.uv_stride() >= frame.width().div_ceil(2) * 2);
 
         let y_data = frame.y_plane();
         let uv_data = frame.uv_plane();
@@ -2006,5 +2026,79 @@ mod tests {
         let frames = split_ivf_frames(data);
         assert_eq!(frames.len(), 45, "av1 フレーム数");
         assert_resolution_change_frames_destroy_and_recreate(DecoderCodec::Av1, &frames);
+    }
+
+    #[test]
+    fn test_decode_jpeg_odd_width_uv_row_bytes() {
+        // 奇数幅の JPEG をデコードし、UV 行のオフセット width が 0 埋めではなく
+        // 最後のクロマの V であることを確認する (重要 4-1 の回帰テスト)
+        //
+        // 幅 65 (奇数) の単色 (赤) JPEG。奇数幅では NV12 の UV 行バイト幅が
+        // ceil(width/2)*2 = width + 1 になり、最後のクロマの V はオフセット width に置かれる。
+        // 修正前は WidthInBytes = width でコピーされるためオフセット width が 0 のまま
+        // 残っていたが、修正後は width + 1 バイトコピーされるため実クロマの V が入る。
+        // なお NVDEC の display が JPEG の SOF と厳密一致する保証はないため、
+        // 正確な寸法は要求せず、奇数幅であることだけを検証する。
+        let data = include_bytes!("../testdata/odd-width/red_65x65.jpg");
+
+        let config = test_decoder_config(DecoderCodec::Jpeg);
+        let (tx, rx) = mpsc::sync_channel::<Result<DecodedFrame<()>, Error>>(4);
+        let decoder = Decoder::new(
+            config,
+            FnDecodeHandler::new(move |frame| {
+                let _ = tx.send(frame);
+            }),
+        )
+        .expect("JPEG デコーダーの作成に失敗した");
+
+        decoder
+            .decode(data, ())
+            .expect("JPEG データのデコードに失敗した");
+        decoder.flush().expect("フラッシュに失敗した");
+
+        let frame = rx
+            .recv()
+            .expect("デコード済みフレームが得られなかった")
+            .expect("デコードエラーが発生した");
+
+        let width = frame.width();
+        // 奇数幅でなければ UV 行バイト幅が width になり、オフセット width は最後の V では
+        // ないためこのテストの前提が崩れる。奇数幅であることだけを検証する。
+        assert!(width % 2 == 1, "JPEG の表示幅が奇数であること: {width}");
+        // 高さが 0 だと UV 行ループが 0 回で素通りしてしまうため、下限だけ確認する
+        assert!(frame.height() > 0, "JPEG の表示高さが正であること");
+
+        // UV 行バイト幅は ceil(width/2)*2 であるべき
+        let uv_row_bytes = width.div_ceil(2) * 2;
+        assert!(
+            frame.uv_stride() >= uv_row_bytes,
+            "UV ストライドが UV 行バイト幅以上であること"
+        );
+
+        // 各 UV 行のオフセット width (奇数幅の最終クロマ V) が 0 埋めではなく実値であること
+        // を確認する。飽和赤の V は十分大きく、修正前の 0 埋め (0) と明確に区別できる。
+        let uv = frame.uv_plane();
+        let uv_stride = frame.uv_stride();
+        let uv_rows = frame.height().div_ceil(2);
+        for y in 0..uv_rows {
+            let row = y * uv_stride;
+            let last_v = uv[row + width];
+            assert!(
+                last_v > 100,
+                "UV 行 {} の最終クロマ V が 0 埋めになっている: {last_v}",
+                y
+            );
+        }
+
+        drop(decoder);
+    }
+
+    #[test]
+    fn test_uv_row_bytes() {
+        // NV12 の UV 行バイト幅は ceil(width/2)*2。偶数 width では width、奇数では width + 1
+        assert_eq!(uv_row_bytes(2), 2);
+        assert_eq!(uv_row_bytes(3), 4);
+        assert_eq!(uv_row_bytes(4), 4);
+        assert_eq!(uv_row_bytes(5), 6);
     }
 }
