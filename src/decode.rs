@@ -128,6 +128,9 @@ pub struct DecoderConfig {
     pub max_display_delay: u32,
 
     /// 出力サーフェスフォーマット (NVDEC: OutputFormat)
+    ///
+    /// 現在は [`SurfaceFormat::Nv12`] (8bit) のみ。10bit 以上の入力は
+    /// [`Decoder::decode`] 中に拒否され、Decoder は終端する。
     pub surface_format: SurfaceFormat,
 }
 
@@ -423,7 +426,8 @@ impl DecoderState {
     /// シーケンスコールバック処理 (pfnSequenceCallback から呼ばれる)
     ///
     /// 既存デコーダーがあれば破棄し、現在のシーケンスのフォーマットで再作成する。
-    /// また、表示領域の検証と width / height / surface サイズの更新を行う。
+    /// また、表示領域と輝度ビット深度 (8bit 以外は拒否) の検証、
+    /// width / height / surface サイズの更新を行う。
     /// 成功時はデコードサーフェス数を返し、失敗時は `Err` を返す。
     /// 戻り値のデコードサーフェス数は extern "C" ラッパー経由で parser へ渡され、
     /// parser はこの値で `CUVIDPICPARAMS.CurrPicIdx` を割り当てる。
@@ -460,12 +464,9 @@ impl DecoderState {
                 "invalid display_area in video format",
             ));
         }
-        // 出力サーフェスは 8bit NV12 のみ対応のため、10bit 以上の入力
-        // (bit_depth_luma_minus8 != 0) は受け付けない。
-        // 10bit 入力だと出力サーフェスは P010 相当 (各サンプル 2 バイト) になる一方、
-        // handle_picture_display のコピー処理は 8bit 前提 (1 画素 1 バイト) で実装されており、
-        // Y / UV のバイト幅計算が崩れて不正な画素データになる。そのため明示的に拒否する。
-        // 10bit 対応 (P016 等) は出力フォーマットの拡張を伴うため本関数では扱わない。
+        // 出力サーフェスとコピー処理は 8bit NV12 前提 (1 画素 1 バイト) のため、
+        // bit_depth_luma_minus8 != 0 の入力は受け付けない。
+        // 10bit 以上を通すと Y / UV のバイト幅計算が崩れて不正な画素データになる。
         if format.bit_depth_luma_minus8 != 0 {
             return Err(Error::new_custom(
                 "handle_video_sequence",
@@ -753,6 +754,9 @@ where
 ///
 /// 内部で専用のワーカースレッドを起動し、非同期でデコードを行う。
 /// デコードが完了すると、コンストラクタで渡したハンドラがワーカースレッド上で即座に呼び出される。
+///
+/// 出力は 8bit NV12 のみ対応する。10bit 以上の入力はデコードせず、
+/// [`DecodeHandler::on_decoded`] に明示的な `Err` を渡して終端する。
 ///
 /// このインスタンスは一度 [`DecodeHandler::on_decoded`] に `Err` を渡した時点で終端状態になる。
 /// 終端状態とは、それ以降はデコードせず、送信されたデータに対して終端を表す `Err` を
@@ -1453,10 +1457,6 @@ mod tests {
     fn test_decode_h265_10bit_rejected() {
         // 10bit HEVC (bit_depth_luma_minus8 = 2) の入力が、handle_video_sequence の
         // 検証で明示的エラーとして拒否され、Decoder が終端することを確認する。
-        //
-        // 出力サーフェスは 8bit NV12 のみ対応のため、10bit 入力は P010 相当の
-        // 出力サーフェスになり、コピー処理 (8bit 前提) と整合しない。
-        // そのため、デコードを開始せずに fail-fast で拒否する。
         //
         // この VPS / SPS は ffmpeg (libx265, pix_fmt=yuv420p10le) で生成した 10bit HEVC の
         // VPS / SPS NAL を抽出したもので、bit_depth_luma_minus8 = 2 を含む。

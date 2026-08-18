@@ -39,10 +39,8 @@
   - `DecoderConfig.max_num_decode_surfaces` に 0 を指定すると `Decoder::new` が設定エラーとして拒否するようになった (従来は受け付けていた)
   - `min_num_decode_surfaces` が上限を超える場合は、`decode()` 中の sequence callback で既存 decoder を破棄する前にエラーが返るようになった
   - @sile
-- [FIX] 10bit 以上の入力をデコード不可として Decoder を終端させるようになる
+- [FIX] 10bit 以上の入力をデコード不可として Decoder を終端させる
   - 出力サーフェスは 8bit NV12 のみ対応なのに 10bit ストリーム (`bit_depth_luma_minus8 != 0`) を拒否しておらず、10bit 入力で Y / UV のバイト幅計算が崩れて不正な画素データが返っていた
-  - `handle_video_sequence` で `bit_depth_luma_minus8 != 0` を検証し、該当する入力は明示的なエラーで Decoder を終端させるようにした
-  - 本変更では 10bit 対応 (P016 等) は出力フォーマットの拡張を伴うため扱わない
   - @sile
 
 ### misc
