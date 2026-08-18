@@ -412,7 +412,7 @@ encoder.encode(&new_frame, &EncodeOptions {
 
 `DecodedFrame` はフレームごとに `width()` / `height()` を持つので、フレームごとにサイズを確認する。
 
-フレームの寸法と画素データは、そのフレームの表示領域 (display area) に一致する。`width()` / `height()` は表示領域の寸法を返し、`y_plane()` / `uv_plane()` は表示領域に対応する Y / UV データだけを返す。表示領域の原点 (left / top) が非ゼロの入力 (フレームの crop) でもこの契約を満たす。
+フレームの寸法と画素データは、そのフレームの表示領域 (display area) に一致する。`width()` / `height()` は表示領域の寸法を返す。画素データは行矩形ではなく各行が stride を持つバッファで、Y は各行の先頭 `width()` バイト (全体で `y_stride() * height()` バイト)、UV は各行の先頭 `width()` バイト (全体で `uv_stride() * height().div_ceil(2)` バイト) である。画素へは `y_plane()[y * y_stride() + x]` のように stride を使ってアクセスする。表示領域の原点 (left / top) が非ゼロの入力 (フレームの crop) での画素一致は NVIDIA GPU 実機未確認のため、検証待ちである。
 
 ```rust
 decoder.decode(&data_1080p, 0)?;

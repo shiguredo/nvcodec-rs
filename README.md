@@ -276,7 +276,7 @@ encoder.reconfigure(ReconfigureParams {
 
 `DecodedFrame` はフレームごとに `width()` / `height()` を持っているので、フレームごとにサイズを確認してください。
 
-フレームの寸法と画素データは、そのフレームの表示領域 (display area) に一致します。`width()` / `height()` は表示領域の寸法を返し、`y_plane()` / `uv_plane()` は表示領域に対応する Y / UV データだけを返します。表示領域の原点 (left / top) が非ゼロの入力 (フレームの crop) でも、この契約を満たします。
+フレームの寸法と画素データは、そのフレームの表示領域 (display area) に一致します。`width()` / `height()` は表示領域の寸法を返します。画素データは行矩形ではなく各行が stride を持つバッファで、Y は各行の先頭 `width()` バイト (全体で `y_stride() * height()` バイト)、UV は各行の先頭 `width()` バイト (全体で `uv_stride() * height().div_ceil(2)` バイト) です。画素へは `y_plane()[y * y_stride() + x]` のように stride を使ってアクセスしてください。表示領域の原点 (left / top) が非ゼロの入力 (フレームの crop) での画素一致は NVIDIA GPU 実機未確認のため、検証待ちです。
 
 ```rust
 // 解像度が変わっても同じデコーダーで継続可能

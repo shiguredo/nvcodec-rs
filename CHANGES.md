@@ -11,12 +11,6 @@
 
 ## develop
 
-- [FIX] Decoder の display area と DecodedFrame の画素領域が一致しない問題を修正する
-  - display area の left / top が非ゼロの場合、公開する寸法は表示領域の寸法 (crop 後) なのに、画素データは mapped output surface の左上を起点にコピーされていた
-  - コピー元を表示領域の左上に合わせることで、`width()` / `height()` と Y / UV データを表示領域に一致させた
-  - `DecodedFrame` の出力契約 (寸法・stride・Y/UV データは表示領域に一致する) を rustdoc に明記した
-  - 通常の decoder 再作成経路のリグレッションテストを追加した
-  - @sile
 - [CHANGE] MSRV (rust-version) を 1.93 に上げる
   - @voluntas
 - [CHANGE] 一度デコードエラーが起きた Decoder インスタンスは使用不能にし、以降のデコードを行わないようにする
@@ -25,6 +19,13 @@
   - エラー発生後の Decoder インスタンスが復旧することはないので、必要なら利用側で Decoder インスタンスを作り直すこと
   - @sile
 - [ADD] Decoder::stats() / Encoder::stats() で内部状態 (counter / gauge) を取得できるようにする
+  - @sile
+- [FIX] Decoder の display area と DecodedFrame の画素領域が一致しない問題を修正する
+  - display area の left / top が非ゼロの場合、公開する寸法は表示領域の寸法 (crop 後) なのに、画素データは mapped output surface の左上を起点にコピーされていた
+  - コピー元を表示領域の左上に合わせることで、`width()` / `height()` と Y / UV データを表示領域に一致させた
+  - `DecodedFrame` の出力契約 (寸法・stride・Y/UV データは表示領域に一致する) を rustdoc に明記した
+  - 原点 0 の解像度変化ストリームによる再作成経路の回帰テストを追加した
+  - 非ゼロ原点 (left / top が非ゼロ) の画素一致は NVIDIA GPU 実機未確認のため、検証待ち
   - @sile
 - [FIX] Decoder の parser DPB と内部 decode surface の数が一致しない場合がある問題を修正する
   - decode surface はデコード済みフレームを一時的に格納する GPU 上のバッファで、参照フレームを保持するために複数必要。その数のことをデコードサーフェス数と呼ぶ
