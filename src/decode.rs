@@ -1934,6 +1934,17 @@ mod tests {
         frames: &[&[u8]],
     ) -> (Vec<DecodedFrame<()>>, Vec<Error>, u64) {
         let config = test_decoder_config(codec);
+        decode_resolution_change_data_with_config(config, frames)
+    }
+
+    /// 指定された config でテストデータを 1 フレームずつデコードして、フレームとエラーを収集する
+    ///
+    /// 戻り値は `decode_resolution_change_data` と同じ。
+    /// `max_display_delay > 0` の B フレーム入力検証に使う。
+    fn decode_resolution_change_data_with_config(
+        config: DecoderConfig,
+        frames: &[&[u8]],
+    ) -> (Vec<DecodedFrame<()>>, Vec<Error>, u64) {
         let (tx, rx) = mpsc::channel();
         let decoder = Decoder::new(
             config,
@@ -2008,6 +2019,61 @@ mod tests {
         assert_eq!(size_counts.len(), 2, "codec: {codec:?}");
     }
 
+    /// B フレーム入力を `max_display_delay > 0` でデコードし、遅延フレームを伴う sequence 変更で
+    /// 旧 sequence の display 待ち picture に新ジオメトリを誤適用しないことを検証する
+    ///
+    /// issue 0033 の実機検証テスト。`max_display_delay > 0` かつ B フレームを含む
+    /// H.264 / H.265 の解像度変化ストリームをデコードし、以下を確認する。
+    /// - 全フレームが出力される (フレーム欠落なし)
+    /// - エラーが通知されない
+    /// - 各出力フレームの寸法が、そのフレームの元の sequence と一致する (新ジオメトリ誤適用なし)
+    ///
+    /// 実機 (NVIDIA GPU) で実行される CI テストとして、sequence callback 後の旧 sequence の
+    /// display 待ち picture の有無と、誤適用の有無を検証する。
+    fn assert_resolution_change_frames_with_display_delay(
+        codec: DecoderCodec,
+        display_delay: u32,
+        frames: &[&[u8]],
+    ) {
+        // 基準となる max_display_delay = 0 の設定を作り、display_delay だけ上書きする
+        let mut config = test_decoder_config(codec);
+        config.max_display_delay = display_delay;
+        let (decoded_frames, errors, create_count) =
+            decode_resolution_change_data_with_config(config, frames);
+
+        // エラーが 1 件も通知されないことを確認する
+        assert!(
+            errors.is_empty(),
+            "予期しないエラーが通知された (codec: {codec:?}): {errors:?}"
+        );
+
+        // destroy + create 経路では、シーケンス変更ごとに cuvidCreateDecoder が呼ばれる
+        assert!(
+            create_count >= 2,
+            "シーケンス変更ごとに cuvidCreateDecoder が呼ばれるはず (codec: {codec:?}): {create_count}"
+        );
+
+        // 全フレームがデコードされることを確認する
+        assert_eq!(
+            decoded_frames.len(),
+            frames.len(),
+            "遅延フレームを含む全フレームがデコードされるはず (codec: {codec:?}): {}",
+            decoded_frames.len()
+        );
+
+        // 各フレームの寸法を検証する
+        let mut size_counts = std::collections::HashMap::new();
+        for frame in &decoded_frames {
+            size_counts
+                .entry((frame.width(), frame.height()))
+                .and_modify(|c| *c += 1)
+                .or_insert(1);
+        }
+        assert_eq!(size_counts.get(&(320, 240)), Some(&30), "codec: {codec:?}");
+        assert_eq!(size_counts.get(&(256, 160)), Some(&15), "codec: {codec:?}");
+        assert_eq!(size_counts.len(), 2, "codec: {codec:?}");
+    }
+
     #[test]
     fn test_split_annexb_frames_h264() {
         // H.264 テストデータは 45 アクセスユニットに分割される
@@ -2039,6 +2105,22 @@ mod tests {
     }
 
     #[test]
+    fn test_split_annexb_frames_h264_bframes() {
+        // B フレームを含む H.264 テストデータも 45 アクセスユニットに分割される
+        let data = include_bytes!("../testdata/resolution-change/h264_bframes.h264");
+        let frames = split_annexb_frames(data, |nal| (nal & 0x1f) == 1 || (nal & 0x1f) == 5);
+        assert_eq!(frames.len(), 45, "h264 B フレームデータのフレーム数");
+    }
+
+    #[test]
+    fn test_split_annexb_frames_h265_bframes() {
+        // B フレームを含む H.265 テストデータも 45 アクセスユニットに分割される
+        let data = include_bytes!("../testdata/resolution-change/h265_bframes.h265");
+        let frames = split_annexb_frames(data, |nal| nal >> 1 <= 31);
+        assert_eq!(frames.len(), 45, "h265 B フレームデータのフレーム数");
+    }
+
+    #[test]
     fn test_split_ivf_frames() {
         // IVF テストデータは 45 フレームに分割される
         let vp8_data = include_bytes!("../testdata/resolution-change/vp8.ivf");
@@ -2065,6 +2147,28 @@ mod tests {
         let frames = split_annexb_frames(data, |nal| nal >> 1 <= 31);
         assert_eq!(frames.len(), 45, "h265 フレーム数");
         assert_resolution_change_frames_destroy_and_recreate(DecoderCodec::Hevc, &frames);
+    }
+
+    #[test]
+    fn test_decode_h264_resolution_change_with_display_delay() {
+        // B フレームを含む H.264 解像度変化ストリームを max_display_delay > 0 でデコードする
+        // (issue 0033 の実機検証: 遅延フレームを伴う sequence 変更で旧 picture に新ジオメトリを
+        //  誤適用しないこと)
+        let data = include_bytes!("../testdata/resolution-change/h264_bframes.h264");
+        let frames = split_annexb_frames(data, |nal| (nal & 0x1f) == 1 || (nal & 0x1f) == 5);
+        assert_eq!(frames.len(), 45, "h264 B フレームデータのフレーム数");
+        assert_resolution_change_frames_with_display_delay(DecoderCodec::H264, 2, &frames);
+    }
+
+    #[test]
+    fn test_decode_h265_resolution_change_with_display_delay() {
+        // B フレームを含む H.265 解像度変化ストリームを max_display_delay > 0 でデコードする
+        // (issue 0033 の実機検証: 遅延フレームを伴う sequence 変更で旧 picture に新ジオメトリを
+        //  誤適用しないこと)
+        let data = include_bytes!("../testdata/resolution-change/h265_bframes.h265");
+        let frames = split_annexb_frames(data, |nal| nal >> 1 <= 31);
+        assert_eq!(frames.len(), 45, "h265 B フレームデータのフレーム数");
+        assert_resolution_change_frames_with_display_delay(DecoderCodec::Hevc, 2, &frames);
     }
 
     #[test]
