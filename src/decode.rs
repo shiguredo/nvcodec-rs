@@ -2072,6 +2072,35 @@ mod tests {
         assert_eq!(size_counts.get(&(320, 240)), Some(&30), "codec: {codec:?}");
         assert_eq!(size_counts.get(&(256, 160)), Some(&15), "codec: {codec:?}");
         assert_eq!(size_counts.len(), 2, "codec: {codec:?}");
+
+        // 寸法の遷移順序を検証する (旧 sequence の display 待ち picture への誤適用検出)
+        //
+        // このストリームは 320x240 → 256x160 → 320x240 の 3 セグメント構成であり、
+        // NVDEC は表示順 (PTS 順) でフレームを出力する。遅延フレーム (B フレーム) の
+        // display 待ち picture が旧 sequence に残る場合、寸法の遷移は期待順序
+        // (320x240 → 256x160 → 320x240) から逸脱し得る。ここでは寸法が変わる境界の
+        // 回数と順序を検証し、旧 picture への新ジオメトリ誤適用がないことを確認する。
+        let dims: Vec<(usize, usize)> = decoded_frames
+            .iter()
+            .map(|f| (f.width(), f.height()))
+            .collect();
+        // 遷移境界 (寸法が変わる位置) を列挙する
+        let boundaries: Vec<usize> = (1..dims.len())
+            .filter(|&i| dims[i] != dims[i - 1])
+            .collect();
+        // 3 セグメント構成なので寸法遷移はちょうど 2 回
+        assert_eq!(
+            boundaries.len(),
+            2,
+            "寸法遷移は 2 回だけであること (codec: {codec:?}): dims={dims:?}"
+        );
+        // 遷移は 320x240 → 256x160 と 256x160 → 320x240 の順
+        let b0 = boundaries[0];
+        let b1 = boundaries[1];
+        assert_eq!(dims[b0 - 1], (320, 240), "codec: {codec:?}");
+        assert_eq!(dims[b0], (256, 160), "codec: {codec:?}");
+        assert_eq!(dims[b1 - 1], (256, 160), "codec: {codec:?}");
+        assert_eq!(dims[b1], (320, 240), "codec: {codec:?}");
     }
 
     #[test]
