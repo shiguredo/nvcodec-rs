@@ -2,7 +2,7 @@
 
 - Created: 2026-08-05
 - Branch: feature/change-decoder-reconfigure-with-max-coded-size
-- Updated: 2026-08-14
+- Updated: 2026-08-19
 
 ## 目的
 
@@ -94,9 +94,9 @@ decoder 再作成は既存の destroy + create 経路を利用する。`cuvidCre
 
 ### 出力ジオメトリ契約との依存関係
 
-issue 0031 は、develop ブランチに既に存在する display area の不整合を修正し、`DecodedFrame` の寸法、stride、Y / UV データに関する出力契約を確定する。
+issue 0031 は、develop ブランチの display area の不整合を修正し、`DecodedFrame` の寸法、stride、Y / UV データに関する出力契約を確定した (PR #22)。
 
-issue 0031 は reconfigure 実装に依存せず、develop ブランチの decoder 再作成経路だけで完了できるようにする。
+issue 0031 は reconfigure 実装に依存せず、develop ブランチの decoder 再作成経路だけで完了した。
 
 本 issue は、issue 0031 で確定した出力契約を reconfigure 経路へ適用する責務を持つ。
 
@@ -156,7 +156,6 @@ reconfigure 経路の出力が正しく、再作成を減らす効果を実測�
 - 安全な再作成フォールバックを採用できない場合は、常時 reconfigure を採用せず、reconfigure を選択した経路の終端条件が公開 API と文書に明記されている
 - `format.display_area` などの事前検証に失敗した場合は、既存 decoder が破棄されない
 - `DecoderStats::total_create_decoder_count` / `total_reconfigure_decoder_count` / `total_reconfigure_failure_count` が各経路を正しく反映する
-- issue 0031 で `DecodedFrame` の出力契約と develop ブランチの実装が確定している
 - reconfigure 経路で、作成時 target surface と現在の sequence のジオメトリが区別して管理されている
 - reconfigure 前後の寸法、stride、Y / UV データがパターン映像で検証され、issue 0031 の出力契約と一致している
 - reconfigure で出力契約を維持できない条件が、decoder 再作成へフォールバックする条件として明文化されている
@@ -191,7 +190,7 @@ reconfigure 経路の出力が正しく、再作成を減らす効果を実測�
 ## 実装で判明した事項
 
 - `query_decoder_caps` で得られる codec ごとの hardware 最小デコード解像度を下回るテストデータでは、sequence callback、decoder 作成、reconfigure が成功しても、`cuvidDecodePicture` が `CUDA_ERROR_INVALID_VALUE` を返す。テストデータは全対象 codec の最小値を上回る 256x160 以上を使用する
-- parser の DPB 数と decoder の decode surface 数の同期は 0028 で先に修正する。本 issue の create / reconfigure 経路は、0028 で確定した実効 surface 数を使用する
+- parser の DPB 数と decoder の decode surface 数の同期は 0028 で修正済み。本 issue の create / reconfigure 経路は、develop に実装済みの実効 surface 数決定処理 (`DecoderState::determine_num_decode_surfaces`) を使用する
 - max coded サイズ超過を終端エラーにしなくなるため、0029 から後回しになっていた終端契約テストの安定したエラー誘発手段としては使用できない。終端契約テストは本 issue のスコープに含めない
 
 ## 関連 issue
@@ -199,6 +198,7 @@ reconfigure 経路の出力が正しく、再作成を減らす効果を実測�
 - 0006 (closed): 解像度変更ごとに decoder を再作成する現在の方式を導入した。本 issue は再作成経路をフォールバックとして残す
 - 0017 (pending): destroy-then-create 順序による復旧不能問題。「display_area 検証位置」は本 issue で解消するが、再作成経路自体は残るため、destroy-then-create 順序の問題は残る
 - 0027 (closed): `DecoderStats` を追加した。本 issue は既存の create / reconfigure / failure カウンターで各経路を検証する
-- 0028 (open): parser の DPB 数と decoder の decode surface 数を同期する。本 issue の reconfigure 経路は、その決定処理を利用する
+- 0028 (closed): parser の DPB 数と decoder の decode surface 数を同期した。本 issue の create / reconfigure 経路は、develop に実装済みの実効 surface 数決定処理 (`DecoderState::determine_num_decode_surfaces`) を使用する
 - 0029 (closed): デコードエラー後の `Decoder` を終端状態にした。本 issue の再作成フォールバックまで失敗した場合は、この終端契約に従う
-- 0031 (open): develop ブランチの display area の不整合を修正し、`DecodedFrame` の出力契約を確定する。本 issue は、その契約を reconfigure 経路へ適用する
+- 0031 (closed): develop ブランチの display area の不整合を修正し、`DecodedFrame` の出力契約を確定した。本 issue は、その契約を reconfigure 経路へ適用する
+- 0033 (closed): 遅延フレームを伴う sequence 変更で、destroy + create 経路では利用者に見える誤適用が観測されなかった。decoder を残す reconfigure 経路での待ち picture 混在は、本 issue の公開設定判断チェックポイントで再検証する
