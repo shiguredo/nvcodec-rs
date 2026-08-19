@@ -26,14 +26,17 @@ decoder は既に sequence callback で coded サイズを取得でき、上限�
 
 `DecoderConfig` に `max_coded_width` / `max_coded_height` は追加しない。SDK が要求する decoder session ごとの上限は crate 内部で管理する。
 
-reconfigure の有効・無効フラグまたは動作モードを追加するかどうかは、この時点では決定しない。reconfigure 方式の正しさ、復旧可能性、resource 使用量、実測効果を確認した後に判断する。
+### reconfigure の利用を選べる公開設定を追加する
 
-判断対象となる方式は次の 2 つとする。
+`DecoderConfig` に `reconfigure_enabled: bool` を追加し、利用側が「reconfigure を可能なら使用する」と「常に decoder を再作成する従来方式」を選択できるようにする。
 
-- 公開設定を追加せず、適用条件を満たす場合は常に reconfigure を試みる
-- `DecoderConfig` に公開設定を追加し、reconfigure を可能なら使用する方式と、常に decoder を再作成する従来方式を利用側が選択できるようにする
+- `false` (推奨値) は従来方式で、シーケンス変更ごとに decoder を破棄して再作成する
+- `true` は、現在の decoder session の上限以内の解像度変化を `cuvidReconfigureDecoder` で処理し、上限を超える拡大やコーデック情報の変化は再作成する
+- 後方互換のため、デフォルト相当は従来方式 (`false`) とする。公開フィールドの追加は既存の struct literal を壊すため後方互換のない変更として扱う
 
-後者を採用する場合も、利用側に最大 coded サイズは要求しない。公開設定は reconfigure の利用方針だけを表し、session 上限の管理と上限超過時の再作成は crate が行う。bool と enum のどちらにするか、既定相当の扱いをどうするかも、同じ判断時点で決定する。
+公開設定は reconfigure の利用方針だけを表し、session 上限の管理と上限超過時の再作成は crate が行う。利用側に最大 coded サイズは要求しない。
+
+`reconfigure_enabled == true` は `max_display_delay > 0` と組み合わせられない。reconfigure は decoder を残すため、表示遅延中の旧 sequence の picture が新しいジオメトリでコピーされる可能性がある。この組み合わせは `Decoder::new` が設定エラーとして拒否する。`reconfigure_enabled == false` (従来方式) では delay の制約はない。
 
 ### decoder session ごとの coded サイズ上限
 
@@ -123,33 +126,28 @@ reconfigure で issue 0031 の出力契約を維持できない条件は、decod
 
 黒一色のテストデータではコピー元の不一致を検出できないため、issue 0031 で用意したパターン映像を使用し、既知の座標にある Y / U / V の値まで検証する。
 
-### 公開設定の判断チェックポイント
+### reconfigure の実装・検証項目
 
-reconfigure 経路と reconfigure 固有の出力ジオメトリ処理の実装・調査後に、次の観点を確認する。
+公開設定 (`reconfigure_enabled`) を追加し、デフォルトは従来方式 (`false`) とすることで、利用側の選択肢を公開する方針に決定した。reconfigure 経路の実装・調査で次の観点を確認する。
 
 - reconfigure 失敗後に decoder を安全に破棄し、現在の sequence から再作成して継続できるか
 - 解像度変更前後で `DecodedFrame` の寸法、stride、Y / UV のコピー位置と内容が正しいか
-- `max_display_delay > 0` や B フレームを含む入力で、旧 sequence の遅延フレームと新しいジオメトリが混在しないか
+- `max_display_delay > 0` との組み合わせは `Decoder::new` で拒否する (reconfigure は decoder を残すため、表示遅延中の旧 sequence の picture が新ジオメトリでコピーされる可能性がある)
 - 縮小後も大きい session 上限を保持することで、同時 decoder 数や GPU メモリ消費へ許容できない影響が出ないか
 - 対象 codec と CI / 利用環境の GPU・driver の組み合わせで、reconfigure 固有の失敗や出力差が発生しないか
 - destroy + create と比較して、reconfigure に採用する価値がある処理時間・latency の改善を確認できるか
 
-reconfigure 経路の出力が正しく、再作成を減らす効果を実測できることは、reconfigure 方式を採用するための前提条件とする。いずれかを確認できない状態では、公開設定の有無を決定せず、本 issue を完了させない。
-
-この前提条件を満たしたうえで、以下をすべて満たす場合は、reconfigure と再作成の選択を crate 内部へ閉じ、公開設定を追加しない。
-
-- reconfigure 失敗時に従来方式へ安全にフォールバックできる
-- resource 使用量と対応環境の差が許容範囲内である
-
-前提条件は満たすが、これらのリスクを crate 内部だけでは十分に吸収できない場合、または対応環境によって結果が分かれる場合は、利用側が「可能なら reconfigure」と「常に再作成」を選択できる公開設定を追加する。調査結果と最終判断は、本 issue の「解決方法」に根拠とともに記録する。
+調査結果と最終判断は、本 issue の「解決方法」に根拠とともに記録する。画素一致 (Y / UV データ) の実機検証は、パターン映像テストデータの整備が必要であり、issue 0031 でも非ゼロ原点の画素一致は未達のため、本 issue では対応せず残課題として記録する。
 
 ## 完了条件
 
 - `max_coded_width` / `max_coded_height` が公開 API に追加されていない
-- 公開設定の判断チェックポイントをすべて検証し、reconfigure の利用方針、公開設定の有無、公開設定を追加する場合の型と意味論が根拠とともに確定している
+- `DecoderConfig` に `reconfigure_enabled: bool` が追加され、デフォルト相当が `false` (従来方式) である
+- `reconfigure_enabled == true` かつ `max_display_delay > 0` の組み合わせが `Decoder::new` で設定エラーとして拒否される
 - 初回 sequence callback で、最初の coded サイズが `CUVIDDECODECREATEINFO.ulMaxWidth` / `ulMaxHeight` と内部の session 上限に設定される
-- 320x240 → 256x160 → 320x240 のストリームで、`total_create_decoder_count` が 1、`total_reconfigure_decoder_count` が 2 以上になり、全フレームが欠落なくデコードされる
-- 256x160 → 320x240 → 256x160 のストリームで、320x240 への変更時に decoder が再作成され、その後の 256x160 への変更では reconfigure される
+- `reconfigure_enabled == true` で 320x240 → 256x160 → 320x240 のストリームをデコードしたとき、`total_create_decoder_count` が 1、`total_reconfigure_decoder_count` が 2 以上になり、全フレームが欠落なくデコードされる
+- `reconfigure_enabled == true` で 256x160 → 320x240 → 256x160 のストリームをデコードしたとき、320x240 への変更時に decoder が再作成され、その後の 256x160 への変更では reconfigure される
+- `reconfigure_enabled == false` で解像度変化ストリームをデコードしたとき、従来どおりシーケンス変更ごとに decoder が再作成され、全フレームが欠落なくデコードされる
 - codec / chroma format / bit depth / progressive sequence のいずれかが変化した場合は decoder が再作成され、成功後は reconfigure 経路へ戻れる
 - `cuvidReconfigureDecoder` 失敗後の decoder を安全に破棄して再作成できるかが実機で確認され、結果に応じた失敗時契約が確定している
 - 安全な再作成フォールバックを採用する場合は、reconfigure と再作成が両方失敗した場合だけ原因エラーが通知され、当該 `Decoder` が終端する
@@ -157,9 +155,8 @@ reconfigure 経路の出力が正しく、再作成を減らす効果を実測�
 - `format.display_area` などの事前検証に失敗した場合は、既存 decoder が破棄されない
 - `DecoderStats::total_create_decoder_count` / `total_reconfigure_decoder_count` / `total_reconfigure_failure_count` が各経路を正しく反映する
 - reconfigure 経路で、作成時 target surface と現在の sequence のジオメトリが区別して管理されている
-- reconfigure 前後の寸法、stride、Y / UV データがパターン映像で検証され、issue 0031 の出力契約と一致している
 - reconfigure で出力契約を維持できない条件が、decoder 再作成へフォールバックする条件として明文化されている
-- 公開設定を追加する場合は、その設定で常に decoder を再作成する経路も既存の解像度変更テストで検証されている
+- 画素一致 (Y / UV データ) の実機検証は、パターン映像テストデータの整備が別途必要なため残課題とし、本 issue の完了条件に含めない
 - `README.md` と `skills/shiguredo-nvcodec/SKILL.md` が、利用側の最大解像度指定を要求せず、最終決定した reconfigure 方針を説明している
 - `CHANGES.md` の `develop` セクションに、最終的な公開 API と挙動に対応するエントリが追加されている
 
@@ -169,7 +166,7 @@ reconfigure 経路の出力が正しく、再作成を減らす効果を実測�
 
 ### 変更対象ファイル
 
-- `src/decode.rs` — session ごとの coded サイズ上限、reconfigure 適用判定、作成時 target surface と現在の sequence のジオメトリ管理、出力契約を維持する NV12 コピー処理、再作成フォールバック、統計値更新、実機テストを追加する。`DecoderConfig` の `max_coded_width` / `max_coded_height` とその検証は追加しない。調査結果によっては reconfigure の利用方針を選択する公開設定を追加する
+- `src/decode.rs` — `DecoderConfig.reconfigure_enabled` の追加と検証、session ごとの coded サイズ上限、reconfigure 適用判定、作成時 target surface と現在の sequence のジオメトリ管理、出力契約を維持する NV12 コピー処理、再作成フォールバック、統計値更新、実機テストを追加する。`DecoderConfig` の `max_coded_width` / `max_coded_height` とその検証は追加しない
 - `src/lib.rs` — `cuvidReconfigureDecoder` の存在確認とラッパーを追加する
 - `build.rs` — docs.rs 用スタブに `CUVIDRECONFIGUREDECODERINFO` を追加する
 - `testdata/resolution-change/` — 解像度変化テストデータを使用し、縮小と上限超過後の縮小を検証する
@@ -177,15 +174,17 @@ reconfigure 経路の出力が正しく、再作成を減らす効果を実測�
 - `skills/shiguredo-nvcodec/SKILL.md` — 動的解像度変更の説明を最終決定した reconfigure 方針へ更新する
 - `CHANGES.md` — `develop` セクションに最終的な公開 API と挙動に対応するエントリを追加する
 
-公開設定を追加しない場合、`CHANGES.md` のエントリは次の内容とする。
+`CHANGES.md` のエントリは次の内容とする。`reconfigure_enabled` の追加は既存の struct literal を壊すため、後方互換のない `[CHANGE]` として記載する。
 
 ```markdown
-- [UPDATE] ストリーム中の解像度変化を decoder の再作成と in-place 再構成のハイブリッドで処理する
-  - 利用側で最大解像度を指定せず、現在の decoder session の上限以内では再構成し、上限を超えた場合は再作成する
+- [CHANGE] `DecoderConfig` に `reconfigure_enabled` フィールドを追加する
+  - `false` (推奨値) は従来どおりシーケンス変更ごとに decoder を再作成する
+  - `true` は現在の decoder session の上限以内の解像度変化を `cuvidReconfigureDecoder` で再構成する
+  - `true` は `max_display_delay > 0` と組み合わせられない (組み合わせた場合は `Decoder::new` が設定エラーを返す)
   - @sile
 ```
 
-公開設定を `DecoderConfig` に追加する場合は既存の struct literal を壊すため、後方互換のない `[CHANGE]` として、最終決定したフィールド名と意味論を記載する。開発ブランチ内の中間設計である `max_coded_width` / `max_coded_height` の追加と削除は変更履歴に記載しない。
+開発ブランチ内の中間設計である `max_coded_width` / `max_coded_height` の追加と削除は変更履歴に記載しない。
 
 ## 実装で判明した事項
 
