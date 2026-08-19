@@ -408,7 +408,7 @@ encoder.encode(&new_frame, &EncodeOptions {
 
 ### デコーダー
 
-ストリーム中に解像度が変わった場合、内部でパーサーが検出して自動的にデコーダーを再作成する。利用者側の操作は不要。
+ストリーム中に解像度が変わった場合、内部でパーサーが検出して `cuvidReconfigureDecoder` による in-place 再構成と decoder の再作成を自動的に使い分ける。利用者側の操作は不要で、最大解像度の指定も不要。現在の decoder session の上限 (作成時または再作成時の coded サイズ) 以内の解像度変化は再構成で処理し、上限を超える拡大やコーデック情報の変化は再作成で処理する。
 
 `DecodedFrame` はフレームごとに `width()` / `height()` を持つので、フレームごとにサイズを確認する。
 
@@ -428,9 +428,9 @@ assert_eq!(frame.width(), 1280);  // 自動的に追従
 
 | | エンコーダー | デコーダー |
 |---|---|---|
-| 仕組み | `reconfigure()` で明示的に変更 | パーサーが自動検出して再作成 |
+| 仕組み | `reconfigure()` で明示的に変更 | パーサーが自動検出して再構成 / 再作成 |
 | 利用者の操作 | `ReconfigureParams` で新解像度を指定 | 不要 |
-| 制約 | `max_encode_width` / `max_encode_height` 以内 | なし |
+| 制約 | `max_encode_width` / `max_encode_height` 以内 | session 上限 (作成時の coded サイズ) 以内は再構成、超過は再作成 |
 | 超えた場合 | エンコーダーを作り直す | 自動対応 |
 
 ## 統計値の取得

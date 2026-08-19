@@ -20,6 +20,9 @@
   - @sile
 - [ADD] Decoder::stats() / Encoder::stats() で内部状態 (counter / gauge) を取得できるようにする
   - @sile
+- [UPDATE] ストリーム中の解像度変化を decoder の再作成と in-place 再構成のハイブリッドで処理する
+  - 利用側で最大解像度を指定せず、現在の decoder session の上限以内では再構成し、上限を超えた場合は再作成する
+  - @sile
 - [FIX] Decoder の display area と DecodedFrame の画素領域が一致しない問題を修正する
   - display area の left / top が非ゼロの場合、公開する寸法は表示領域の寸法 (crop 後) なのに、画素データは mapped output surface の左上を起点にコピーされていた
   - コピー元を表示領域の左上に合わせることで、`width()` / `height()` と Y / UV データを表示領域に一致させた
