@@ -29,9 +29,11 @@ issue 0031 は display area が非ゼロの入力で `DecodedFrame` の寸法と
 
 ただし、現時点では sequence callback 後に旧 sequence の display callback が発生することを再現できていない。
 
+2026-08-19 の実機検証 (GitHub Actions `Test (NVIDIA GPU)`) で、`max_display_delay = 2` かつ B フレームを含む H.264 / H.265 の解像度変化ストリーム (45 フレーム、320x240 → 256x160 → 320x240) をデコードし、全フレームが出力され、各フレームの寸法が正しいことを確認した。旧 sequence の display 待ち picture への新ジオメトリ誤適用は再現しなかった。
+
 NVIDIA の公開仕様では EOS による display 待ち picture の排出は説明されているが、sequence 変更時に同じ排出が必ず完了するとは明記されていない。
 
-`testdata/resolution-change/` は issue 0031 のマージ (PR #22) で develop ブランチに追加済みだが、既存データは全て B フレームを含まない (遅延なしの destroy + recreate 経路の検証用)。`max_display_delay > 0` や B フレームを含む入力を実機で検証するテスト基盤は未整備のため、この可能性を検証できていない。
+`testdata/resolution-change/` は issue 0031 のマージ (PR #22) で develop ブランチに追加済みで、既存データは全て B フレームを含まない (遅延なしの destroy + recreate 経路の検証用)。本 issue で `h264_bframes.h264` / `h265_bframes.h265` (B フレームを含む H.264 / H.265 の解像度変化ストリーム) を追加し、`max_display_delay > 0` での実機検証が可能になった。
 
 したがって、この項目は develop ブランチの確定した不具合ではなく、実機検証が必要なリスクとして扱う。
 
