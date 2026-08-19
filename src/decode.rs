@@ -128,6 +128,9 @@ pub struct DecoderConfig {
     pub max_display_delay: u32,
 
     /// 出力サーフェスフォーマット (NVDEC: OutputFormat)
+    ///
+    /// 現在は [`SurfaceFormat::Nv12`] (8bit) のみ。10bit 以上の入力は
+    /// [`Decoder::decode`] 中に拒否され、Decoder は終端状態に遷移する。
     pub surface_format: SurfaceFormat,
 }
 
@@ -423,7 +426,8 @@ impl DecoderState {
     /// シーケンスコールバック処理 (pfnSequenceCallback から呼ばれる)
     ///
     /// 既存デコーダーがあれば破棄し、現在のシーケンスのフォーマットで再作成する。
-    /// また、表示領域の検証と width / height / surface サイズの更新を行う。
+    /// また、表示領域と輝度ビット深度 (8bit 以外は拒否) の検証、
+    /// width / height / surface サイズの更新を行う。
     /// 成功時はデコードサーフェス数を返し、失敗時は `Err` を返す。
     /// 戻り値のデコードサーフェス数は extern "C" ラッパー経由で parser へ渡され、
     /// parser はこの値で `CUVIDPICPARAMS.CurrPicIdx` を割り当てる。
@@ -458,6 +462,15 @@ impl DecoderState {
             return Err(Error::new_custom(
                 "handle_video_sequence",
                 "invalid display_area in video format",
+            ));
+        }
+        // 出力サーフェスとコピー処理は 8bit NV12 前提 (1 画素 1 バイト) のため、
+        // bit_depth_luma_minus8 != 0 の入力は受け付けない。
+        // 10bit 以上を通すと Y / UV のバイト幅計算が崩れて不正な画素データになる。
+        if format.bit_depth_luma_minus8 != 0 {
+            return Err(Error::new_custom(
+                "handle_video_sequence",
+                "bit_depth_luma_minus8 must be 0 (only 8bit output is supported)",
             ));
         }
         // デコーダーが既に作成されている場合は破棄して再作成する
@@ -741,6 +754,9 @@ where
 ///
 /// 内部で専用のワーカースレッドを起動し、非同期でデコードを行う。
 /// デコードが完了すると、コンストラクタで渡したハンドラがワーカースレッド上で即座に呼び出される。
+///
+/// 出力は 8bit NV12 のみ対応する。10bit 以上の入力はデコードせず、
+/// [`DecodeHandler::on_decoded`] に明示的な `Err` を渡して終端する。
 ///
 /// このインスタンスは一度 [`DecodeHandler::on_decoded`] に `Err` を渡した時点で終端状態になる。
 /// 終端状態とは、それ以降はデコードせず、送信されたデータに対して終端を表す `Err` を
@@ -1433,6 +1449,56 @@ mod tests {
             .expect("Decoding error occurred");
 
         assert_black_frame(&frame, 640, 480);
+
+        drop(decoder);
+    }
+
+    #[test]
+    fn test_decode_h265_10bit_rejected() {
+        // 10bit HEVC (bit_depth_luma_minus8 = 2) の入力が、handle_video_sequence の
+        // 検証で明示的エラーとして拒否され、Decoder が終端状態に遷移することを確認する。
+        //
+        // 出力サーフェスは 8bit NV12 のみ対応のため、10bit 入力は P010 相当の
+        // 出力サーフェスになり、コピー処理 (8bit 前提) と整合しない。
+        // そのため、デコードを開始せずに fail-fast で拒否する。
+        //
+        // ffmpeg (libx265, pix_fmt=yuv420p10le) で生成した 10bit HEVC の完全なストリーム
+        // (VPS / SPS / PPS / フレームデータを含む) を使う。SPS やパラメータセットのみでは
+        // NVDEC のパーサーがシーケンス解析を完結させず handle_video_sequence が呼ばれない
+        // ため、シーケンス解析を確実に発火させるには完全なストリームが必要である。
+        let h265_data = include_bytes!("../testdata/10bit/black10.h265");
+
+        let config = test_decoder_config(DecoderCodec::Hevc);
+        let (tx, rx) = mpsc::sync_channel::<Result<DecodedFrame<()>, Error>>(4);
+        let decoder = Decoder::new(
+            config,
+            FnDecodeHandler::new(move |frame| {
+                let _ = tx.send(frame);
+            }),
+        )
+        .expect("Failed to create h265 decoder");
+
+        // デコードを実行 (シーケンス解析時に handle_video_sequence が呼ばれ、10bit のため拒否される)
+        decoder
+            .decode(h265_data, ())
+            .expect("Failed to decode H.265 data");
+
+        // フィニッシュ処理をテスト
+        decoder.flush().expect("flush failed");
+
+        // 10bit 入力は拒否されるため、on_decoded に Err が渡される (Decoder は終端状態に遷移する)
+        let result = rx.recv().expect("No decoded result available");
+
+        match result {
+            Ok(_) => panic!("10bit input must be rejected but a frame was decoded"),
+            Err(e) => {
+                // 10bit 拒否の具体的エラーが通知されることを確認する
+                assert!(
+                    e.to_string().contains("bit_depth_luma_minus8 must be 0"),
+                    "unexpected error: {e}"
+                );
+            }
+        }
 
         drop(decoder);
     }
