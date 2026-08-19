@@ -33,12 +33,10 @@ pub struct DecoderStats {
     pub total_create_decoder_count: Counter,
 
     /// cuvidReconfigureDecoder の通算成功回数
-    /// (reconfigure 経路は 0024 マージ後に導入予定のため、それまでは常に 0 を返す)
     pub total_reconfigure_decoder_count: Counter,
 
     /// cuvidReconfigureDecoder 呼び出しの通算失敗回数
-    /// (解像度上限超過の事前検証エラーや cuvidCreateDecoder の失敗は含まない。
-    ///  reconfigure 経路は 0024 マージ後に導入予定のため、それまでは常に 0 を返す)
+    /// (解像度上限超過の事前検証エラーや cuvidCreateDecoder の失敗は含まない)
     pub total_reconfigure_failure_count: Counter,
 
     /// decode() で正常に送信された通算回数
@@ -153,11 +151,74 @@ struct DecoderState {
     surface_width: u32,
     surface_height: u32,
     surface_format: u32,
+    // 現在の decoder session の coded サイズ上限 (CUVIDDECODECREATEINFO.ulMaxWidth / ulMaxHeight)。
+    // reconfigure の適用可否判定に使い、coded サイズがこの上限を超える場合は再作成する。
+    session_max_width: u32,
+    session_max_height: u32,
+    // 初回 cuvidCreateDecoder 時に確定した出力ジオメトリ。
+    // cuvidReconfigureDecoder では target サイズと display_area をこの値に固定して渡す。
+    create_geometry: DecoderCreateGeometry,
+    // 直近の create / reconfigure 時のコーデック情報。
+    // reconfigure 適用可否判定のベースライン。
+    reconfigure_baseline: ReconfigureBaseline,
     frame_tx: Sender<RawFrame>,
     frame_rx: Receiver<RawFrame>,
     // 読み書きはワーカースレッドのみ（パーサーコールバックも同スレッド）なので Mutex 不要
     callback_error: Option<Error>,
     stats: Arc<DecoderStats>,
+}
+
+/// cuvidCreateDecoder 呼び出し時に確定した出力ジオメトリ
+///
+/// cuvidReconfigureDecoder では target サイズと display_area をこの値に固定して渡す
+/// (NVIDIA 公式サンプル NvDecoder::ReconfigureDecoder と同じ挙動)。
+/// フィールド型は CUVIDDECODECREATEINFO と CUVIDRECONFIGUREDECODERINFO の
+/// 該当フィールドに合わせる。
+#[derive(Debug, Clone, Copy)]
+struct DecoderCreateGeometry {
+    target_width: u32,
+    target_height: u32,
+    display_left: i16,
+    display_top: i16,
+    display_right: i16,
+    display_bottom: i16,
+}
+
+/// cuvidReconfigureDecoder の適用可否判定用のベースライン
+///
+/// 直近の create / reconfigure 時のコーデック情報を保存する。
+#[derive(Debug, Clone, Copy)]
+struct ReconfigureBaseline {
+    codec: sys::cudaVideoCodec,
+    chroma_format: u32,
+    bit_depth_luma_minus8: u8,
+    bit_depth_chroma_minus8: u8,
+    progressive_sequence: u8,
+}
+
+impl ReconfigureBaseline {
+    /// CUVIDEOFORMAT からベースラインを保存する
+    fn from_format(format: &sys::CUVIDEOFORMAT) -> Self {
+        Self {
+            codec: format.codec,
+            chroma_format: format.chroma_format,
+            bit_depth_luma_minus8: format.bit_depth_luma_minus8,
+            bit_depth_chroma_minus8: format.bit_depth_chroma_minus8,
+            progressive_sequence: format.progressive_sequence,
+        }
+    }
+
+    /// ベースラインからコーデック情報が変化したかを判定する
+    ///
+    /// cuvidReconfigureDecoder は same codec 限定のため、
+    /// コーデック情報が変化した場合は reconfigure を使えない。
+    fn changed(&self, format: &sys::CUVIDEOFORMAT) -> bool {
+        self.codec != format.codec
+            || self.chroma_format != format.chroma_format
+            || self.bit_depth_luma_minus8 != format.bit_depth_luma_minus8
+            || self.bit_depth_chroma_minus8 != format.bit_depth_chroma_minus8
+            || self.progressive_sequence != format.progressive_sequence
+    }
 }
 
 unsafe impl Send for DecoderState {}
@@ -282,6 +343,24 @@ impl DecoderState {
                 display_area_top: 0,
                 surface_width: 0,
                 surface_height: 0,
+                session_max_width: 0,
+                session_max_height: 0,
+                // ダミー値で初期化する。初回 sequence callback で create_decoder が呼ばれたときに
+                // 実値で上書きされるため、ここでの値は使われない。
+                create_geometry: DecoderCreateGeometry {
+                    target_width: 0,
+                    target_height: 0,
+                    display_left: 0,
+                    display_top: 0,
+                    display_right: 0,
+                    display_bottom: 0,
+                },
+                // ダミー値で初期化する。初回 sequence callback の create_decoder 後に
+                // save_reconfigure_baseline で実値が保存される。
+                reconfigure_baseline: {
+                    let zeroed: sys::CUVIDEOFORMAT = std::mem::zeroed();
+                    ReconfigureBaseline::from_format(&zeroed)
+                },
                 surface_format: config.surface_format.to_sys(),
                 frame_tx,
                 frame_rx,
@@ -425,9 +504,8 @@ impl DecoderState {
 
     /// シーケンスコールバック処理 (pfnSequenceCallback から呼ばれる)
     ///
-    /// 既存デコーダーがあれば破棄し、現在のシーケンスのフォーマットで再作成する。
-    /// また、表示領域と輝度ビット深度 (8bit 以外は拒否) の検証、
-    /// width / height / surface サイズの更新を行う。
+    /// 表示領域と輝度ビット深度 (8bit 以外は拒否) の検証後、decoder の作成状況と
+    /// coded サイズの session 上限に応じて、作成 / 再作成 / reconfigure を使い分ける。
     /// 成功時はデコードサーフェス数を返し、失敗時は `Err` を返す。
     /// 戻り値のデコードサーフェス数は extern "C" ラッパー経由で parser へ渡され、
     /// parser はこの値で `CUVIDPICPARAMS.CurrPicIdx` を割り当てる。
@@ -473,14 +551,88 @@ impl DecoderState {
                 "bit_depth_luma_minus8 must be 0 (only 8bit output is supported)",
             ));
         }
-        // デコーダーが既に作成されている場合は破棄して再作成する
-        // ストリーム中の解像度変更に対応するため
-        if !self.decoder.is_null() {
-            self.lib
-                .with_context(self.ctx, || self.lib.cuvid_destroy_decoder(self.decoder))?;
-            self.decoder = ptr::null_mut();
+
+        if self.decoder.is_null() {
+            // 初回コールバックではデコーダーを新規作成する。
+            // 現在の coded サイズを session 上限 (ulMaxWidth / ulMaxHeight) に設定するため、
+            // 以降の reconfigure でこの coded サイズまで戻すことが可能になる。
+            self.create_decoder(format)?;
+            self.save_reconfigure_baseline(format);
+        } else if self.reconfigure_baseline.changed(format) {
+            // コーデック情報 (codec / chroma_format / bit depth / progressive) が変化した場合は
+            // cuvidReconfigureDecoder は same codec 限定のため破棄して再作成する。
+            // 現在の coded サイズを新しい session 上限として設定し、判定ベースラインも更新して
+            // 次回以降 reconfigure 経路に戻れるようにする。
+            self.destroy_and_recreate_decoder(format)?;
+            self.save_reconfigure_baseline(format);
+        } else if format.coded_width > self.session_max_width
+            || format.coded_height > self.session_max_height
+        {
+            // 現在の coded サイズが session 上限を超えている場合は破棄して再作成する。
+            // 上限を超えたまま reconfigure すると cuvidReconfigureDecoder が失敗するため、
+            // 上限を新しい coded サイズへ引き上げる。
+            self.destroy_and_recreate_decoder(format)?;
+            self.save_reconfigure_baseline(format);
+        } else {
+            // それ以外 (coded サイズが session 上限以内) は
+            // cuvidReconfigureDecoder で in-place に再構成する。
+            //
+            // ulTargetWidth / ulTargetHeight と display_area は作成時に確定した値
+            // (self.create_geometry) をそのまま渡す。新しい coded サイズを ulTargetWidth に
+            // 渡すと、既に作成時サイズで allocate された出力サーフェスとの不整合により
+            // cuvidDecodePicture が縮小時に CUDA_ERROR_INVALID_VALUE を返すため、
+            // NVIDIA 公式サンプル NvDecoder::ReconfigureDecoder と同じく作成時サイズを維持する。
+            let result = self.lib.with_context(self.ctx, || {
+                let mut reconfigure_info: sys::CUVIDRECONFIGUREDECODERINFO =
+                    unsafe { std::mem::zeroed() };
+                reconfigure_info.ulWidth = format.coded_width;
+                reconfigure_info.ulHeight = format.coded_height;
+                reconfigure_info.ulTargetWidth = self.create_geometry.target_width;
+                reconfigure_info.ulTargetHeight = self.create_geometry.target_height;
+                reconfigure_info.display_area.left = self.create_geometry.display_left;
+                reconfigure_info.display_area.top = self.create_geometry.display_top;
+                reconfigure_info.display_area.right = self.create_geometry.display_right;
+                reconfigure_info.display_area.bottom = self.create_geometry.display_bottom;
+                reconfigure_info.ulNumDecodeSurfaces = num_decode_surfaces;
+                self.lib
+                    .cuvid_reconfigure_decoder(self.decoder, &mut reconfigure_info)
+            });
+            match result {
+                Ok(()) => {
+                    self.stats.total_reconfigure_decoder_count.inc();
+                }
+                Err(_e) => {
+                    // reconfigure 失敗時は decoder を破棄してから再作成する。
+                    // NVDEC SDK は reconfigure 失敗後の decoder 状態を明示していないため、
+                    // 失敗した decoder を継続利用しない。
+                    self.stats.total_reconfigure_failure_count.inc();
+                    self.destroy_and_recreate_decoder(format)?;
+                    self.save_reconfigure_baseline(format);
+                    return Ok(num_decode_surfaces as i32);
+                }
+            }
         }
 
+        // 成功した経路に合わせて幅・高さを更新する。
+        // surface サイズは create 経路でのみ更新し、reconfigure 経路では
+        // mapped output surface の実寸法 (作成時 target サイズ) を維持する。
+        // 表示領域の原点 (left / top) は検証済みのため負値にはならない。
+        self.width = (right - left) as u32;
+        self.height = (bottom - top) as u32;
+        self.display_area_left = left as u32;
+        self.display_area_top = top as u32;
+
+        // シーケンスコールバックの戻り値は decoder の ulNumDecodeSurfaces と同じ値にする
+        // (parser がこの値で CUVIDPICPARAMS.CurrPicIdx を割り当てるため、両者を一致させる)
+        Ok(num_decode_surfaces as i32)
+    }
+
+    /// デコーダーを新規作成する
+    ///
+    /// `ulMaxWidth` / `ulMaxHeight` には現在の coded サイズを設定し、以降の
+    /// `cuvidReconfigureDecoder` による in-place 再構成を可能にする。
+    /// 作成成功時のみ、session 上限と作成時ジオメトリを更新する。
+    fn create_decoder(&mut self, format: &sys::CUVIDEOFORMAT) -> Result<(), Error> {
         // デコーダーの作成情報を設定
         let mut create_info: sys::CUVIDDECODECREATEINFO = unsafe { std::mem::zeroed() };
         create_info.CodecType = format.codec;
@@ -495,13 +647,21 @@ impl DecoderState {
         create_info.ulNumOutputSurfaces = 2; // 出力サーフェスの数（ダブルバッファリング用に 2 を指定）
         create_info.ulCreationFlags =
             sys::cudaVideoCreateFlags_enum_cudaVideoCreate_PreferCUVID as u64; // CUVID ハードウェアデコーダーの使用を優先するフラグ
-        create_info.ulNumDecodeSurfaces = num_decode_surfaces as u64;
+        create_info.ulNumDecodeSurfaces = format.min_num_decode_surfaces as u64;
         create_info.ulWidth = format.coded_width as u64;
         create_info.ulHeight = format.coded_height as u64;
         create_info.ulMaxWidth = format.coded_width as u64;
         create_info.ulMaxHeight = format.coded_height as u64;
         create_info.ulTargetWidth = format.coded_width as u64;
         create_info.ulTargetHeight = format.coded_height as u64;
+
+        // display_area は以降の cuvidReconfigureDecoder でも同じ値を再度渡す必要があるため
+        // ここで明示的に設定する (i32 → i16 のキャストは display_area の検証で
+        // 負値 / 逆転を弾いており、実用上の解像度は i16 の上限を超えないため安全)。
+        create_info.display_area.left = format.display_area.left as i16;
+        create_info.display_area.top = format.display_area.top as i16;
+        create_info.display_area.right = format.display_area.right as i16;
+        create_info.display_area.bottom = format.display_area.bottom as i16;
 
         // パーサーと共有するコンテキストロックを使用
         create_info.vidLock = self.ctx_lock;
@@ -511,19 +671,38 @@ impl DecoderState {
                 .cuvid_create_decoder(&mut self.decoder, &mut create_info)
         })?;
         self.stats.total_create_decoder_count.inc();
-        self.width = (right - left) as u32;
-        self.height = (bottom - top) as u32;
-        // display_area の原点を保持する。非ゼロの場合は mapped output surface 上の
-        // 表示領域がこの位置から始まるため、handle_picture_display でコピー元オフセットとして使う。
-        // 検証済みのため負値にはならない。
-        self.display_area_left = left as u32;
-        self.display_area_top = top as u32;
+
+        // 作成時ジオメトリを保存する
+        // 以降の cuvidReconfigureDecoder では target サイズと display_area をこの値に固定して渡す
+        self.create_geometry = DecoderCreateGeometry {
+            target_width: format.coded_width,
+            target_height: format.coded_height,
+            display_left: create_info.display_area.left,
+            display_top: create_info.display_area.top,
+            display_right: create_info.display_area.right,
+            display_bottom: create_info.display_area.bottom,
+        };
+
+        // 作成時に確定した session 上限と、mapped output surface の実寸法を保存する
+        self.session_max_width = format.coded_width;
+        self.session_max_height = format.coded_height;
         self.surface_width = format.coded_width;
         self.surface_height = format.coded_height;
 
-        // シーケンスコールバックの戻り値は decoder の ulNumDecodeSurfaces と同じ値にする
-        // (parser がこの値で CUVIDPICPARAMS.CurrPicIdx を割り当てるため、両者を一致させる)
-        Ok(num_decode_surfaces as i32)
+        Ok(())
+    }
+
+    /// 既存デコーダーを破棄してから再作成する
+    fn destroy_and_recreate_decoder(&mut self, format: &sys::CUVIDEOFORMAT) -> Result<(), Error> {
+        self.lib
+            .with_context(self.ctx, || self.lib.cuvid_destroy_decoder(self.decoder))?;
+        self.decoder = ptr::null_mut();
+        self.create_decoder(format)
+    }
+
+    /// 直近の create / reconfigure 時のコーデック情報をベースラインとして保存する
+    fn save_reconfigure_baseline(&mut self, format: &sys::CUVIDEOFORMAT) {
+        self.reconfigure_baseline = ReconfigureBaseline::from_format(format);
     }
 
     /// ピクチャデコードコールバック処理 (pfnDecodePicture から呼ばれる)
@@ -2008,6 +2187,171 @@ mod tests {
         assert_eq!(size_counts.len(), 2, "codec: {codec:?}");
     }
 
+    /// テストデータを 1 フレームずつデコードして、フレーム・エラー・reconfigure 統計を収集する
+    ///
+    /// 戻り値は (デコードされたフレーム, エラー, total_create_decoder_count,
+    /// total_reconfigure_decoder_count, total_reconfigure_failure_count)。
+    /// reconfigure 経路の検証に使う。
+    fn decode_resolution_change_data_for_reconfigure(
+        codec: DecoderCodec,
+        frames: &[&[u8]],
+    ) -> (Vec<DecodedFrame<()>>, Vec<Error>, u64, u64, u64) {
+        let config = test_decoder_config(codec);
+        let (tx, rx) = mpsc::channel();
+        let decoder = Decoder::new(
+            config,
+            FnDecodeHandler::new(move |frame| {
+                let _ = tx.send(frame);
+            }),
+        )
+        .expect("デコーダーの作成に失敗した");
+
+        for frame in frames {
+            // decode() の戻り値はジョブ送信の成否だけを表す。
+            // シーケンスエラーはコールバック経由で errors に集まり、送信失敗は
+            // decoded_frames.len() の検証で検出されるため、ここでは戻り値を確認しない。
+            let _ = decoder.decode(frame, ());
+        }
+        let _ = decoder.flush();
+
+        // reconfigure 経路では、初回の cuvidCreateDecoder だけが呼ばれ、
+        // 以降のシーケンス変更は cuvidReconfigureDecoder で処理されるはず
+        let create_count = decoder.stats().total_create_decoder_count.get();
+        let reconfigure_count = decoder.stats().total_reconfigure_decoder_count.get();
+        let reconfigure_failure_count = decoder.stats().total_reconfigure_failure_count.get();
+
+        // チャネルからフレームとエラーを回収する
+        let mut decoded_frames = Vec::new();
+        let mut errors = Vec::new();
+        loop {
+            match rx.try_recv() {
+                Ok(Ok(frame)) => decoded_frames.push(frame),
+                Ok(Err(e)) => errors.push(e),
+                Err(mpsc::TryRecvError::Empty | mpsc::TryRecvError::Disconnected) => break,
+            }
+        }
+        (
+            decoded_frames,
+            errors,
+            create_count,
+            reconfigure_count,
+            reconfigure_failure_count,
+        )
+    }
+
+    /// reconfigure 経路で 45 フレームすべてがデコードされることを確認する
+    ///
+    /// 320x240 → 256x160 → 320x240 の解像度変化ストリームを、初回の create と
+    /// 以降の cuvidReconfigureDecoder で欠落なくデコードできることを確認する。
+    /// 縮小 (320x240 → 256x160) と元のサイズへ戻る (256x160 → 320x240) は、
+    /// いずれも初回 create 時の session 上限 (320x240) 以内のため reconfigure される。
+    fn assert_resolution_change_frames_reconfigure(codec: DecoderCodec, frames: &[&[u8]]) {
+        let (decoded_frames, errors, create_count, reconfigure_count, reconfigure_failure_count) =
+            decode_resolution_change_data_for_reconfigure(codec, frames);
+
+        // エラーが 1 件も通知されないことを確認する
+        assert!(
+            errors.is_empty(),
+            "予期しないエラーが通知された (codec: {codec:?}): {errors:?}"
+        );
+
+        // 初回 create の 1 回だけで、シーケンス変更ごとに再作成されないことを確認する
+        assert_eq!(
+            create_count, 1,
+            "reconfigure 経路では初回の create だけが呼ばれるはず (codec: {codec:?}): {create_count}"
+        );
+
+        // 2 回のシーケンス変更が reconfigure で処理されることを確認する
+        assert_eq!(
+            reconfigure_count, 2,
+            "シーケンス変更ごとに reconfigure が呼ばれるはず (codec: {codec:?}): {reconfigure_count}"
+        );
+
+        // reconfigure が失敗していないことを確認する
+        assert_eq!(
+            reconfigure_failure_count, 0,
+            "reconfigure が失敗しないはず (codec: {codec:?}): {reconfigure_failure_count}"
+        );
+
+        // 全フレームがデコードされることを確認する
+        assert_eq!(
+            decoded_frames.len(),
+            frames.len(),
+            "全フレームがデコードされるはず (codec: {codec:?}): {}",
+            decoded_frames.len()
+        );
+
+        // 各フレームの寸法を検証する
+        let mut size_counts = std::collections::HashMap::new();
+        for frame in &decoded_frames {
+            size_counts
+                .entry((frame.width(), frame.height()))
+                .and_modify(|c| *c += 1)
+                .or_insert(1);
+        }
+        assert_eq!(size_counts.get(&(320, 240)), Some(&30), "codec: {codec:?}");
+        assert_eq!(size_counts.get(&(256, 160)), Some(&15), "codec: {codec:?}");
+        assert_eq!(size_counts.len(), 2, "codec: {codec:?}");
+    }
+
+    /// 上限超過の拡大で再作成し、上限以内の縮小で reconfigure する経路を確認する
+    ///
+    /// 256x160 → 320x240 → 256x160 の解像度変化ストリームでは、
+    /// 初回 create の session 上限は 256x160 のため、320x240 への拡大時に
+    /// 上限を超えて decoder を再作成する。再作成後の session 上限は 320x240 なので、
+    /// その後の 256x160 への縮小は reconfigure で処理される。
+    fn assert_resolution_change_frames_recreate_then_reconfigure(
+        codec: DecoderCodec,
+        frames: &[&[u8]],
+    ) {
+        let (decoded_frames, errors, create_count, reconfigure_count, reconfigure_failure_count) =
+            decode_resolution_change_data_for_reconfigure(codec, frames);
+
+        // エラーが 1 件も通知されないことを確認する
+        assert!(
+            errors.is_empty(),
+            "予期しないエラーが通知された (codec: {codec:?}): {errors:?}"
+        );
+
+        // 初回 create + 拡大時の再作成で 2 回 create されることを確認する
+        assert_eq!(
+            create_count, 2,
+            "拡大時に decoder が再作成されるはず (codec: {codec:?}): {create_count}"
+        );
+
+        // 拡大後の縮小が 1 回だけ reconfigure で処理されることを確認する
+        assert_eq!(
+            reconfigure_count, 1,
+            "上限超過後の縮小が reconfigure されるはず (codec: {codec:?}): {reconfigure_count}"
+        );
+
+        // reconfigure が失敗していないことを確認する
+        assert_eq!(
+            reconfigure_failure_count, 0,
+            "reconfigure が失敗しないはず (codec: {codec:?}): {reconfigure_failure_count}"
+        );
+
+        // 全フレームがデコードされることを確認する
+        assert_eq!(
+            decoded_frames.len(),
+            frames.len(),
+            "全フレームがデコードされるはず (codec: {codec:?}): {}",
+            decoded_frames.len()
+        );
+
+        // 各フレームの寸法を検証する (256x160 が 30 枚、320x240 が 15 枚)
+        let mut size_counts = std::collections::HashMap::new();
+        for frame in &decoded_frames {
+            size_counts
+                .entry((frame.width(), frame.height()))
+                .and_modify(|c| *c += 1)
+                .or_insert(1);
+        }
+        assert_eq!(size_counts.get(&(256, 160)), Some(&30), "codec: {codec:?}");
+        assert_eq!(size_counts.get(&(320, 240)), Some(&15), "codec: {codec:?}");
+        assert_eq!(size_counts.len(), 2, "codec: {codec:?}");
+    }
+
     #[test]
     fn test_split_annexb_frames_h264() {
         // H.264 テストデータは 45 アクセスユニットに分割される
@@ -2050,6 +2394,14 @@ mod tests {
     }
 
     #[test]
+    fn test_split_annexb_frames_h264_upscale() {
+        // 256x160 → 320x240 → 256x160 のテストデータも 45 アクセスユニットに分割される
+        let data = include_bytes!("../testdata/resolution-change/h264_upscale.h264");
+        let frames = split_annexb_frames(data, |nal| (nal & 0x1f) == 1 || (nal & 0x1f) == 5);
+        assert_eq!(frames.len(), 45, "h264 upscale フレーム数");
+    }
+
+    #[test]
     fn test_decode_h264_resolution_change_destroy_and_recreate() {
         // destroy + create で解像度変化に対応することを確認する
         let data = include_bytes!("../testdata/resolution-change/h264.h264");
@@ -2059,12 +2411,41 @@ mod tests {
     }
 
     #[test]
+    fn test_decode_h264_resolution_change_reconfigure() {
+        // reconfigure 経路で解像度変化に対応することを確認する
+        // 初回 create の 1 回だけで、2 回のシーケンス変更を reconfigure で処理する
+        let data = include_bytes!("../testdata/resolution-change/h264.h264");
+        let frames = split_annexb_frames(data, |nal| (nal & 0x1f) == 1 || (nal & 0x1f) == 5);
+        assert_eq!(frames.len(), 45, "h264 フレーム数");
+        assert_resolution_change_frames_reconfigure(DecoderCodec::H264, &frames);
+    }
+
+    #[test]
+    fn test_decode_h264_resolution_change_recreate_then_reconfigure() {
+        // 上限超過の拡大で再作成し、上限以内の縮小で reconfigure する経路を確認する
+        let data = include_bytes!("../testdata/resolution-change/h264_upscale.h264");
+        let frames = split_annexb_frames(data, |nal| (nal & 0x1f) == 1 || (nal & 0x1f) == 5);
+        assert_eq!(frames.len(), 45, "h264 upscale フレーム数");
+        assert_resolution_change_frames_recreate_then_reconfigure(DecoderCodec::H264, &frames);
+    }
+
+    #[test]
     fn test_decode_h265_resolution_change_destroy_and_recreate() {
         // destroy + create で解像度変化に対応することを確認する
         let data = include_bytes!("../testdata/resolution-change/h265.h265");
         let frames = split_annexb_frames(data, |nal| nal >> 1 <= 31);
         assert_eq!(frames.len(), 45, "h265 フレーム数");
         assert_resolution_change_frames_destroy_and_recreate(DecoderCodec::Hevc, &frames);
+    }
+
+    #[test]
+    fn test_decode_h265_resolution_change_reconfigure() {
+        // reconfigure 経路で解像度変化に対応することを確認する
+        // 初回 create の 1 回だけで、2 回のシーケンス変更を reconfigure で処理する
+        let data = include_bytes!("../testdata/resolution-change/h265.h265");
+        let frames = split_annexb_frames(data, |nal| nal >> 1 <= 31);
+        assert_eq!(frames.len(), 45, "h265 フレーム数");
+        assert_resolution_change_frames_reconfigure(DecoderCodec::Hevc, &frames);
     }
 
     #[test]

@@ -1,7 +1,7 @@
 # 0024-change-decoder-resolution-change-strategy
 
 - Created: 2026-08-05
-- Branch: feature/change-decoder-reconfigure-with-max-coded-size
+- Branch: feature/change-decoder-reconfigure-strategy
 - Updated: 2026-08-19
 
 ## 目的
