@@ -2105,88 +2105,6 @@ mod tests {
     }
 
     /// テストデータを 1 フレームずつデコードして、フレームとエラーを収集する
-    ///
-    /// 戻り値は (デコードされたフレーム, エラー, total_create_decoder_count)。
-    /// 通常の decoder 再作成 (destroy + create) 経路の検証に使う。
-    fn decode_resolution_change_data(
-        codec: DecoderCodec,
-        frames: &[&[u8]],
-    ) -> (Vec<DecodedFrame<()>>, Vec<Error>, u64) {
-        let config = test_decoder_config(codec);
-        let (tx, rx) = mpsc::channel();
-        let decoder = Decoder::new(
-            config,
-            FnDecodeHandler::new(move |frame| {
-                let _ = tx.send(frame);
-            }),
-        )
-        .expect("デコーダーの作成に失敗した");
-
-        for frame in frames {
-            // decode() の戻り値はジョブ送信の成否だけを表す。
-            // シーケンスエラーはコールバック経由で errors に集まり、送信失敗は
-            // decoded_frames.len() の検証で検出されるため、ここでは戻り値を確認しない。
-            let _ = decoder.decode(frame, ());
-        }
-        let _ = decoder.flush();
-
-        // destroy + create 経路ではシーケンス変更ごとに cuvidCreateDecoder が呼ばれる
-        let create_count = decoder.stats().total_create_decoder_count.get();
-
-        // チャネルからフレームとエラーを回収する
-        let mut decoded_frames = Vec::new();
-        let mut errors = Vec::new();
-        loop {
-            match rx.try_recv() {
-                Ok(Ok(frame)) => decoded_frames.push(frame),
-                Ok(Err(e)) => errors.push(e),
-                Err(mpsc::TryRecvError::Empty | mpsc::TryRecvError::Disconnected) => break,
-            }
-        }
-        (decoded_frames, errors, create_count)
-    }
-
-    /// 通常の decoder 再作成 (destroy + create) 経路で 45 フレームすべてがデコードされることを確認する
-    ///
-    /// 320x240 x30 + 256x160 x15 の解像度変化ストリームを、シーケンス変更ごとの
-    /// decoder 再作成で欠落なくデコードできることを確認する。display_delay = 0 のため
-    /// シーケンス変更時に in-flight フレームが存在せず、フレームロスは発生しないことを期待する。
-    fn assert_resolution_change_frames_destroy_and_recreate(codec: DecoderCodec, frames: &[&[u8]]) {
-        let (decoded_frames, errors, create_count) = decode_resolution_change_data(codec, frames);
-
-        // エラーが 1 件も通知されないことを確認する
-        assert!(
-            errors.is_empty(),
-            "予期しないエラーが通知された: {errors:?}"
-        );
-
-        // destroy + create 経路では、シーケンス変更ごとに cuvidCreateDecoder が呼ばれる
-        assert!(
-            create_count >= 2,
-            "シーケンス変更ごとに cuvidCreateDecoder が呼ばれるはず (codec: {codec:?}): {create_count}"
-        );
-
-        // 全フレームがデコードされることを確認する
-        assert_eq!(
-            decoded_frames.len(),
-            frames.len(),
-            "全フレームがデコードされるはず (codec: {codec:?}): {}",
-            decoded_frames.len()
-        );
-
-        // 各フレームの寸法を検証する
-        let mut size_counts = std::collections::HashMap::new();
-        for frame in &decoded_frames {
-            size_counts
-                .entry((frame.width(), frame.height()))
-                .and_modify(|c| *c += 1)
-                .or_insert(1);
-        }
-        assert_eq!(size_counts.get(&(320, 240)), Some(&30), "codec: {codec:?}");
-        assert_eq!(size_counts.get(&(256, 160)), Some(&15), "codec: {codec:?}");
-        assert_eq!(size_counts.len(), 2, "codec: {codec:?}");
-    }
-
     /// テストデータを 1 フレームずつデコードして、フレーム・エラー・reconfigure 統計を収集する
     ///
     /// 戻り値は (デコードされたフレーム, エラー, total_create_decoder_count,
@@ -2402,15 +2320,6 @@ mod tests {
     }
 
     #[test]
-    fn test_decode_h264_resolution_change_destroy_and_recreate() {
-        // destroy + create で解像度変化に対応することを確認する
-        let data = include_bytes!("../testdata/resolution-change/h264.h264");
-        let frames = split_annexb_frames(data, |nal| (nal & 0x1f) == 1 || (nal & 0x1f) == 5);
-        assert_eq!(frames.len(), 45, "h264 フレーム数");
-        assert_resolution_change_frames_destroy_and_recreate(DecoderCodec::H264, &frames);
-    }
-
-    #[test]
     fn test_decode_h264_resolution_change_reconfigure() {
         // reconfigure 経路で解像度変化に対応することを確認する
         // 初回 create の 1 回だけで、2 回のシーケンス変更を reconfigure で処理する
@@ -2430,15 +2339,6 @@ mod tests {
     }
 
     #[test]
-    fn test_decode_h265_resolution_change_destroy_and_recreate() {
-        // destroy + create で解像度変化に対応することを確認する
-        let data = include_bytes!("../testdata/resolution-change/h265.h265");
-        let frames = split_annexb_frames(data, |nal| nal >> 1 <= 31);
-        assert_eq!(frames.len(), 45, "h265 フレーム数");
-        assert_resolution_change_frames_destroy_and_recreate(DecoderCodec::Hevc, &frames);
-    }
-
-    #[test]
     fn test_decode_h265_resolution_change_reconfigure() {
         // reconfigure 経路で解像度変化に対応することを確認する
         // 初回 create の 1 回だけで、2 回のシーケンス変更を reconfigure で処理する
@@ -2449,30 +2349,33 @@ mod tests {
     }
 
     #[test]
-    fn test_decode_vp8_resolution_change_destroy_and_recreate() {
-        // destroy + create で解像度変化に対応することを確認する
+    fn test_decode_vp8_resolution_change_reconfigure() {
+        // reconfigure 経路で解像度変化に対応することを確認する
+        // 初回 create の 1 回だけで、2 回のシーケンス変更を reconfigure で処理する
         let data = include_bytes!("../testdata/resolution-change/vp8.ivf");
         let frames = split_ivf_frames(data);
         assert_eq!(frames.len(), 45, "vp8 フレーム数");
-        assert_resolution_change_frames_destroy_and_recreate(DecoderCodec::Vp8, &frames);
+        assert_resolution_change_frames_reconfigure(DecoderCodec::Vp8, &frames);
     }
 
     #[test]
-    fn test_decode_vp9_resolution_change_destroy_and_recreate() {
-        // destroy + create で解像度変化に対応することを確認する
+    fn test_decode_vp9_resolution_change_reconfigure() {
+        // reconfigure 経路で解像度変化に対応することを確認する
+        // 初回 create の 1 回だけで、2 回のシーケンス変更を reconfigure で処理する
         let data = include_bytes!("../testdata/resolution-change/vp9.ivf");
         let frames = split_ivf_frames(data);
         assert_eq!(frames.len(), 45, "vp9 フレーム数");
-        assert_resolution_change_frames_destroy_and_recreate(DecoderCodec::Vp9, &frames);
+        assert_resolution_change_frames_reconfigure(DecoderCodec::Vp9, &frames);
     }
 
     #[test]
-    fn test_decode_av1_resolution_change_destroy_and_recreate() {
-        // destroy + create で解像度変化に対応することを確認する
+    fn test_decode_av1_resolution_change_reconfigure() {
+        // reconfigure 経路で解像度変化に対応することを確認する
+        // 初回 create の 1 回だけで、2 回のシーケンス変更を reconfigure で処理する
         let data = include_bytes!("../testdata/resolution-change/av1.ivf");
         let frames = split_ivf_frames(data);
         assert_eq!(frames.len(), 45, "av1 フレーム数");
-        assert_resolution_change_frames_destroy_and_recreate(DecoderCodec::Av1, &frames);
+        assert_resolution_change_frames_reconfigure(DecoderCodec::Av1, &frames);
     }
 
     #[test]
