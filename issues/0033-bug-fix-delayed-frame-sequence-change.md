@@ -31,7 +31,7 @@ issue 0031 は display area が非ゼロの入力で `DecodedFrame` の寸法と
 
 NVIDIA の公開仕様では EOS による display 待ち picture の排出は説明されているが、sequence 変更時に同じ排出が必ず完了するとは明記されていない。
 
-`testdata/resolution-change/` は develop ブランチに存在せず、`max_display_delay > 0` や B フレームを含む入力を実機で検証するテスト基盤も未整備のため、この可能性を検証できていない。
+`testdata/resolution-change/` は issue 0031 のマージ (PR #22) で develop ブランチに追加済みだが、既存データは全て B フレームを含まない (遅延なしの destroy + recreate 経路の検証用)。`max_display_delay > 0` や B フレームを含む入力を実機で検証するテスト基盤は未整備のため、この可能性を検証できていない。
 
 したがって、この項目は develop ブランチの確定した不具合ではなく、実機検証が必要なリスクとして扱う。
 
@@ -95,4 +95,4 @@ picture index を利用する場合は、次を管理する。
 ## 関連 issue
 
 - 0024 (open): reconfigure と decoder 再作成のハイブリッド化。公開設定の判断チェックポイントに `max_display_delay > 0` や B フレームを含む入力での遅延フレーム混在の確認がある
-- 0031 (open): display area の非ゼロ原点による `DecodedFrame` の寸法と画素領域の不一致を修正する。本 issue は、そこから分離した遅延フレームの検証と条件付き修正を扱う。`testdata/resolution-change/` は本 issue で構築された基盤を使用する
+- 0031 (closed): display area の非ゼロ原点による `DecodedFrame` の寸法と画素領域の不一致を修正する。本 issue は、そこから分離した遅延フレームの検証と条件付き修正を扱う。`testdata/resolution-change/` は本 issue で構築された基盤を使用する
