@@ -18,10 +18,12 @@
   - この仕様を変更して、エラー後にフレームのデコードを試みた場合は、常にエラーがコールバックに通知されるようにする
   - エラー発生後の Decoder インスタンスが復旧することはないので、必要なら利用側で Decoder インスタンスを作り直すこと
   - @sile
-- [ADD] Decoder::stats() / Encoder::stats() で内部状態 (counter / gauge) を取得できるようにする
+- [CHANGE] `DecoderConfig` に `reconfigure_enabled` フィールドを追加する
+  - `false` (推奨値) は従来どおりシーケンス変更ごとに decoder を再作成する
+  - `true` は現在の decoder session の上限以内の解像度変化を `cuvidReconfigureDecoder` で再構成する
+  - `true` は `max_display_delay > 0` と組み合わせられない (組み合わせた場合は `Decoder::new` が設定エラーを返す)
   - @sile
-- [UPDATE] ストリーム中の解像度変化を decoder の再作成と in-place 再構成のハイブリッドで処理する
-  - 利用側で最大解像度を指定せず、現在の decoder session の上限以内では再構成し、上限を超えた場合は再作成する
+- [ADD] Decoder::stats() / Encoder::stats() で内部状態 (counter / gauge) を取得できるようにする
   - @sile
 - [FIX] Decoder の display area と DecodedFrame の画素領域が一致しない問題を修正する
   - display area の left / top が非ゼロの場合、公開する寸法は表示領域の寸法 (crop 後) なのに、画素データは mapped output surface の左上を起点にコピーされていた

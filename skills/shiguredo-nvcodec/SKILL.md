@@ -408,7 +408,11 @@ encoder.encode(&new_frame, &EncodeOptions {
 
 ### デコーダー
 
-ストリーム中に解像度が変わった場合、内部でパーサーが検出して `cuvidReconfigureDecoder` による in-place 再構成と decoder の再作成を自動的に使い分ける。利用者側の操作は不要で、最大解像度の指定も不要。現在の decoder session の上限 (作成時または再作成時の coded サイズ) 以内の解像度変化は再構成で処理し、上限を超える拡大やコーデック情報の変化は再作成で処理する。
+ストリーム中に解像度が変わった場合、`DecoderConfig.reconfigure_enabled` で処理方式を選べる。最大解像度の指定は不要。
+
+- `reconfigure_enabled: false` (推奨値) は従来方式で、シーケンス変更ごとに decoder を破棄して再作成する。
+- `reconfigure_enabled: true` は、現在の decoder session の上限 (作成時または再作成時の coded サイズ) 以内の解像度変化を `cuvidReconfigureDecoder` による in-place 再構成で処理し、上限を超える拡大やコーデック情報の変化は再作成で処理する。
+- `reconfigure_enabled: true` は `max_display_delay > 0` と組み合わせられない (組み合わせた場合は `Decoder::new` が設定エラーを返す)。
 
 `DecodedFrame` はフレームごとに `width()` / `height()` を持つので、フレームごとにサイズを確認する。
 
@@ -428,9 +432,9 @@ assert_eq!(frame.width(), 1280);  // 自動的に追従
 
 | | エンコーダー | デコーダー |
 |---|---|---|
-| 仕組み | `reconfigure()` で明示的に変更 | パーサーが自動検出して再構成 / 再作成 |
-| 利用者の操作 | `ReconfigureParams` で新解像度を指定 | 不要 |
-| 制約 | `max_encode_width` / `max_encode_height` 以内 | session 上限 (作成時の coded サイズ) 以内は再構成、超過は再作成 |
+| 仕組み | `reconfigure()` で明示的に変更 | `reconfigure_enabled` に応じて再構成 / 再作成を使い分け |
+| 利用者の操作 | `ReconfigureParams` で新解像度を指定 | `reconfigure_enabled` を指定するのみ (既定は従来の再作成) |
+| 制約 | `max_encode_width` / `max_encode_height` 以内 | session 上限 (作成時または再作成時の coded サイズ) 以内は再構成、超過は再作成 |
 | 超えた場合 | エンコーダーを作り直す | 自動対応 |
 
 ## 統計値の取得
