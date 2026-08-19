@@ -556,14 +556,14 @@ impl DecoderState {
             // 初回コールバックではデコーダーを新規作成する。
             // 現在の coded サイズを session 上限 (ulMaxWidth / ulMaxHeight) に設定するため、
             // 以降の reconfigure でこの coded サイズまで戻すことが可能になる。
-            self.create_decoder(format)?;
+            self.create_decoder(format, num_decode_surfaces)?;
             self.save_reconfigure_baseline(format);
         } else if self.reconfigure_baseline.changed(format) {
             // コーデック情報 (codec / chroma_format / bit depth / progressive) が変化した場合は
             // cuvidReconfigureDecoder は same codec 限定のため破棄して再作成する。
             // 現在の coded サイズを新しい session 上限として設定し、判定ベースラインも更新して
             // 次回以降 reconfigure 経路に戻れるようにする。
-            self.destroy_and_recreate_decoder(format)?;
+            self.destroy_and_recreate_decoder(format, num_decode_surfaces)?;
             self.save_reconfigure_baseline(format);
         } else if format.coded_width > self.session_max_width
             || format.coded_height > self.session_max_height
@@ -571,7 +571,7 @@ impl DecoderState {
             // 現在の coded サイズが session 上限を超えている場合は破棄して再作成する。
             // 上限を超えたまま reconfigure すると cuvidReconfigureDecoder が失敗するため、
             // 上限を新しい coded サイズへ引き上げる。
-            self.destroy_and_recreate_decoder(format)?;
+            self.destroy_and_recreate_decoder(format, num_decode_surfaces)?;
             self.save_reconfigure_baseline(format);
         } else {
             // それ以外 (coded サイズが session 上限以内) は
@@ -605,10 +605,11 @@ impl DecoderState {
                     // reconfigure 失敗時は decoder を破棄してから再作成する。
                     // NVDEC SDK は reconfigure 失敗後の decoder 状態を明示していないため、
                     // 失敗した decoder を継続利用しない。
+                    // 再作成が成功した場合は、下の表示寸法更新を含む共通経路へ流れ、
+                    // 通常の create 経路と同じように width / height / display 原点を更新する。
                     self.stats.total_reconfigure_failure_count.inc();
-                    self.destroy_and_recreate_decoder(format)?;
+                    self.destroy_and_recreate_decoder(format, num_decode_surfaces)?;
                     self.save_reconfigure_baseline(format);
-                    return Ok(num_decode_surfaces as i32);
                 }
             }
         }
@@ -632,7 +633,11 @@ impl DecoderState {
     /// `ulMaxWidth` / `ulMaxHeight` には現在の coded サイズを設定し、以降の
     /// `cuvidReconfigureDecoder` による in-place 再構成を可能にする。
     /// 作成成功時のみ、session 上限と作成時ジオメトリを更新する。
-    fn create_decoder(&mut self, format: &sys::CUVIDEOFORMAT) -> Result<(), Error> {
+    fn create_decoder(
+        &mut self,
+        format: &sys::CUVIDEOFORMAT,
+        num_decode_surfaces: u32,
+    ) -> Result<(), Error> {
         // デコーダーの作成情報を設定
         let mut create_info: sys::CUVIDDECODECREATEINFO = unsafe { std::mem::zeroed() };
         create_info.CodecType = format.codec;
@@ -647,7 +652,7 @@ impl DecoderState {
         create_info.ulNumOutputSurfaces = 2; // 出力サーフェスの数（ダブルバッファリング用に 2 を指定）
         create_info.ulCreationFlags =
             sys::cudaVideoCreateFlags_enum_cudaVideoCreate_PreferCUVID as u64; // CUVID ハードウェアデコーダーの使用を優先するフラグ
-        create_info.ulNumDecodeSurfaces = format.min_num_decode_surfaces as u64;
+        create_info.ulNumDecodeSurfaces = num_decode_surfaces as u64;
         create_info.ulWidth = format.coded_width as u64;
         create_info.ulHeight = format.coded_height as u64;
         create_info.ulMaxWidth = format.coded_width as u64;
@@ -693,11 +698,15 @@ impl DecoderState {
     }
 
     /// 既存デコーダーを破棄してから再作成する
-    fn destroy_and_recreate_decoder(&mut self, format: &sys::CUVIDEOFORMAT) -> Result<(), Error> {
+    fn destroy_and_recreate_decoder(
+        &mut self,
+        format: &sys::CUVIDEOFORMAT,
+        num_decode_surfaces: u32,
+    ) -> Result<(), Error> {
         self.lib
             .with_context(self.ctx, || self.lib.cuvid_destroy_decoder(self.decoder))?;
         self.decoder = ptr::null_mut();
-        self.create_decoder(format)
+        self.create_decoder(format, num_decode_surfaces)
     }
 
     /// 直近の create / reconfigure 時のコーデック情報をベースラインとして保存する
