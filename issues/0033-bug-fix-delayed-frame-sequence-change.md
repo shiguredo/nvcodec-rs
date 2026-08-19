@@ -1,7 +1,7 @@
 # 0033-bug-fix-delayed-frame-sequence-change
 
 - Created: 2026-08-17
-- Completed: {YYYY-MM-DD} (例: 2024-07-01)
+- Completed: 2026-08-19
 - Branch: feature/fix-delayed-frame-sequence-change
 - Polished: {YYYY-MM-DD} (例: 2024-07-15)
 
