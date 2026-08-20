@@ -14,7 +14,7 @@ description: 時雨堂の NVIDIA Video Codec SDK バインディング shiguredo
 - **動的ロード**: CUDA ライブラリ (`libcuda.so.1` / `libnvcuvid.so.1` / `libnvidia-encode.so.1`) を `dlopen` で実行時にロード。ビルド時の CUDA Toolkit リンクは不要
 - **ハンドラー型 API**: コンストラクタで [`EncodeHandler`] / [`DecodeHandler`] を渡し、ワーカースレッド上のコールバックで結果を受け取る
 - **ケーパビリティ照会**: コーデックごとの最大解像度・対応プロファイル・対応機能をクエリ可能
-- **動的解像度変更**: エンコーダーは [`reconfigure`] で明示変更、デコーダーはストリーム中の解像度変化を自動検出
+- **動的解像度変更**: エンコーダーは [`reconfigure`] で明示変更、デコーダーはストリーム中の解像度変化を検出して再構成 / 再作成で対応
 - **依存ゼロ (ランタイム)**: `tokio` / `async-std` 等の非同期ランタイム非依存
 
 ## バージョン情報
@@ -76,7 +76,7 @@ docs.rs 向けには `DOCS_RS=1 cargo doc --no-deps` でスタブヘッダー経
 | 型 | 説明 | 主要メソッド・フィールド |
 |----|------|------------------------|
 | `Decoder<H: DecodeHandler>` | デコーダー本体。内部で `nvcodec-decoder` ワーカースレッドを起動 | `new(DecoderConfig, H)`, `decode(&[u8], H::UserData)`, `flush()`, `stats()` |
-| `DecoderConfig` | デコーダー設定 | `codec: DecoderCodec`, `device_id`, `max_num_decode_surfaces`, `max_display_delay`, `surface_format: SurfaceFormat` |
+| `DecoderConfig` | デコーダー設定 | `codec: DecoderCodec`, `device_id`, `max_num_decode_surfaces`, `max_display_delay`, `surface_format: SurfaceFormat`, `reconfigure_enabled: bool` |
 | `DecoderCodec` | デコーダー対応コーデック | `H264`, `Hevc`, `Av1`, `Vp8`, `Vp9`, `Jpeg` |
 | `SurfaceFormat` | 出力サーフェスフォーマット | `Nv12` のみ (他フォーマット要望時は `DecodedFrame` 拡張が必要) |
 | `DecodedFrame<T>` | デコード済みフレーム (NV12) | `y_plane()`, `uv_plane()`, `y_stride()`, `uv_stride()`, `width()`, `height()`, `user_data()`, `into_parts()` |
@@ -289,6 +289,7 @@ let config = DecoderConfig {
     device_id: 0,
     max_num_decode_surfaces: 20,
     max_display_delay: 0,
+    reconfigure_enabled: false,
     surface_format: SurfaceFormat::Nv12,
 };
 
@@ -408,7 +409,13 @@ encoder.encode(&new_frame, &EncodeOptions {
 
 ### デコーダー
 
-ストリーム中に解像度が変わった場合、内部でパーサーが検出して自動的にデコーダーを再作成する。利用者側の操作は不要。
+ストリーム中に解像度が変わった場合、`DecoderConfig.reconfigure_enabled` で処理方式を選べる。最大解像度の指定は不要。
+
+- `reconfigure_enabled: false` (推奨値) は、シーケンス変更ごとに decoder を破棄して再作成する。
+- `reconfigure_enabled: true` は、現在の decoder session の上限 (作成時または再作成時の coded サイズ) 以内の解像度変化を `cuvidReconfigureDecoder` による in-place 再構成で処理し、上限を超える拡大やコーデック情報の変化は再作成で処理する。
+- `reconfigure_enabled: true` は、解像度変更が頻繁に起こるストリームで、シーケンス変更ごとの decoder 再作成コスト (処理時間・遅延) を避けたい場合に指定する。一方、一度大きな解像度に達したあとに小さい解像度が長く続く場合は、decoder session の上限が大きなまま維持されるため、確保されるデコードサーフェスのメモリ消費の面では `reconfigure_enabled: false` の方が有利だ。
+- `reconfigure_enabled: true` のとき、`cuvidReconfigureDecoder` が失敗した場合は decoder を破棄して再作成し、デコードを継続する (失敗回数は `DecoderStats::total_reconfigure_failure_count` で確認できる)。
+- `reconfigure_enabled: true` は `max_display_delay > 0` と組み合わせられない (組み合わせた場合は `Decoder::new` が設定エラーを返す)。
 
 `DecodedFrame` はフレームごとに `width()` / `height()` を持つので、フレームごとにサイズを確認する。
 
@@ -428,9 +435,9 @@ assert_eq!(frame.width(), 1280);  // 自動的に追従
 
 | | エンコーダー | デコーダー |
 |---|---|---|
-| 仕組み | `reconfigure()` で明示的に変更 | パーサーが自動検出して再作成 |
-| 利用者の操作 | `ReconfigureParams` で新解像度を指定 | 不要 |
-| 制約 | `max_encode_width` / `max_encode_height` 以内 | なし |
+| 仕組み | `reconfigure()` で明示的に変更 | `reconfigure_enabled` に応じて再構成 / 再作成を使い分け |
+| 利用者の操作 | `ReconfigureParams` で新解像度を指定 | `reconfigure_enabled` を指定するのみ (推奨値は false) |
+| 制約 | `max_encode_width` / `max_encode_height` 以内 | session 上限 (作成時または再作成時の coded サイズ) 以内は再構成、超過は再作成 |
 | 超えた場合 | エンコーダーを作り直す | 自動対応 |
 
 ## 統計値の取得

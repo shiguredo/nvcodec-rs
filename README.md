@@ -32,7 +32,7 @@ CUDA ドライバー API を実行時に動的ロード (`dlopen`) するため�
 - デコード出力サーフェスフォーマット選択 (NV12 / P016 / YUV444 / NV16 / P216)
 - フレーム単位のエンコードオプション (IDR フレーム強制、SPS/PPS 出力)
 - エンコーダーのランタイム再構成 (解像度、ビットレート、フレームレート変更)
-- デコーダーの動的解像度変更の自動対応
+- デコーダーの動的解像度変更対応
 - CUDA デバイス列挙
 - CUDA ストリーム管理
 - 2D メモリコピー、ピッチ付きメモリ割り当て
@@ -134,6 +134,7 @@ let config = DecoderConfig {
     device_id: 0,
     max_num_decode_surfaces: 20,
     max_display_delay: 0,
+    reconfigure_enabled: false,
     surface_format: SurfaceFormat::Nv12,
 };
 
@@ -272,7 +273,12 @@ encoder.reconfigure(ReconfigureParams {
 
 ### デコーダー
 
-利用者側の操作は不要です。ストリーム中に解像度が変わった場合、内部で自動的にデコーダーが再作成されます。
+ストリーム中に解像度が変わる場合、`DecoderConfig.reconfigure_enabled` で処理方式を選べます。最大解像度を利用者が指定する必要はありません。
+
+- `reconfigure_enabled: false` (推奨値) は、シーケンス変更ごとに decoder を破棄して再作成します。
+- `reconfigure_enabled: true` は、現在の decoder session の上限以内の解像度変化を `cuvidReconfigureDecoder` で再構成し、上限を超える拡大やコーデック情報の変化、reconfigure 失敗は再作成で処理します。
+
+どちらの方式を使うべきかの判断基準は、`DecoderConfig::reconfigure_enabled` のドキュメントを参照してください。
 
 `DecodedFrame` はフレームごとに `width()` / `height()` を持っているので、フレームごとにサイズを確認してください。
 
@@ -298,9 +304,9 @@ assert_eq!(frame.width(), 1280);  // 自動的に変更される
 
 | | エンコーダー | デコーダー |
 |---|---|---|
-| 仕組み | `reconfigure()` で明示的に変更 | パーサーが自動検出して再作成 |
-| 利用者の操作 | `ReconfigureParams` で新解像度を指定 | 不要 |
-| 制約 | `max_encode_width` / `max_encode_height` 以内 | なし |
+| 仕組み | `reconfigure()` で明示的に変更 | `reconfigure_enabled` に応じて再構成 / 再作成を使い分け |
+| 利用者の操作 | `ReconfigureParams` で新解像度を指定 | `reconfigure_enabled` を指定するのみ (推奨値は false) |
+| 制約 | `max_encode_width` / `max_encode_height` 以内 | session 上限 (作成時または再作成時の coded サイズ) 以内は再構成、超過は再作成 |
 | 超えた場合 | エンコーダーを作り直す | 自動対応 |
 
 ## 統計値の取得
