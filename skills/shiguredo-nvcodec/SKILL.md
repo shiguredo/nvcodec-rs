@@ -14,7 +14,7 @@ description: 時雨堂の NVIDIA Video Codec SDK バインディング shiguredo
 - **動的ロード**: CUDA ライブラリ (`libcuda.so.1` / `libnvcuvid.so.1` / `libnvidia-encode.so.1`) を `dlopen` で実行時にロード。ビルド時の CUDA Toolkit リンクは不要
 - **ハンドラー型 API**: コンストラクタで [`EncodeHandler`] / [`DecodeHandler`] を渡し、ワーカースレッド上のコールバックで結果を受け取る
 - **ケーパビリティ照会**: コーデックごとの最大解像度・対応プロファイル・対応機能をクエリ可能
-- **動的解像度変更**: エンコーダーは [`reconfigure`] で明示変更、デコーダーはストリーム中の解像度変化を自動検出
+- **動的解像度変更**: エンコーダーは [`reconfigure`] で明示変更、デコーダーはストリーム中の解像度変化を検出して再構成 / 再作成で対応
 - **依存ゼロ (ランタイム)**: `tokio` / `async-std` 等の非同期ランタイム非依存
 
 ## バージョン情報

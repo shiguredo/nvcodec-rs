@@ -41,9 +41,9 @@ pub struct DecoderStats {
 
     /// cuvidReconfigureDecoder 呼び出しの通算失敗回数
     ///
-    /// 失敗後にフォールバック再作成が成功した場合もこのカウンターは増える
-    /// (総失敗回数を表す)。解像度上限超過の事前検証エラーや cuvidCreateDecoder の
-    /// 失敗は含まない。
+    /// 増えるのは cuvidReconfigureDecoder の失敗だけである。失敗後にフォールバック
+    /// 再作成が成功した場合もこのカウンターは増える (総失敗回数を表す)。
+    /// cuvidCreateDecoder の失敗はこのカウンターでは計上しない。
     pub total_reconfigure_failure_count: Counter,
 
     /// decode() で正常に送信された通算回数
@@ -2132,7 +2132,6 @@ mod tests {
         frames
     }
 
-    /// テストデータを 1 フレームずつデコードして、フレームとエラーを収集する
     /// テストデータを 1 フレームずつデコードして、フレーム・エラー・reconfigure 統計を収集する
     ///
     /// 戻り値は (デコードされたフレーム, エラー, total_create_decoder_count,
@@ -2162,8 +2161,6 @@ mod tests {
         }
         let _ = decoder.flush();
 
-        // reconfigure 経路では、初回の cuvidCreateDecoder だけが呼ばれ、
-        // 以降のシーケンス変更は cuvidReconfigureDecoder で処理されるはず
         let create_count = decoder.stats().total_create_decoder_count.get();
         let reconfigure_count = decoder.stats().total_reconfigure_decoder_count.get();
         let reconfigure_failure_count = decoder.stats().total_reconfigure_failure_count.get();
