@@ -305,7 +305,7 @@ assert_eq!(frame.width(), 1280);  // 自動的に変更される
 | | エンコーダー | デコーダー |
 |---|---|---|
 | 仕組み | `reconfigure()` で明示的に変更 | `reconfigure_enabled` に応じて再構成 / 再作成を使い分け |
-| 利用者の操作 | `ReconfigureParams` で新解像度を指定 | `reconfigure_enabled` を指定するのみ (既定は破棄して再作成) |
+| 利用者の操作 | `ReconfigureParams` で新解像度を指定 | `reconfigure_enabled` を指定するのみ (推奨値は false) |
 | 制約 | `max_encode_width` / `max_encode_height` 以内 | session 上限 (作成時または再作成時の coded サイズ) 以内は再構成、超過は再作成 |
 | 超えた場合 | エンコーダーを作り直す | 自動対応 |
 

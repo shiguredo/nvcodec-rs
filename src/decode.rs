@@ -567,10 +567,11 @@ impl DecoderState {
         } else if !self.reconfigure_enabled || self.reconfigure_baseline.changed(format) {
             // reconfigure_enabled == false の場合は、シーケンス変更ごとに decoder を破棄して
             // 再作成する。
-            // また、コーデック情報 (codec / chroma_format / bit depth / progressive) が
-            // 変化した場合は cuvidReconfigureDecoder は same codec 限定のため破棄して再作成する。
-            // 現在の coded サイズを新しい session 上限として設定し、判定ベースラインも更新して
-            // 次回以降 reconfigure 経路に戻れるようにする。
+            // reconfigure_enabled == true の場合でも、コーデック情報
+            // (codec / chroma_format / bit depth / progressive) が変化した場合は
+            // cuvidReconfigureDecoder は same codec 限定のため破棄して再作成する。
+            // 再作成時は現在の coded サイズを新しい session 上限として設定し、
+            // 判定ベースラインも更新する。
             self.destroy_and_recreate_decoder(format, num_decode_surfaces)?;
             self.save_reconfigure_baseline(format);
         } else if format.coded_width > self.session_max_width
@@ -639,7 +640,8 @@ impl DecoderState {
     ///
     /// `ulMaxWidth` / `ulMaxHeight` には現在の coded サイズを設定し、以降の
     /// `cuvidReconfigureDecoder` による in-place 再構成を可能にする。
-    /// 作成成功時のみ、session 上限と作成時ジオメトリを更新する。
+    /// 作成成功時のみ session 上限を更新する。
+    /// 表示寸法と mapped output surface の実寸法は呼び出し元の共通経路で更新する。
     fn create_decoder(
         &mut self,
         format: &sys::CUVIDEOFORMAT,
@@ -667,9 +669,9 @@ impl DecoderState {
         create_info.ulTargetWidth = format.coded_width as u64;
         create_info.ulTargetHeight = format.coded_height as u64;
 
-        // display_area は設定しない (zeroed のまま)。mapped output surface は coded サイズ全体で
-        // あり、表示領域はソフトウェア側で display_area の原点からコピーする方式のため、
-        // HW の display_area による crop は使わない。
+        // display_area は設定しない (zeroed のまま)。mapped output surface は
+        // coded サイズ全体であり、表示領域はソフトウェア側で display_area の原点から
+        // コピーする方式のため、HW の display_area による crop は使わない。
         // パーサーと共有するコンテキストロックを使用
         create_info.vidLock = self.ctx_lock;
 
