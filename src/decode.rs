@@ -139,6 +139,12 @@ pub struct DecoderConfig {
     /// 解像度変化を `cuvidReconfigureDecoder` で処理し、上限を超える拡大や
     /// コーデック情報の変化は再作成する。
     ///
+    /// `true` は、解像度変更が頻繁に起こるストリームで、シーケンス変更ごとの
+    /// decoder 再作成コスト (処理時間・遅延) を避けたい場合に指定する。
+    /// 一方、一度大きな解像度に達したあとに小さい解像度が長く続く場合は、
+    /// decoder session の上限が大きなまま維持されるため、確保されるデコードサーフェスの
+    /// メモリ消費の面では `false` の方が有利になる。
+    ///
     /// `true` のとき、`cuvidReconfigureDecoder` が失敗した場合は decoder を破棄して
     /// 再作成し、デコードを継続する。失敗回数は
     /// [`DecoderStats::total_reconfigure_failure_count`] で確認できる。
