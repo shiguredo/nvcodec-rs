@@ -1,6 +1,7 @@
 # 0024-change-decoder-resolution-change-strategy
 
 - Created: 2026-08-05
+- Completed: 2026-08-20
 - Branch: feature/change-decoder-reconfigure-strategy
 - Updated: 2026-08-19
 
@@ -162,7 +163,28 @@ reconfigure で issue 0031 の出力契約を維持できない条件は、decod
 
 ## 解決方法
 
-実装と実機調査の完了後に、公開設定の判断チェックポイントの結果、採用する方式、公開 API の最終形を本節へ記録する。
+`reconfigure_enabled: bool` を公開設定として追加し、利用側が処理方式を選べる形にした。`false` (推奨値) はシーケンス変更ごとに decoder を破棄して再作成し、`true` は現在の decoder session の上限以内の解像度変化を `cuvidReconfigureDecoder` で処理する。
+
+### 採用した方式
+
+- 出力は方式 2 (mapped output surface を coded サイズ全体とし、表示領域をソフトウェア側で display_area の原点からコピーする) に一貫化した。`CUVIDDECODECREATEINFO.display_area` と `CUVIDRECONFIGUREDECODERINFO.display_area` は設定しない
+- reconfigure の `ulWidth` / `ulHeight` / `ulTargetWidth` / `ulTargetHeight` はすべて現在の coded サイズを渡す。作成時 target を固定する方式は、mapped output surface の実寸法と公開する寸法がずれるため採用しない
+- `cuvidReconfigureDecoder` が失敗した場合は、decoder を破棄して現在の sequence から再作成し、デコードを継続する (失敗回数は `DecoderStats::total_reconfigure_failure_count` で確認できる)
+- `reconfigure_enabled == true` は `max_display_delay > 0` と組み合わせられず、`Decoder::new` が設定エラーとして拒否する
+
+### 実機検証結果
+
+CI (NVIDIA GPU) で以下が成功した。
+
+- 320x240 → 256x160 → 320x240 の reconfigure 経路 (H.264 / H.265 / VP8 / VP9 / AV1): 初回 create のみで再作成なし、全フレーム欠落なし
+- 256x160 → 320x240 → 256x160 の経路: 上限超過の拡大で再作成、その後の縮小は reconfigure
+- `reconfigure_enabled == false` の destroy + create 経路: シーケンス変更ごとに再作成
+
+これにより、縮小 reconfigure が decode まで成立することが実機で確認できた。事前の target 縮小判定による再作成フォールバックは不要と判断した。
+
+### 残課題
+
+- 画素一致 (Y / UV データ) の実機検証は、パターン映像テストデータの整備が必要なため残課題とする
 
 ### 変更対象ファイル
 
