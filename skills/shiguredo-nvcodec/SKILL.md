@@ -76,7 +76,7 @@ docs.rs 向けには `DOCS_RS=1 cargo doc --no-deps` でスタブヘッダー経
 | 型 | 説明 | 主要メソッド・フィールド |
 |----|------|------------------------|
 | `Decoder<H: DecodeHandler>` | デコーダー本体。内部で `nvcodec-decoder` ワーカースレッドを起動 | `new(DecoderConfig, H)`, `decode(&[u8], H::UserData)`, `flush()`, `stats()` |
-| `DecoderConfig` | デコーダー設定 | `codec: DecoderCodec`, `device_id`, `max_num_decode_surfaces`, `max_display_delay`, `surface_format: SurfaceFormat` |
+| `DecoderConfig` | デコーダー設定 | `codec: DecoderCodec`, `device_id`, `max_num_decode_surfaces`, `max_display_delay`, `surface_format: SurfaceFormat`, `reconfigure_enabled: bool` |
 | `DecoderCodec` | デコーダー対応コーデック | `H264`, `Hevc`, `Av1`, `Vp8`, `Vp9`, `Jpeg` |
 | `SurfaceFormat` | 出力サーフェスフォーマット | `Nv12` のみ (他フォーマット要望時は `DecodedFrame` 拡張が必要) |
 | `DecodedFrame<T>` | デコード済みフレーム (NV12) | `y_plane()`, `uv_plane()`, `y_stride()`, `uv_stride()`, `width()`, `height()`, `user_data()`, `into_parts()` |
@@ -289,6 +289,7 @@ let config = DecoderConfig {
     device_id: 0,
     max_num_decode_surfaces: 20,
     max_display_delay: 0,
+    reconfigure_enabled: false,
     surface_format: SurfaceFormat::Nv12,
 };
 
@@ -410,8 +411,9 @@ encoder.encode(&new_frame, &EncodeOptions {
 
 ストリーム中に解像度が変わった場合、`DecoderConfig.reconfigure_enabled` で処理方式を選べる。最大解像度の指定は不要。
 
-- `reconfigure_enabled: false` (推奨値) は従来方式で、シーケンス変更ごとに decoder を破棄して再作成する。
+- `reconfigure_enabled: false` (推奨値) は、シーケンス変更ごとに decoder を破棄して再作成する。
 - `reconfigure_enabled: true` は、現在の decoder session の上限 (作成時または再作成時の coded サイズ) 以内の解像度変化を `cuvidReconfigureDecoder` による in-place 再構成で処理し、上限を超える拡大やコーデック情報の変化は再作成で処理する。
+- `reconfigure_enabled: true` のとき、`cuvidReconfigureDecoder` が失敗した場合は decoder を破棄して再作成し、デコードを継続する (失敗回数は `DecoderStats::total_reconfigure_failure_count` で確認できる)。
 - `reconfigure_enabled: true` は `max_display_delay > 0` と組み合わせられない (組み合わせた場合は `Decoder::new` が設定エラーを返す)。
 
 `DecodedFrame` はフレームごとに `width()` / `height()` を持つので、フレームごとにサイズを確認する。
@@ -433,7 +435,7 @@ assert_eq!(frame.width(), 1280);  // 自動的に追従
 | | エンコーダー | デコーダー |
 |---|---|---|
 | 仕組み | `reconfigure()` で明示的に変更 | `reconfigure_enabled` に応じて再構成 / 再作成を使い分け |
-| 利用者の操作 | `ReconfigureParams` で新解像度を指定 | `reconfigure_enabled` を指定するのみ (既定は従来の再作成) |
+| 利用者の操作 | `ReconfigureParams` で新解像度を指定 | `reconfigure_enabled` を指定するのみ (既定は破棄して再作成) |
 | 制約 | `max_encode_width` / `max_encode_height` 以内 | session 上限 (作成時または再作成時の coded サイズ) 以内は再構成、超過は再作成 |
 | 超えた場合 | エンコーダーを作り直す | 自動対応 |
 

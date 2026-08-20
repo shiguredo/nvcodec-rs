@@ -134,10 +134,14 @@ pub struct DecoderConfig {
 
     /// ストリーム中の解像度変化を `cuvidReconfigureDecoder` で再構成するかどうか
     ///
-    /// `false` (推奨値) は従来方式で、シーケンス変更ごとに decoder を破棄して再作成する。
+    /// `false` (推奨値) は、シーケンス変更ごとに decoder を破棄して再作成する。
     /// `true` は、現在の decoder session の上限 (作成時または再作成時の coded サイズ) 以内の
     /// 解像度変化を `cuvidReconfigureDecoder` で処理し、上限を超える拡大や
     /// コーデック情報の変化は再作成する。
+    ///
+    /// `true` のとき、`cuvidReconfigureDecoder` が失敗した場合は decoder を破棄して
+    /// 再作成し、デコードを継続する。失敗回数は
+    /// [`DecoderStats::total_reconfigure_failure_count`] で確認できる。
     ///
     /// `true` は `max_display_delay > 0` と組み合わせられない。reconfigure は decoder を
     /// 残すため、表示遅延中の旧 sequence の picture が新しいジオメトリでコピーされる
@@ -177,9 +181,6 @@ struct DecoderState {
     // reconfigure の適用可否判定に使い、coded サイズがこの上限を超える場合は再作成する。
     session_max_width: u32,
     session_max_height: u32,
-    // 初回 cuvidCreateDecoder 時に確定した出力ジオメトリ。
-    // cuvidReconfigureDecoder では target サイズと display_area をこの値に固定して渡す。
-    create_geometry: DecoderCreateGeometry,
     // 直近の create / reconfigure 時のコーデック情報。
     // reconfigure 適用可否判定のベースライン。
     reconfigure_baseline: ReconfigureBaseline,
@@ -188,22 +189,6 @@ struct DecoderState {
     // 読み書きはワーカースレッドのみ（パーサーコールバックも同スレッド）なので Mutex 不要
     callback_error: Option<Error>,
     stats: Arc<DecoderStats>,
-}
-
-/// cuvidCreateDecoder 呼び出し時に確定した出力ジオメトリ
-///
-/// cuvidReconfigureDecoder では target サイズと display_area をこの値に固定して渡す
-/// (NVIDIA 公式サンプル NvDecoder::ReconfigureDecoder と同じ挙動)。
-/// フィールド型は CUVIDDECODECREATEINFO と CUVIDRECONFIGUREDECODERINFO の
-/// 該当フィールドに合わせる。
-#[derive(Debug, Clone, Copy)]
-struct DecoderCreateGeometry {
-    target_width: u32,
-    target_height: u32,
-    display_left: i16,
-    display_top: i16,
-    display_right: i16,
-    display_bottom: i16,
 }
 
 /// cuvidReconfigureDecoder の適用可否判定用のベースライン
@@ -376,16 +361,6 @@ impl DecoderState {
                 surface_height: 0,
                 session_max_width: 0,
                 session_max_height: 0,
-                // ダミー値で初期化する。初回 sequence callback で create_decoder が呼ばれたときに
-                // 実値で上書きされるため、ここでの値は使われない。
-                create_geometry: DecoderCreateGeometry {
-                    target_width: 0,
-                    target_height: 0,
-                    display_left: 0,
-                    display_top: 0,
-                    display_right: 0,
-                    display_bottom: 0,
-                },
                 // ダミー値で初期化する。初回 sequence callback の create_decoder 後に
                 // save_reconfigure_baseline で実値が保存される。
                 reconfigure_baseline: {
@@ -590,7 +565,8 @@ impl DecoderState {
             self.create_decoder(format, num_decode_surfaces)?;
             self.save_reconfigure_baseline(format);
         } else if !self.reconfigure_enabled || self.reconfigure_baseline.changed(format) {
-            // reconfigure_enabled == false の場合は従来どおり常に破棄して再作成する。
+            // reconfigure_enabled == false の場合は、シーケンス変更ごとに decoder を破棄して
+            // 再作成する。
             // また、コーデック情報 (codec / chroma_format / bit depth / progressive) が
             // 変化した場合は cuvidReconfigureDecoder は same codec 限定のため破棄して再作成する。
             // 現在の coded サイズを新しい session 上限として設定し、判定ベースラインも更新して
@@ -609,22 +585,18 @@ impl DecoderState {
             // それ以外 (coded サイズが session 上限以内) は
             // cuvidReconfigureDecoder で in-place に再構成する。
             //
-            // ulTargetWidth / ulTargetHeight と display_area は作成時に確定した値
-            // (self.create_geometry) をそのまま渡す。新しい coded サイズを ulTargetWidth に
-            // 渡すと、既に作成時サイズで allocate された出力サーフェスとの不整合により
-            // cuvidDecodePicture が縮小時に CUDA_ERROR_INVALID_VALUE を返すため、
-            // NVIDIA 公式サンプル NvDecoder::ReconfigureDecoder と同じく作成時サイズを維持する。
+            // ulWidth / ulHeight / ulTargetWidth / ulTargetHeight には現在の coded サイズを
+            // すべて設定する。mapped output surface の寸法はその sequence の coded サイズであり、
+            // 表示領域はソフトウェア側で display_area の原点からコピーする方式のため、
+            // target を作成時サイズに固定すると surface の実寸法と公開する寸法がずれる。
+            // display_area は作成時と同じく設定しない (zeroed のまま)。
             let result = self.lib.with_context(self.ctx, || {
                 let mut reconfigure_info: sys::CUVIDRECONFIGUREDECODERINFO =
                     unsafe { std::mem::zeroed() };
                 reconfigure_info.ulWidth = format.coded_width;
                 reconfigure_info.ulHeight = format.coded_height;
-                reconfigure_info.ulTargetWidth = self.create_geometry.target_width;
-                reconfigure_info.ulTargetHeight = self.create_geometry.target_height;
-                reconfigure_info.display_area.left = self.create_geometry.display_left;
-                reconfigure_info.display_area.top = self.create_geometry.display_top;
-                reconfigure_info.display_area.right = self.create_geometry.display_right;
-                reconfigure_info.display_area.bottom = self.create_geometry.display_bottom;
+                reconfigure_info.ulTargetWidth = format.coded_width;
+                reconfigure_info.ulTargetHeight = format.coded_height;
                 reconfigure_info.ulNumDecodeSurfaces = num_decode_surfaces;
                 self.lib
                     .cuvid_reconfigure_decoder(self.decoder, &mut reconfigure_info)
@@ -646,12 +618,15 @@ impl DecoderState {
             }
         }
 
-        // 成功した経路に合わせて幅・高さを更新する。
-        // surface サイズは create 経路でのみ更新し、reconfigure 経路では
-        // mapped output surface の実寸法 (作成時 target サイズ) を維持する。
+        // 成功した経路に合わせて寸法を更新する。
+        // reconfigure 経路も target を現在の coded サイズに合わせているため、
+        // mapped output surface の実寸法 (surface_width / surface_height) は
+        // 現在の coded サイズに一致する。
         // 表示領域の原点 (left / top) は検証済みのため負値にはならない。
         self.width = (right - left) as u32;
         self.height = (bottom - top) as u32;
+        self.surface_width = format.coded_width;
+        self.surface_height = format.coded_height;
         self.display_area_left = left as u32;
         self.display_area_top = top as u32;
 
@@ -692,14 +667,9 @@ impl DecoderState {
         create_info.ulTargetWidth = format.coded_width as u64;
         create_info.ulTargetHeight = format.coded_height as u64;
 
-        // display_area は以降の cuvidReconfigureDecoder でも同じ値を再度渡す必要があるため
-        // ここで明示的に設定する (i32 → i16 のキャストは display_area の検証で
-        // 負値 / 逆転を弾いており、実用上の解像度は i16 の上限を超えないため安全)。
-        create_info.display_area.left = format.display_area.left as i16;
-        create_info.display_area.top = format.display_area.top as i16;
-        create_info.display_area.right = format.display_area.right as i16;
-        create_info.display_area.bottom = format.display_area.bottom as i16;
-
+        // display_area は設定しない (zeroed のまま)。mapped output surface は coded サイズ全体で
+        // あり、表示領域はソフトウェア側で display_area の原点からコピーする方式のため、
+        // HW の display_area による crop は使わない。
         // パーサーと共有するコンテキストロックを使用
         create_info.vidLock = self.ctx_lock;
 
@@ -709,22 +679,10 @@ impl DecoderState {
         })?;
         self.stats.total_create_decoder_count.inc();
 
-        // 作成時ジオメトリを保存する
-        // 以降の cuvidReconfigureDecoder では target サイズと display_area をこの値に固定して渡す
-        self.create_geometry = DecoderCreateGeometry {
-            target_width: format.coded_width,
-            target_height: format.coded_height,
-            display_left: create_info.display_area.left,
-            display_top: create_info.display_area.top,
-            display_right: create_info.display_area.right,
-            display_bottom: create_info.display_area.bottom,
-        };
-
-        // 作成時に確定した session 上限と、mapped output surface の実寸法を保存する
+        // 作成時に確定した session 上限を保存する。
+        // 以降の cuvidReconfigureDecoder はこの上限以内の解像度変化にのみ適用する。
         self.session_max_width = format.coded_width;
         self.session_max_height = format.coded_height;
-        self.surface_width = format.coded_width;
-        self.surface_height = format.coded_height;
 
         Ok(())
     }

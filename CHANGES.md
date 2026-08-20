@@ -19,8 +19,9 @@
   - エラー発生後の Decoder インスタンスが復旧することはないので、必要なら利用側で Decoder インスタンスを作り直すこと
   - @sile
 - [CHANGE] `DecoderConfig` に `reconfigure_enabled` フィールドを追加する
-  - `false` (推奨値) は従来どおりシーケンス変更ごとに decoder を再作成する
+  - `false` (推奨値) はシーケンス変更ごとに decoder を再作成する
   - `true` は現在の decoder session の上限以内の解像度変化を `cuvidReconfigureDecoder` で再構成する
+  - `true` のとき、`cuvidReconfigureDecoder` が失敗した場合は decoder を破棄して再作成し、デコードを継続する (失敗回数は `DecoderStats::total_reconfigure_failure_count` で確認できる)
   - `true` は `max_display_delay > 0` と組み合わせられない (組み合わせた場合は `Decoder::new` が設定エラーを返す)
   - @sile
 - [ADD] Decoder::stats() / Encoder::stats() で内部状態 (counter / gauge) を取得できるようにする

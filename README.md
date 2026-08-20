@@ -134,6 +134,7 @@ let config = DecoderConfig {
     device_id: 0,
     max_num_decode_surfaces: 20,
     max_display_delay: 0,
+    reconfigure_enabled: false,
     surface_format: SurfaceFormat::Nv12,
 };
 
@@ -274,8 +275,9 @@ encoder.reconfigure(ReconfigureParams {
 
 ストリーム中に解像度が変わる場合、`DecoderConfig.reconfigure_enabled` で処理方式を選べます。最大解像度を利用者が指定する必要はありません。
 
-- `reconfigure_enabled: false` (推奨値) は従来方式で、シーケンス変更ごとに decoder を破棄して再作成します。
+- `reconfigure_enabled: false` (推奨値) は、シーケンス変更ごとに decoder を破棄して再作成します。
 - `reconfigure_enabled: true` は、現在の decoder session の上限 (作成時または再作成時の coded サイズ) 以内の解像度変化を `cuvidReconfigureDecoder` による in-place 再構成で処理し、上限を超える拡大やコーデック情報の変化は再作成で処理します。
+- `reconfigure_enabled: true` のとき、`cuvidReconfigureDecoder` が失敗した場合は decoder を破棄して再作成し、デコードを継続します (失敗回数は `DecoderStats::total_reconfigure_failure_count` で確認できます)。
 - `reconfigure_enabled: true` は `max_display_delay > 0` と組み合わせられません (組み合わせた場合は `Decoder::new` が設定エラーを返します)。
 
 `DecodedFrame` はフレームごとに `width()` / `height()` を持っているので、フレームごとにサイズを確認してください。
@@ -303,7 +305,7 @@ assert_eq!(frame.width(), 1280);  // 自動的に変更される
 | | エンコーダー | デコーダー |
 |---|---|---|
 | 仕組み | `reconfigure()` で明示的に変更 | `reconfigure_enabled` に応じて再構成 / 再作成を使い分け |
-| 利用者の操作 | `ReconfigureParams` で新解像度を指定 | `reconfigure_enabled` を指定するのみ (既定は従来の再作成) |
+| 利用者の操作 | `ReconfigureParams` で新解像度を指定 | `reconfigure_enabled` を指定するのみ (既定は破棄して再作成) |
 | 制約 | `max_encode_width` / `max_encode_height` 以内 | session 上限 (作成時または再作成時の coded サイズ) 以内は再構成、超過は再作成 |
 | 超えた場合 | エンコーダーを作り直す | 自動対応 |
 
