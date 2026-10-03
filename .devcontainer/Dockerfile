@@ -20,11 +20,12 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && rm -rf /var/lib/apt/lists/*
 
 # Rust ツールチェインのインストール
-RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain stable
+# バージョンは Cargo.toml の rust-version (MSRV) と揃える
+RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain 1.93
 ENV PATH="/root/.cargo/bin:${PATH}"
 
-# clippy / rustfmt コンポーネント (rust-toolchain.toml と同期)
-RUN rustup component add clippy rustfmt
+# clippy / rustfmt / llvm-tools コンポーネント (rust-toolchain.toml と同期)
+RUN rustup component add clippy rustfmt llvm-tools
 
 # x86_64 ターゲットのツールチェインを追加 (arm64 ホストからクロスビルドするため)
 RUN rustup target add x86_64-unknown-linux-gnu
