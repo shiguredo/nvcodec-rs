@@ -1,6 +1,6 @@
 ---
 name: shiguredo-nvcodec
-description: 時雨堂の NVIDIA Video Codec SDK バインディング shiguredo_nvcodec の機能・API リファレンス。NVENC/NVCUVID によるハードウェアエンコード/デコード、コーデック情報照会、CUDA リソース管理、動的解像度変更に関する質問時に使用。
+description: 時雨堂の NVIDIA Video Codec SDK バインディング shiguredo_nvcodec の機能・API リファレンス。NVENC/NVCUVID によるハードウェアエンコード/デコード、コーデック情報照会、CUDA リソース管理、動的解像度変更、統計値取得に関する質問時に使用。
 ---
 
 # shiguredo_nvcodec
@@ -15,12 +15,13 @@ description: 時雨堂の NVIDIA Video Codec SDK バインディング shiguredo
 - **ハンドラー型 API**: コンストラクタで [`EncodeHandler`] / [`DecodeHandler`] を渡し、ワーカースレッド上のコールバックで結果を受け取る
 - **ケーパビリティ照会**: コーデックごとの最大解像度・対応プロファイル・対応機能をクエリ可能
 - **動的解像度変更**: エンコーダーは [`reconfigure`] で明示変更、デコーダーはストリーム中の解像度変化を検出して再構成 / 再作成で対応
+- **統計値**: `Decoder::stats()` / `Encoder::stats()` で counter / gauge を取得できる
 - **依存ゼロ (ランタイム)**: `tokio` / `async-std` 等の非同期ランタイム非依存
 
 ## バージョン情報
 
 - crate 名: `shiguredo_nvcodec`
-- バージョン: 2026.2.0
+- バージョン: 2026.3.0
 - Rust Edition: 2024
 - 最小 Rust バージョン: 1.95
 - ライセンス: Apache-2.0
@@ -31,9 +32,11 @@ description: 時雨堂の NVIDIA Video Codec SDK バインディング shiguredo
 - Linux (x86_64)
 - NVIDIA GPU (Kepler 世代以降)
 - NVIDIA ドライバー (CUDA ドライバー API を含む)
-- ビルド時のみ: NVIDIA Video Codec SDK 13.0 以降のヘッダーファイル (`third_party/` 配下に配置)
+- ビルド時: Rust 1.95 以降、clang (bindgen が利用する libclang)
 
-docs.rs 向けには `DOCS_RS=1 cargo doc --no-deps` でスタブヘッダー経由のドキュメント生成のみ可能。
+NVIDIA Video Codec SDK 13.0.19 のヘッダーファイルは `third_party/nvcodec/include/` に同梱されている。CUDA Toolkit は不要で、CUDA ヘッダーファイルは `third_party/cuda/include/` のスタブを使用する。
+
+docs.rs 向けには `DOCS_RS=1 cargo doc --no-deps` で、build.rs が生成するダミー定義を使ったドキュメント生成のみ可能。
 
 ## コア API
 
@@ -51,7 +54,7 @@ docs.rs 向けには `DOCS_RS=1 cargo doc --no-deps` でスタブヘッダー経
 | `ReconfigureParams` | 動的再構成パラメータ (全フィールド `Option`) | `width`, `height`, `framerate_num`, `framerate_den`, `average_bitrate`, `max_bitrate` |
 | `EncodedFrame<T>` | エンコード済みフレーム | `data()`, `timestamp()`, `picture_type()`, `user_data()`, `into_parts()` |
 | `EncoderCaps` | エンコーダケーパビリティ | `supported_ratecontrol_modes`, `support_yuv444_encode`, `support_yuv422_encode`, `support_meonly_mode`, `width_max/min`, `height_max/min`, `num_max_bframes`, `support_10bit_encode`, `support_lossless_encode`, `support_lookahead`, `support_temporal_aq` |
-| `EncoderStats` | エンコーダ統計値 (全フィールド `Counter`) | counter: `total_encoder_buffer_full_count` / gauge: `max_in_flight_frames` |
+| `EncoderStats` | エンコーダ統計値 | counter: `total_encoder_buffer_full_count` / gauge: `max_in_flight_frames` |
 | `Counter` | 統計値のプリミティブ型 (通算値。`AtomicU64` の薄いラッパー。共有は `Arc<DecoderStats>` / `Arc<EncoderStats>` で行う。`inc()` は crate 内部のみ) | `new()`, `get() -> u64` |
 | `Gauge` | 統計値のプリミティブ型 (時点値。`AtomicU64` の薄いラッパー。共有は `Arc<DecoderStats>` / `Arc<EncoderStats>` で行う。`set()` は crate 内部のみ) | `new()`, `get() -> u64` |
 
@@ -81,11 +84,11 @@ docs.rs 向けには `DOCS_RS=1 cargo doc --no-deps` でスタブヘッダー経
 | `SurfaceFormat` | 出力サーフェスフォーマット | `Nv12` のみ (他フォーマット要望時は `DecodedFrame` 拡張が必要) |
 | `DecodedFrame<T>` | デコード済みフレーム (NV12) | `y_plane()`, `uv_plane()`, `y_stride()`, `uv_stride()`, `width()`, `height()`, `user_data()`, `into_parts()` |
 | `DecoderCaps` | デコーダケーパビリティ | `is_supported`, `max_width`, `max_height`, `max_mb_count`, `min_width`, `min_height` |
-| `DecoderStats` | デコーダ統計値 (全フィールド `Counter`) | counter: `total_create_decoder_count`, `total_reconfigure_decoder_count`, `total_reconfigure_failure_count`, `total_decode_count`, `total_sequence_callback_count`, `total_decode_callback_count`, `total_output_frame_count` |
+| `DecoderStats` | デコーダ統計値 (全フィールド `Counter`) | counter: `total_create_decoder_count`, `total_reconfigure_decoder_count`, `total_reconfigure_failure_count`, `total_decode_count`, `total_sequence_callback_count`, `total_decode_callback_count`, `total_output_frame_count` / `in_flight_frames() -> u64` (入力済みで未出力のフレーム数) |
 
 #### デコードサーフェス数の決定
 
-`DecoderConfig.max_num_decode_surfaces` はデコードサーフェス数の上限を指定する。`0` は指定できず、`Decoder::new` が設定エラーとして拒否する。NVDEC が正しいデコードに必要な最小サーフェス数 (`CUVIDEOFORMAT.min_num_decode_surfaces`) がこの上限を超える場合は、`decode()` 中の sequence callback で既存 decoder を破棄する前にエラーを返す。
+`DecoderConfig.max_num_decode_surfaces` はデコードサーフェス数の上限を指定する。`0` は指定できず、`Decoder::new` が設定エラーとして拒否する。NVDEC が正しいデコードに必要な最小サーフェス数 (`CUVIDEOFORMAT.min_num_decode_surfaces`) がこの上限を超える場合は、`decode()` 中の sequence callback で既存 decoder を破棄する前に、エラーをコールバックに通知して Decoder を終端させる。
 
 実際に parser と decoder の両方へ適用する実効サーフェス数は、`min_num_decode_surfaces` と `max_num_decode_surfaces` から次の規則で決定する。実効サーフェス数は常に `max_num_decode_surfaces` 以下になる。
 
@@ -97,6 +100,17 @@ docs.rs 向けには `DOCS_RS=1 cargo doc --no-deps` でスタブヘッダー経
 - `min_num_decode_surfaces == 1` かつ `max_num_decode_surfaces == 1` なら、実効サーフェス数として 1 を使う
 
 codec 別の固定サーフェス数は使わない。`min_num_decode_surfaces` を超えるサーフェス数は性能とメモリ使用量の調整であり、正しさのための必須条件ではない。
+
+#### デコーダーの終端状態
+
+デコード中にエラーが発生すると、その Decoder インスタンスは終端状態に遷移する。終端状態では以降の `decode()` はデコードを行わず、常にエラーをコールバックする。
+
+- 終端状態に遷移した時点で出力待ちだったフレームにはコールバックが呼び出されない
+- 終端状態では `flush()` は未完了フレームの出力を待たずに戻る
+- `decode()` の呼び出し回数と `on_decoded()` の呼び出し回数は一致しないことがある
+- 終端状態の Decoder は復旧できないため、新しい Decoder を作り直すこと
+
+出力は 8bit NV12 のみ対応するため、10bit 以上の入力 (`bit_depth_luma_minus8 != 0`) はデコード不可として拒否し、Decoder を終端させる。
 
 ### ハンドラートレイト
 
@@ -120,8 +134,11 @@ codec 別の固定サーフェス数は使わない。`min_num_decode_surfaces` 
 | `EncoderCodec` | エンコード対応コーデック (`H264`, `Hevc`, `Av1`) |
 | `CodecInfo` | コーデックごとの情報 (`codec`, `decoding: DecodingInfo`, `encoding: EncodingInfo`) |
 | `DecodingInfo` | デコード情報 (`supported`, `hardware_accelerated`, `max_width/height`, `min_width/height`, `max_mb_count`) |
-| `EncodingInfo` | エンコード情報 (`supported`, `profiles: EncodingProfiles`, `max_width/height`, `min_width/height`, `num_max_bframes`, `supports_yuv444/yuv422/10bit/lossless/lookahead/temporal_aq`, `supported_ratecontrol_modes`) |
+| `EncodingInfo` | エンコード情報 (`supported`, `hardware_accelerated`, `profiles: EncodingProfiles`, `max_width/height`, `min_width/height`, `num_max_bframes`, `supports_yuv444/yuv422/10bit/lossless/lookahead/temporal_aq`, `supported_ratecontrol_modes`) |
 | `EncodingProfiles` | コーデック別プロファイル一覧 (`H264(Vec<H264EncodingProfile>)`, `Hevc(Vec<HevcEncodingProfile>)`, `Av1(Vec<Av1EncodingProfile>)`, `None`) |
+| `H264EncodingProfile` | H.264 のエンコードプロファイル (`Baseline`, `Main`, `High`, `High10`, `High422`, `High444`, `Stereo`, `ProgressiveHigh`, `ConstrainedHigh`) |
+| `HevcEncodingProfile` | HEVC のエンコードプロファイル (`Main`, `Main10`, `Frext`) |
+| `Av1EncodingProfile` | AV1 のエンコードプロファイル (`Main`) |
 
 `EncodingInfo::hardware_accelerated` と `DecodingInfo::hardware_accelerated` は NVENC / NVDEC が常にハードウェア処理であるため `supported` と同値。
 
@@ -138,7 +155,7 @@ codec 別の固定サーフェス数は使わない。`min_num_decode_surfaces` 
 | `MemoryType` | `Host` / `Device` |
 | `CudaStream` | 非同期 GPU 操作用のストリーム。`new()`, `synchronize()`, `as_raw() -> CUstream`. `Drop` で破棄 |
 
-### バージョン情報
+### ビルド時に参照したバージョン
 
 | 定数 | 説明 |
 |------|------|
@@ -146,9 +163,9 @@ codec 別の固定サーフェス数は使わない。`min_num_decode_surfaces` 
 
 ## エラー型
 
-`Error` は CUDA / NVENC / クレート起因のエラーをまとめて表現する struct。`std::error::Error` と `Display` を実装。
+`Error` は CUDA / NVENC / クレート起因のエラーをまとめて表現する struct。`std::error::Error` と `Display` を実装。フィールドは非公開のため、内容は `Display` / `Debug` で確認する。
 
-| フィールド | 説明 |
+| 内部フィールド | 説明 |
 |-----------|------|
 | `function` | エラーが発生した関数名 (`&'static str`) |
 | `status_code` | CUDA / NVENC のステータスコード (`Option<u32>`) |
@@ -503,7 +520,8 @@ println!(
 
 - **OS**: Linux (x86_64) のみ。Windows / macOS は未対応
 - **GPU**: NVIDIA GPU 専用 (Kepler 世代以降)
-- **デコード出力**: 現状 `SurfaceFormat::Nv12` のみ。他フォーマットを追加するには `DecodedFrame` のプレーン構造拡張とコピー処理の分岐が必要
+- **デコード出力**: 現状 `SurfaceFormat::Nv12` (8bit) のみ。他フォーマットを追加するには `DecodedFrame` のプレーン構造拡張とコピー処理の分岐が必要
+- **10bit 入力**: 出力は 8bit NV12 のみのため、10bit 以上の入力はデコード不可として拒否し Decoder を終端させる
 - **エンコードコーデック**: VP8 / VP9 / JPEG は NVENC でエンコード非対応 (デコードのみ)
 - **`bindgen` 自動変換の限界**: `#define` 定数や一部の `static` 変数は `build.rs` で直接定義しているため、SDK バージョン更新時は `build.rs` も併せて更新する必要がある
 - **`third_party/` の更新**: NVIDIA Video Codec SDK のヘッダーは要ログインダウンロードのため `build.rs` でフェッチせず手動配置している。バージョン更新時は `Cargo.toml` の `[package.metadata.external-dependencies.nvcodec]` と `third_party/` の両方を更新する

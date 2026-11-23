@@ -29,7 +29,7 @@ CUDA ドライバー API を実行時に動的ロード (`dlopen`) するため�
 - CUDA ライブラリの実行時動的ロード (ビルド時の CUDA Toolkit リンク不要)
 - エンコーダー / デコーダーのケーパビリティクエリ
 - エンコード入力バッファフォーマット選択 (NV12 / YV12 / I420 / YUV444 / 10bit / ARGB / ABGR)
-- デコード出力サーフェスフォーマット選択 (NV12 / P016 / YUV444 / NV16 / P216)
+- デコード出力サーフェスフォーマット (NV12、8bit のみ)
 - フレーム単位のエンコードオプション (IDR フレーム強制、SPS/PPS 出力)
 - エンコーダーのランタイム再構成 (解像度、ビットレート、フレームレート変更)
 - デコーダーの動的解像度変更対応
@@ -42,11 +42,17 @@ CUDA ドライバー API を実行時に動的ロード (`dlopen`) するため�
 - Linux (x86_64)
 - NVIDIA GPU (Kepler 世代以降)
 - NVIDIA ドライバー (CUDA ドライバー API を含む)
-- NVIDIA Video Codec SDK 13.0 以降のヘッダーファイル (ビルド時)
+
+ビルドには次のものが必要です。
+
+- Rust 1.95 以降
+- clang (bindgen が利用する libclang)
 
 ## ビルド
 
-CUDA Toolkit がインストールされている Linux 環境でビルドしてください。
+CUDA Toolkit は不要です。CUDA ヘッダーファイルは `third_party/cuda/include/` のスタブを使用し、NVIDIA Video Codec SDK のヘッダーファイルは `third_party/nvcodec/include/` に同梱されています。
+
+CUDA Toolkit がインストールされている環境では `/usr/local/cuda/include/cuda.h` を使用します。別の場所の `cuda.h` を使う場合は `CUDA_INCLUDE_PATH` でディレクトリを指定してください。
 
 ```bash
 cargo build
@@ -54,7 +60,7 @@ cargo build
 
 ### docs.rs 向けビルド
 
-CUDA Toolkit がない環境では、同梱のスタブヘッダーを使って docs.rs 向けのドキュメント生成のみ可能です。
+`DOCS_RS=1` を指定すると、build.rs が生成するダミー定義を使ってドキュメント生成のみ行えます。CUDA Toolkit は不要です。
 
 ```bash
 DOCS_RS=1 cargo doc --no-deps
@@ -159,7 +165,11 @@ for frame in rx.try_iter() {
 }
 ```
 
-`DecoderConfig.max_num_decode_surfaces` は、デコードサーフェス数の上限を指定する。`0` は指定できず、`Decoder::new` が設定エラーとして拒否する。NVDEC が正しいデコードに必要な最小サーフェス数 (`CUVIDEOFORMAT.min_num_decode_surfaces`) がこの上限を超える場合は、`decode()` 中の sequence callback で既存 decoder を破棄する前にエラーが返る。実際に割り当てられるサーフェス数は常にこの上限以下になる。
+`DecoderConfig.max_num_decode_surfaces` は、デコードサーフェス数の上限を指定する。`0` は指定できず、`Decoder::new` が設定エラーとして拒否する。NVDEC が正しいデコードに必要な最小サーフェス数 (`CUVIDEOFORMAT.min_num_decode_surfaces`) がこの上限を超える場合は、`decode()` 中の sequence callback で既存 decoder を破棄する前に、エラーがコールバックに通知される。実際に割り当てられるサーフェス数は常にこの上限以下になる。
+
+出力は 8bit NV12 のみ対応するため、10bit 以上の入力はデコード不可としてエラーになる。
+
+デコード中にエラーが発生すると Decoder は終端状態になり、以降の `decode()` はデコードを行わず、常にエラーをコールバックする。終端状態に遷移した時点で出力待ちだったフレームにはコールバックが呼ばれない。終端状態の Decoder は復旧できないため、新しい Decoder を作り直すこと。
 
 ### エンコーダーケーパビリティクエリ
 
@@ -277,6 +287,7 @@ encoder.reconfigure(ReconfigureParams {
 
 - `reconfigure_enabled: false` (推奨値) は、シーケンス変更ごとに decoder を破棄して再作成します。
 - `reconfigure_enabled: true` は、現在の decoder session の上限以内の解像度変化を `cuvidReconfigureDecoder` で再構成し、上限を超える拡大やコーデック情報の変化、reconfigure 失敗は再作成で処理します。
+- `reconfigure_enabled: true` は `max_display_delay > 0` と組み合わせられません (組み合わせた場合は `Decoder::new` が設定エラーを返します)。
 
 どちらの方式を使うべきかの判断基準は、`DecoderConfig::reconfigure_enabled` のドキュメントを参照してください。
 
