@@ -21,7 +21,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 
 # Rust ツールチェインのインストール
 # バージョンは Cargo.toml の rust-version (MSRV) と揃える
-RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain 1.93
+RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain 1.95
 ENV PATH="/root/.cargo/bin:${PATH}"
 
 # clippy / rustfmt / llvm-tools コンポーネント (rust-toolchain.toml と同期)
