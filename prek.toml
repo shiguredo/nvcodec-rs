@@ -2,52 +2,103 @@
 # See https://prek.j178.dev for more information.
 #:schema https://www.schemastore.org/prek.json
 
+# 最初に失敗したフックで残りをスキップする
 fail_fast = true
+# stages 未指定のフックは pre-commit でだけ実行される
+default_stages = ["pre-commit"]
+# prek install で pre-commit と pre-push の両方の Git フックを入れる
+default_install_hook_types = ["pre-commit", "pre-push"]
+# third_party/ はベンダー提供のヘッダーなのでフックによる書き換え対象外にする
+exclude = { glob = ["target/**", "fuzz/target/**", "third_party/**"] }
 
+# prek 組み込みフック (オフラインで動作する Rust ネイティブ実装)
 [[repos]]
 repo = "builtin"
 hooks = [
+  # 行末の空白を取り除く
   { id = "trailing-whitespace" },
+  # ファイル末尾を改行 1 つで終わらせる
   { id = "end-of-file-fixer" },
+  # ファイル先頭の UTF-8 BOM を取り除く
+  { id = "fix-byte-order-marker" },
+  # TOML の構文エラーを検出する
   { id = "check-toml" },
+  # YAML の構文エラーを検出する
   { id = "check-yaml" },
+  # JSON の構文エラーと重複キーを検出する
+  { id = "check-json" },
+  # マージコンフリクトマーカーが残ったコミットを防ぐ
+  { id = "check-merge-conflict" },
+  # 大文字小文字だけが異なるファイル名の衝突を防ぐ
+  { id = "check-case-conflict" },
+  # Windows で使えないファイル名の混入を防ぐ
+  { id = "check-illegal-windows-names" },
+  # 大きなファイルの誤コミットを防ぐ
+  { id = "check-added-large-files" },
+  # 秘密鍵の誤コミットを防ぐ
+  { id = "detect-private-key" },
+  # 改行コードの混在を防ぐ
+  { id = "mixed-line-ending" },
+  # リンク切れのシンボリックリンクを検出する
+  { id = "check-symlinks" },
+  # シンボリックリンクだったファイルが実体ファイルとしてコミットされるのを検出する
+  { id = "destroyed-symlinks" },
+  # 実行権限のあるファイルに shebang があるか確認する
+  { id = "check-executables-have-shebangs" },
+  # shebang 付きスクリプトに実行権限があるか確認する
+  # Rust の inner attribute #![...] が shebang と誤判定されるため Rust ファイルは除外する
+  { id = "check-shebang-scripts-are-executable", exclude_types = ["rust"] },
 ]
 
+# tombi: TOML のフォーマッタ・リンタ
+# rev は prek auto-update で更新する
+[[repos]]
+repo = "https://github.com/tombi-toml/tombi-pre-commit"
+rev = "v1.2.4"
+hooks = [
+  # Cargo.lock は自動生成ファイルなので tombi の対象外にする
+  { id = "tombi-lint", exclude = { glob = "**/Cargo.lock" } },
+  { id = "tombi-format", exclude = { glob = "**/Cargo.lock" } },
+]
+
+# プロジェクト固有のローカルフック
+# priority が小さいほど先に実行される。同じ priority なら並列実行される
 [[repos]]
 repo = "local"
-hooks = [
-  {
-    id = "cargo-fmt",
-    name = "cargo fmt",
-    entry = "cargo fmt --all -- --check",
-    language = "system",
-    types = ["rust"],
-    pass_filenames = false,
-    priority = 0,
-  },
-  {
-    id = "cargo-clippy",
-    name = "cargo clippy",
-    # macOS では Apple Container 上の Linux コンテナで Rosetta 2 を使わず x86_64 ターゲットの clippy を実行する
-    # 事前に `make container-build` でイメージ (nvcodec-rs-check) を用意しておくこと
-    # ソースは bind mount するので Rust ファイルの編集はコンテナ再ビルドなしで反映される
-    # ホストの target/ と衝突しないようコンテナ内では CARGO_TARGET_DIR=/tmp/cargo-target を使う
-    entry = "sh -c 'case \"$(uname -s)\" in Darwin) container run --rm -v \"$(pwd):/workspace\" -w /workspace -e CARGO_TARGET_DIR=/tmp/cargo-target nvcodec-rs-check cargo clippy --workspace --all-targets -- -D warnings;; *) cargo clippy --workspace --all-targets -- -D warnings;; esac'",
-    language = "system",
-    types = ["rust"],
-    pass_filenames = false,
-    priority = 10,
-  },
-  {
-    id = "cargo-test",
-    name = "cargo test (Linux x86_64 only)",
-    # devcontainer は arm64 ホストから x86_64-unknown-linux-gnu にクロスビルドするため
-    # 生成バイナリをホストで実行できない。Linux x86_64 ホストでのみテストを実行する。
-    entry = "sh -c 'case \"$(uname -sm)\" in Darwin*) echo \"Skipped on macOS\"; exit 0;; \"Linux x86_64\") cargo test --workspace -- --test-threads=1;; *) echo \"Skipped on $(uname -sm)\"; exit 0;; esac'",
-    language = "system",
-    types = ["rust"],
-    pass_filenames = false,
-    always_run = true,
-    priority = 20,
-  },
-]
+
+# --all でワークスペース全体を対象にし、--check で書き換えずに未フォーマットを検出だけする
+[[repos.hooks]]
+id = "cargo-fmt"
+name = "cargo fmt"
+entry = "cargo fmt --all -- --check"
+language = "system"
+types = ["rust"]
+pass_filenames = false
+priority = 0
+
+# --all-targets でテスト・example・ベンチも lint し、-D warnings で警告をエラーに昇格する
+# macOS では Apple Container 上の Linux コンテナで Rosetta 2 を使わず x86_64 ターゲットの clippy を実行する
+# 事前に `make container-build` でイメージ (nvcodec-rs-check) を用意しておくこと
+# ソースは bind mount するので Rust ファイルの編集はコンテナ再ビルドなしで反映される
+# ホストの target/ と衝突しないようコンテナ内では CARGO_TARGET_DIR=/tmp/cargo-target を使う
+[[repos.hooks]]
+id = "cargo-clippy"
+name = "cargo clippy"
+entry = "sh -c 'case \"$(uname -s)\" in Darwin) container run --rm -v \"$(pwd):/workspace\" -w /workspace -e CARGO_TARGET_DIR=/tmp/cargo-target nvcodec-rs-check cargo clippy --workspace --all-targets -- -D warnings;; *) cargo clippy --workspace --all-targets -- -D warnings;; esac'"
+language = "system"
+types = ["rust"]
+pass_filenames = false
+priority = 10
+
+# cargo test: コミットを遅くしないため pre-push でだけ実行する
+# NVIDIA Video Codec SDK 連携バイナリは Linux x86_64 ホストでのみ実行できる
+# macOS / その他アーキテクチャではスキップする
+[[repos.hooks]]
+id = "cargo-test"
+name = "cargo test (Linux x86_64 only)"
+entry = "sh -c 'case \"$(uname -sm)\" in Darwin*) echo \"Skipped on macOS\"; exit 0;; \"Linux x86_64\") cargo test --workspace -- --test-threads=1;; *) echo \"Skipped on $(uname -sm)\"; exit 0;; esac'"
+language = "system"
+types = ["rust"]
+pass_filenames = false
+stages = ["pre-push"]
+priority = 20

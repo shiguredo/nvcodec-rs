@@ -1,10 +1,15 @@
 use std::collections::VecDeque;
 use std::ffi::c_void;
 use std::ptr;
+use std::sync::Arc;
 use std::sync::mpsc::{self, Receiver, Sender, SyncSender};
 use std::thread::JoinHandle;
 
-use crate::{CudaLibrary, Error, ReleaseGuard, sys};
+use crate::{
+    CudaLibrary, Error, ReleaseGuard,
+    stats::{Counter, Gauge},
+    sys,
+};
 
 /// プリセット
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -396,6 +401,28 @@ pub struct EncoderCaps {
     pub support_temporal_aq: bool,
 }
 
+/// エンコーダの統計値
+///
+/// `clone()` は各フィールドを個別にコピーするため、フィールド間の一貫性は保証されない。
+#[derive(Debug, Clone, Default)]
+pub struct EncoderStats {
+    /// "encoder buffer is full" エラーの通算発生回数
+    pub total_encoder_buffer_full_count: Counter,
+
+    /// "encoder buffer is full" エラーを発生させずに in-flight にできる最大フレーム数
+    /// (n_encoder_buffer - 1 = frame_interval_p + 2、生成時に確定する静的な値)
+    pub max_in_flight_frames: Gauge,
+}
+
+impl EncoderStats {
+    /// "encoder buffer is full" エラーを発生させずに in-flight にできる最大フレーム数を算出する
+    ///
+    /// (n_encoder_buffer = frame_interval_p + 3 のバッファを 1 つ空けて運用する)
+    fn max_in_flight_frames(frame_interval_p: u32) -> u64 {
+        frame_interval_p as u64 + 2
+    }
+}
+
 /// エンコーダ再構成パラメータ
 #[derive(Debug, Clone, Default)]
 pub struct ReconfigureParams {
@@ -468,6 +495,7 @@ struct EncoderState {
     i_to_send: usize,
     i_got: usize,
     mapped_inputs: Vec<Option<sys::NV_ENC_INPUT_PTR>>,
+    stats: Arc<EncoderStats>,
 }
 
 unsafe impl Send for EncoderState {}
@@ -514,6 +542,11 @@ impl EncoderState {
 
             let n_encoder_buffer = config.frame_interval_p as usize + 3;
 
+            let stats = Arc::new(EncoderStats::default());
+            stats
+                .max_in_flight_frames
+                .set(EncoderStats::max_in_flight_frames(config.frame_interval_p));
+
             let mut state = Self {
                 lib: lib.clone(),
                 ctx,
@@ -533,6 +566,7 @@ impl EncoderState {
                 i_to_send: 0,
                 i_got: 0,
                 mapped_inputs: vec![None; n_encoder_buffer],
+                stats,
             };
 
             // デフォルトパラメータでエンコーダーを初期化
@@ -1198,6 +1232,7 @@ pub struct Encoder<H: EncodeHandler> {
     job_tx: Sender<Job<H::UserData>>,
     worker: Option<JoinHandle<()>>,
     drain_handle: Option<JoinHandle<()>>,
+    stats: Arc<EncoderStats>,
 }
 
 /// drain スレッドへのリクエスト
@@ -1257,6 +1292,8 @@ impl<H: EncodeHandler> Encoder<H> {
 
         let state = EncoderState::new(&config)?;
 
+        let stats = state.stats.clone();
+
         // drain スレッドを起動
         let drain_job_tx = job_tx.clone();
         let drain_handle = std::thread::Builder::new()
@@ -1278,7 +1315,16 @@ impl<H: EncodeHandler> Encoder<H> {
             job_tx,
             worker: Some(worker),
             drain_handle: Some(drain_handle),
+            stats,
         })
+    }
+
+    /// エンコーダーの統計値を取得する
+    ///
+    /// 返される参照は共有統計値への参照であり、読み出すたびに
+    /// 最新値が読める。保持したい場合は `clone()` でスナップショットを取得する。
+    pub fn stats(&self) -> &EncoderStats {
+        &self.stats
     }
 
     /// フレームをエンコードする
@@ -1568,6 +1614,7 @@ fn run_worker<H>(
             } => {
                 // バッファが満杯の場合はエラー callback を実行する
                 if state.i_to_send - state.i_got >= state.n_encoder_buffer {
+                    state.stats.total_encoder_buffer_full_count.inc();
                     handler.on_encoded(Err(
                         Error::new_custom("encode", "encoder buffer is full").into()
                     ));
@@ -2661,25 +2708,27 @@ mod tests {
 
     #[test]
     fn test_encode_after_worker_terminated() {
-        use std::mem::ManuallyDrop;
-
         let (tx, _rx) = mpsc::sync_channel::<Result<EncodedFrame<()>, Error>>(4);
         let config = test_encoder_config(CodecConfig::H264(H264EncoderConfig {
             profile: None,
             idr_period: None,
         }));
 
-        let mut encoder = ManuallyDrop::new(
-            Encoder::new(
-                config,
-                FnEncodeHandler::new(move |frame| {
-                    let _ = tx.send(frame);
-                }),
-            )
-            .unwrap(),
-        );
+        let mut encoder = Encoder::new(
+            config,
+            FnEncodeHandler::new(move |frame| {
+                let _ = tx.send(frame);
+            }),
+        )
+        .expect("H.264 エンコーダーの作成に失敗した");
 
-        unsafe { ManuallyDrop::drop(&mut encoder) };
+        // 受信側を先に drop したチャネルで置き換えて send 失敗を検証する。
+        // drain スレッドが job_tx.clone() を保持しているためワーカースレッドは終了しない。
+        // 元の job_tx は検証後に復元してから drop する
+        // (置き換えたまま drop すると worker が recv でブロックし続け、join がデッドロックする)。
+        let (dead_tx, dead_rx) = mpsc::channel::<Job<()>>();
+        drop(dead_rx);
+        let original_job_tx = std::mem::replace(&mut encoder.job_tx, dead_tx);
 
         let result = encoder.encode(
             &[],
@@ -2695,32 +2744,33 @@ mod tests {
             "encode() failed: encoder worker thread has terminated"
         );
 
-        unsafe {
-            ManuallyDrop::drop(&mut encoder);
-        }
+        // 元の job_tx を復元してから drop する
+        encoder.job_tx = original_job_tx;
     }
 
     #[test]
     fn test_flush_after_encoder_worker_terminated() {
-        use std::mem::ManuallyDrop;
-
         let (tx, _rx) = mpsc::sync_channel::<Result<EncodedFrame<()>, Error>>(4);
         let config = test_encoder_config(CodecConfig::H264(H264EncoderConfig {
             profile: None,
             idr_period: None,
         }));
 
-        let mut encoder = ManuallyDrop::new(
-            Encoder::new(
-                config,
-                FnEncodeHandler::new(move |frame| {
-                    let _ = tx.send(frame);
-                }),
-            )
-            .unwrap(),
-        );
+        let mut encoder = Encoder::new(
+            config,
+            FnEncodeHandler::new(move |frame| {
+                let _ = tx.send(frame);
+            }),
+        )
+        .expect("H.264 エンコーダーの作成に失敗した");
 
-        unsafe { ManuallyDrop::drop(&mut encoder) };
+        // 受信側を先に drop したチャネルで置き換えて send 失敗を検証する。
+        // drain スレッドが job_tx.clone() を保持しているためワーカースレッドは終了しない。
+        // 元の job_tx は検証後に復元してから drop する
+        // (置き換えたまま drop すると worker が recv でブロックし続け、join がデッドロックする)。
+        let (dead_tx, dead_rx) = mpsc::channel::<Job<()>>();
+        drop(dead_rx);
+        let original_job_tx = std::mem::replace(&mut encoder.job_tx, dead_tx);
 
         let result = encoder.flush();
         assert_eq!(
@@ -2728,32 +2778,33 @@ mod tests {
             "flush() failed: send failed"
         );
 
-        unsafe {
-            ManuallyDrop::drop(&mut encoder);
-        }
+        // 元の job_tx を復元してから drop する
+        encoder.job_tx = original_job_tx;
     }
 
     #[test]
     fn test_reconfigure_after_encoder_worker_terminated() {
-        use std::mem::ManuallyDrop;
-
         let (tx, _rx) = mpsc::sync_channel::<Result<EncodedFrame<()>, Error>>(4);
         let config = test_encoder_config(CodecConfig::H264(H264EncoderConfig {
             profile: None,
             idr_period: None,
         }));
 
-        let mut encoder = ManuallyDrop::new(
-            Encoder::new(
-                config,
-                FnEncodeHandler::new(move |frame| {
-                    let _ = tx.send(frame);
-                }),
-            )
-            .unwrap(),
-        );
+        let mut encoder = Encoder::new(
+            config,
+            FnEncodeHandler::new(move |frame| {
+                let _ = tx.send(frame);
+            }),
+        )
+        .expect("H.264 エンコーダーの作成に失敗した");
 
-        unsafe { ManuallyDrop::drop(&mut encoder) };
+        // 受信側を先に drop したチャネルで置き換えて send 失敗を検証する。
+        // drain スレッドが job_tx.clone() を保持しているためワーカースレッドは終了しない。
+        // 元の job_tx は検証後に復元してから drop する
+        // (置き換えたまま drop すると worker が recv でブロックし続け、join がデッドロックする)。
+        let (dead_tx, dead_rx) = mpsc::channel::<Job<()>>();
+        drop(dead_rx);
+        let original_job_tx = std::mem::replace(&mut encoder.job_tx, dead_tx);
 
         let result = encoder.reconfigure(ReconfigureParams::default());
         assert_eq!(
@@ -2761,9 +2812,8 @@ mod tests {
             "reconfigure() failed: send failed"
         );
 
-        unsafe {
-            ManuallyDrop::drop(&mut encoder);
-        }
+        // 元の job_tx を復元してから drop する
+        encoder.job_tx = original_job_tx;
     }
 
     /// drain スレッドによってコールバックハンドラが遅延なく発火することを確認する
@@ -2857,25 +2907,27 @@ mod tests {
 
     #[test]
     fn test_get_sequence_params_after_encoder_worker_terminated() {
-        use std::mem::ManuallyDrop;
-
         let (tx, _rx) = mpsc::sync_channel::<Result<EncodedFrame<()>, Error>>(4);
         let config = test_encoder_config(CodecConfig::H264(H264EncoderConfig {
             profile: None,
             idr_period: None,
         }));
 
-        let mut encoder = ManuallyDrop::new(
-            Encoder::new(
-                config,
-                FnEncodeHandler::new(move |frame| {
-                    let _ = tx.send(frame);
-                }),
-            )
-            .unwrap(),
-        );
+        let mut encoder = Encoder::new(
+            config,
+            FnEncodeHandler::new(move |frame| {
+                let _ = tx.send(frame);
+            }),
+        )
+        .expect("H.264 エンコーダーの作成に失敗した");
 
-        unsafe { ManuallyDrop::drop(&mut encoder) };
+        // 受信側を先に drop したチャネルで置き換えて send 失敗を検証する。
+        // drain スレッドが job_tx.clone() を保持しているためワーカースレッドは終了しない。
+        // 元の job_tx は検証後に復元してから drop する
+        // (置き換えたまま drop すると worker が recv でブロックし続け、join がデッドロックする)。
+        let (dead_tx, dead_rx) = mpsc::channel::<Job<()>>();
+        drop(dead_rx);
+        let original_job_tx = std::mem::replace(&mut encoder.job_tx, dead_tx);
 
         let result = encoder.get_sequence_params();
         assert_eq!(
@@ -2883,9 +2935,8 @@ mod tests {
             "get_sequence_params() failed: send failed"
         );
 
-        unsafe {
-            ManuallyDrop::drop(&mut encoder);
-        }
+        // 元の job_tx を復元してから drop する
+        encoder.job_tx = original_job_tx;
     }
 
     #[test]
@@ -2902,5 +2953,108 @@ mod tests {
             "height_max should be positive: {}",
             caps.height_max
         );
+    }
+
+    /// max_in_flight_frames() の値の計算を確認する
+    #[test]
+    fn test_max_in_flight_frames_value() {
+        assert_eq!(EncoderStats::max_in_flight_frames(0), 2);
+        assert_eq!(EncoderStats::max_in_flight_frames(1), 3);
+        assert_eq!(EncoderStats::max_in_flight_frames(2), 4);
+    }
+
+    /// stats() で max_in_flight_frames が取得できることを確認する
+    ///
+    /// max_in_flight_frames は frame_interval_p + 2
+    /// (test_encoder_config は frame_interval_p = 1 なので 3)
+    #[test]
+    fn test_encoder_stats_max_in_flight_frames() {
+        let (tx, _rx) = mpsc::sync_channel::<Result<EncodedFrame<()>, Error>>(4);
+        let config = test_encoder_config(CodecConfig::H264(H264EncoderConfig {
+            profile: None,
+            idr_period: None,
+        }));
+        let encoder = Encoder::new(
+            config,
+            FnEncodeHandler::new(move |frame| {
+                let _ = tx.send(frame);
+            }),
+        )
+        .expect("H.264 エンコーダーの作成に失敗した");
+
+        // max_in_flight_frames = frame_interval_p + 2 = 3
+        assert_eq!(encoder.stats().max_in_flight_frames.get(), 3);
+
+        drop(encoder);
+    }
+
+    /// stats() で total_encoder_buffer_full_count が取得できることを確認する
+    ///
+    /// frame_interval_p = 0 (n_encoder_buffer = 3) にし、drain の完了より
+    /// 速く encode を連続送信して "encoder buffer is full" エラーを
+    /// 発生させる。コールバックハンドラに通知されたエラー数と
+    /// stats() の total_encoder_buffer_full_count が一致することを確認する。
+    ///
+    /// エラーが 1 件以上発生することの保証は「worker のジョブ処理が
+    /// drain スレッドのエンコード完了待ちより速い」というハードウェア
+    /// 速度比に依存する (現実的な構成ではほぼ確実に成立する)。
+    #[test]
+    fn test_encoder_stats_buffer_full_count() {
+        let mut config = test_encoder_config(CodecConfig::H264(H264EncoderConfig {
+            profile: None,
+            idr_period: None,
+        }));
+        // n_encoder_buffer = 3 にして buffer full を発生させやすくする
+        config.frame_interval_p = 0;
+
+        let width = config.width;
+        let height = config.height;
+
+        // 成功フレームとエラーの合計が収まる十分なバッファを用意する
+        // (ハンドラの送信ブロックで worker スレッドが詰まらないようにする)
+        let (tx, rx) = mpsc::sync_channel::<Result<EncodedFrame<u32>, Error>>(1024);
+        let encoder = Encoder::new(
+            config,
+            FnEncodeHandler::new(move |frame| {
+                let _ = tx.send(frame);
+            }),
+        )
+        .expect("H.264 エンコーダーの作成に失敗した");
+
+        let frame_data = create_black_frame(width, height);
+        let opts = EncodeOptions {
+            force_intra: false,
+            force_idr: false,
+            output_spspps: false,
+        };
+
+        // drain の完了より速く連続送信して buffer full を発生させる
+        for i in 0..200u32 {
+            encoder
+                .encode(&frame_data, &opts, i)
+                .expect("フレームのエンコードに失敗した");
+        }
+        encoder.flush().expect("flush に失敗した");
+
+        // コールバックハンドラに通知された buffer full エラー数を回収する
+        // (buffer full 以外のエラーが混入しても等号断言が偽陰性にならないように
+        //  メッセージで filter する)
+        let error_count = rx
+            .try_iter()
+            .filter(|result| {
+                matches!(result, Err(e) if e.to_string().contains("encoder buffer is full"))
+            })
+            .count();
+
+        // stats のカウンターと通知されたエラー数が一致することを確認する
+        let stats = encoder.stats();
+        assert_eq!(
+            stats.total_encoder_buffer_full_count.get(),
+            error_count as u64,
+            "total_encoder_buffer_full_count が通知されたエラー数と一致しない"
+        );
+        assert!(error_count > 0, "buffer full エラーが 1 件も発生しなかった");
+
+        drop(encoder);
     }
 }

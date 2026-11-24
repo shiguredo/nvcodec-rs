@@ -29,10 +29,10 @@ CUDA ドライバー API を実行時に動的ロード (`dlopen`) するため�
 - CUDA ライブラリの実行時動的ロード (ビルド時の CUDA Toolkit リンク不要)
 - エンコーダー / デコーダーのケーパビリティクエリ
 - エンコード入力バッファフォーマット選択 (NV12 / YV12 / I420 / YUV444 / 10bit / ARGB / ABGR)
-- デコード出力サーフェスフォーマット選択 (NV12 / P016 / YUV444 / NV16 / P216)
+- デコード出力サーフェスフォーマット (NV12、8bit のみ)
 - フレーム単位のエンコードオプション (IDR フレーム強制、SPS/PPS 出力)
 - エンコーダーのランタイム再構成 (解像度、ビットレート、フレームレート変更)
-- デコーダーの動的解像度変更の自動対応
+- デコーダーの動的解像度変更対応
 - CUDA デバイス列挙
 - CUDA ストリーム管理
 - 2D メモリコピー、ピッチ付きメモリ割り当て
@@ -42,11 +42,17 @@ CUDA ドライバー API を実行時に動的ロード (`dlopen`) するため�
 - Linux (x86_64)
 - NVIDIA GPU (Kepler 世代以降)
 - NVIDIA ドライバー (CUDA ドライバー API を含む)
-- NVIDIA Video Codec SDK 13.0 以降のヘッダーファイル (ビルド時)
+
+ビルドには次のものが必要です。
+
+- Rust 1.95 以降
+- clang (bindgen が利用する libclang)
 
 ## ビルド
 
-CUDA Toolkit がインストールされている Linux 環境でビルドしてください。
+CUDA Toolkit は不要です。CUDA ヘッダーファイルは `third_party/cuda/include/` のスタブを使用し、NVIDIA Video Codec SDK のヘッダーファイルは `third_party/nvcodec/include/` に同梱されています。
+
+CUDA Toolkit がインストールされている環境では `/usr/local/cuda/include/cuda.h` を使用します。別の場所の `cuda.h` を使う場合は `CUDA_INCLUDE_PATH` でディレクトリを指定してください。
 
 ```bash
 cargo build
@@ -54,7 +60,7 @@ cargo build
 
 ### docs.rs 向けビルド
 
-CUDA Toolkit がない環境では、同梱のスタブヘッダーを使って docs.rs 向けのドキュメント生成のみ可能です。
+`DOCS_RS=1` を指定すると、build.rs が生成するダミー定義を使ってドキュメント生成のみ行えます。CUDA Toolkit は不要です。
 
 ```bash
 DOCS_RS=1 cargo doc --no-deps
@@ -134,6 +140,7 @@ let config = DecoderConfig {
     device_id: 0,
     max_num_decode_surfaces: 20,
     max_display_delay: 0,
+    reconfigure_enabled: false,
     surface_format: SurfaceFormat::Nv12,
 };
 
@@ -157,6 +164,12 @@ for frame in rx.try_iter() {
     println!("Y: {}, UV: {}", y_plane.len(), uv_plane.len());
 }
 ```
+
+`DecoderConfig.max_num_decode_surfaces` は、デコードサーフェス数の上限を指定する。`0` は指定できず、`Decoder::new` が設定エラーとして拒否する。NVDEC が正しいデコードに必要な最小サーフェス数 (`CUVIDEOFORMAT.min_num_decode_surfaces`) がこの上限を超える場合は、`decode()` 中の sequence callback で既存 decoder を破棄する前に、エラーがコールバックに通知される。実際に割り当てられるサーフェス数は常にこの上限以下になる。
+
+出力は 8bit NV12 のみ対応するため、10bit 以上の入力はデコード不可としてエラーになる。
+
+デコード中にエラーが発生すると Decoder は終端状態になり、以降の `decode()` はデコードを行わず、常にエラーをコールバックする。終端状態に遷移した時点で出力待ちだったフレームにはコールバックが呼ばれない。終端状態の Decoder は復旧できないため、新しい Decoder を作り直すこと。
 
 ### エンコーダーケーパビリティクエリ
 
@@ -270,9 +283,17 @@ encoder.reconfigure(ReconfigureParams {
 
 ### デコーダー
 
-利用者側の操作は不要です。ストリーム中に解像度が変わった場合、内部で自動的にデコーダーが再作成されます。
+ストリーム中に解像度が変わる場合、`DecoderConfig.reconfigure_enabled` で処理方式を選べます。最大解像度を利用者が指定する必要はありません。
+
+- `reconfigure_enabled: false` (推奨値) は、シーケンス変更ごとに decoder を破棄して再作成します。
+- `reconfigure_enabled: true` は、現在の decoder session の上限以内の解像度変化を `cuvidReconfigureDecoder` で再構成し、上限を超える拡大やコーデック情報の変化、reconfigure 失敗は再作成で処理します。
+- `reconfigure_enabled: true` は `max_display_delay > 0` と組み合わせられません (組み合わせた場合は `Decoder::new` が設定エラーを返します)。
+
+どちらの方式を使うべきかの判断基準は、`DecoderConfig::reconfigure_enabled` のドキュメントを参照してください。
 
 `DecodedFrame` はフレームごとに `width()` / `height()` を持っているので、フレームごとにサイズを確認してください。
+
+フレームの寸法と画素データは、そのフレームの表示領域 (display area) に一致します。`width()` / `height()` は表示領域の寸法を返します。画素データは行矩形ではなく各行が stride を持つバッファで、Y は `y_plane()[y * y_stride() + x]`、UV はインターリーブされたクロマを `uv_plane()` からアクセスしてください。`uv_stride()` は `width()` より大きいことがあります。詳細な出力契約は `DecodedFrame` の rustdoc を参照してください。
 
 ```rust
 // 解像度が変わっても同じデコーダーで継続可能
@@ -294,10 +315,56 @@ assert_eq!(frame.width(), 1280);  // 自動的に変更される
 
 | | エンコーダー | デコーダー |
 |---|---|---|
-| 仕組み | `reconfigure()` で明示的に変更 | パーサーが自動検出して再作成 |
-| 利用者の操作 | `ReconfigureParams` で新解像度を指定 | 不要 |
-| 制約 | `max_encode_width` / `max_encode_height` 以内 | なし |
+| 仕組み | `reconfigure()` で明示的に変更 | `reconfigure_enabled` に応じて再構成 / 再作成を使い分け |
+| 利用者の操作 | `ReconfigureParams` で新解像度を指定 | `reconfigure_enabled` を指定するのみ (推奨値は false) |
+| 制約 | `max_encode_width` / `max_encode_height` 以内 | session 上限 (作成時または再作成時の coded サイズ) 以内は再構成、超過は再作成 |
 | 超えた場合 | エンコーダーを作り直す | 自動対応 |
+
+## 統計値の取得
+
+`Decoder::stats()` / `Encoder::stats()` で、デコーダー / エンコーダーの内部状態を統計値として取得できます。
+
+統計値は `Counter` 型 (通算値) と `Gauge` 型 (時点値) で表現され、`get()` で現在値を読み出します。`stats()` が返すのは共有統計値への参照であり、読み出すたびに最新値が読めます (値を保持したい場合は `clone()` でスナップショットを取得)。
+
+- counter: 単調増加する通算値 (デコーダー作成回数、"encoder buffer is full" エラー発生回数等)
+- gauge: 現在値を表す時点値 (in-flight 上限等)
+
+```rust
+// エンコーダーの統計値を取得
+let stats = encoder.stats();
+println!(
+    "encoder buffer full count: {}",
+    stats.total_encoder_buffer_full_count.get()
+);
+
+// in-flight 上限に基づく flush 制御のレシピ
+// max_in_flight_frames を超えて encode を連続呼び出しすると
+// "encoder buffer is full" エラーになるため、
+// 送信フレーム数が上限に達するたびに flush する
+let max_in_flight_frames = encoder.stats().max_in_flight_frames.get();
+let mut in_flight = 0;
+for nv12_data in frame_stream {
+    encoder.encode(&nv12_data, &options, ())?;
+    in_flight += 1;
+    if in_flight >= max_in_flight_frames {
+        encoder.flush()?;
+        in_flight = 0;
+    }
+}
+encoder.flush()?;
+```
+
+デコーダーも同様に `decoder.stats()` で統計値を取得できます。
+
+```rust
+let stats = decoder.stats();
+println!(
+    "decode calls: {}, output frames: {}, in flight: {}",
+    stats.total_decode_count.get(),
+    stats.total_output_frame_count.get(),
+    stats.in_flight_frames()
+);
+```
 
 ## ライセンス
 

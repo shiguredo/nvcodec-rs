@@ -11,30 +11,36 @@ on:
 
 env:
   RUST_BACKTRACE: 1
-  CUDA_VERSION: "13.1.1"
 
 jobs:
   # CUDA ヘッダを使ったビルド確認 (GPU 不要)
+  # Ubuntu 26.04 の NVIDIA 公式リポジトリは CUDA 13 系のみのため、OS ごとに cuda_version を分ける
   ci-cuda:
     name: CI (CUDA)
     strategy:
       matrix:
-        os:
-          - ubuntu-24.04
-          - ubuntu-22.04
+        include:
+          # NVIDIA 公式 ubuntu2604 は 13.3.x のみ
+          - os: ubuntu-26.04
+            cuda_version: "13.3.1"
+          - os: ubuntu-24.04
+            cuda_version: "13.1.1"
+          - os: ubuntu-22.04
+            cuda_version: "13.1.1"
     runs-on: ${{ matrix.os }}
     timeout-minutes: 20
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
-      - run: rustup update stable
+      # ツールチェーンは rust-toolchain.toml で MSRV に固定しているため、
+      # 最初の cargo 実行時に MSRV のツールチェーンが導入される
       - uses: shiguredo/github-actions/.github/actions/setup-cuda-toolkit@main
         with:
-          cuda_version: ${{ env.CUDA_VERSION }}
+          cuda_version: ${{ matrix.cuda_version }}
           platform: ${{ matrix.os }}
       - uses: shiguredo/github-actions/.github/actions/rust-cache@main
         with:
           os: ${{ matrix.os }}
-          toolchain: stable
+          toolchain: "1.95"
       - run: cargo fmt --all --check
       - run: cargo clippy --workspace -- -D warnings
 
@@ -65,7 +71,7 @@ jobs:
       DOCS_RS: 1
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
-      - run: rustup update stable
+      # ツールチェーンは rust-toolchain.toml で MSRV に固定している
       - run: cargo doc --no-deps
 
   slack_notify:

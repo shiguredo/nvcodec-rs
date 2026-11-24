@@ -12,20 +12,22 @@ mod decode;
 mod dl;
 mod encode;
 mod error;
+mod stats;
 mod sys;
 
 pub use codec_info::*;
 pub use decode::{
-    DecodeHandler, DecodedFrame, Decoder, DecoderCaps, DecoderCodec, DecoderConfig,
+    DecodeHandler, DecodedFrame, Decoder, DecoderCaps, DecoderCodec, DecoderConfig, DecoderStats,
     FnDecodeHandler, SurfaceFormat, query_decoder_caps,
 };
 pub use encode::{
     Av1EncoderConfig, Av1Profile, BufferFormat, CodecConfig, EncodeHandler, EncodeOptions,
-    EncodedFrame, Encoder, EncoderCaps, EncoderCodec, EncoderConfig, FnEncodeHandler,
+    EncodedFrame, Encoder, EncoderCaps, EncoderCodec, EncoderConfig, EncoderStats, FnEncodeHandler,
     H264EncoderConfig, H264Profile, HevcEncoderConfig, HevcProfile, PictureType, Preset,
     RateControlMode, ReconfigureParams, TuningInfo, query_encoder_caps,
 };
 pub use error::Error;
+pub use stats::{Counter, Gauge};
 
 /// ビルド時に参照したバージョン
 pub const BUILD_VERSION: &str = sys::BUILD_METADATA_VERSION;
@@ -138,11 +140,6 @@ impl CudaLibrary {
                         Error::new_custom("CudaLibrary::load", "cuMemcpyHtoD_v2 not found")
                     })?;
 
-                let _: unsafe extern "C" fn(*mut c_void, sys::CUdeviceptr, usize) -> u32 =
-                    cuda_lib.get(b"cuMemcpyDtoH_v2").map_err(|_| {
-                        Error::new_custom("CudaLibrary::load", "cuMemcpyDtoH_v2 not found")
-                    })?;
-
                 // デバイス列挙関連
                 let _: unsafe extern "C" fn(*mut c_int) -> u32 =
                     cuda_lib.get(b"cuDeviceGetCount").map_err(|_| {
@@ -242,6 +239,13 @@ impl CudaLibrary {
                     nvcuvid_lib.get(b"cuvidDecodePicture").map_err(|_| {
                         Error::new_custom("CudaLibrary::load", "cuvidDecodePicture not found")
                     })?;
+
+                let _: unsafe extern "C" fn(
+                    sys::CUvideodecoder,
+                    *mut sys::CUVIDRECONFIGUREDECODERINFO,
+                ) -> u32 = nvcuvid_lib.get(b"cuvidReconfigureDecoder").map_err(|_| {
+                    Error::new_custom("CudaLibrary::load", "cuvidReconfigureDecoder not found")
+                })?;
 
                 let _: unsafe extern "C" fn(
                     sys::CUvideodecoder,
@@ -434,23 +438,6 @@ impl CudaLibrary {
         }
     }
 
-    /// デバイスからホストへメモリをコピーする
-    fn cu_memcpy_d_to_h(
-        &self,
-        dst_host: *mut c_void,
-        src_device: sys::CUdeviceptr,
-        byte_count: usize,
-    ) -> Result<(), Error> {
-        unsafe {
-            let f: unsafe extern "C" fn(*mut c_void, sys::CUdeviceptr, usize) -> u32 = self
-                .cuda_lib
-                .get(b"cuMemcpyDtoH_v2")
-                .expect("cuMemcpyDtoH_v2 should exist (checked in load())");
-            let status = f(dst_host, src_device, byte_count);
-            Error::check_cuda(status, "cuMemcpyDtoH_v2")
-        }
-    }
-
     /// NvEncodeAPICreateInstance を呼び出す
     fn nvenc_create_api_instance(
         &self,
@@ -572,6 +559,25 @@ impl CudaLibrary {
                 .expect("cuvidDestroyDecoder should exist (checked in load())");
             let status = f(decoder);
             Error::check_cuda(status, "cuvidDestroyDecoder")
+        }
+    }
+
+    /// cuvidReconfigureDecoder を呼び出す
+    fn cuvid_reconfigure_decoder(
+        &self,
+        decoder: sys::CUvideodecoder,
+        reconfigure_info: *mut sys::CUVIDRECONFIGUREDECODERINFO,
+    ) -> Result<(), Error> {
+        unsafe {
+            let f: unsafe extern "C" fn(
+                sys::CUvideodecoder,
+                *mut sys::CUVIDRECONFIGUREDECODERINFO,
+            ) -> u32 = self
+                .nvcuvid_lib
+                .get(b"cuvidReconfigureDecoder")
+                .expect("cuvidReconfigureDecoder should exist (checked in load())");
+            let status = f(decoder, reconfigure_info);
+            Error::check_cuda(status, "cuvidReconfigureDecoder")
         }
     }
 

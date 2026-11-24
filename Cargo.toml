@@ -1,8 +1,8 @@
 [package]
 name = "shiguredo_nvcodec"
-version = "2026.2.0"
+version = "2026.3.0"
 edition = "2024"
-rust-version = "1.88"
+rust-version = "1.95"
 description = "Rust bindings for NVIDIA Video Codec SDK"
 readme = "README.md"
 homepage = "https://github.com/shiguredo/nvcodec-rs"

@@ -11,6 +11,56 @@
 
 ## develop
 
+## 2026.3.0
+
+**リリース日**: 2026-11-24
+
+- [CHANGE] MSRV (rust-version) を 1.95 に上げる
+  - `rust-toolchain.toml` の channel と CI / devcontainer のツールチェーンも 1.95 に揃える
+  - @voluntas
+- [CHANGE] 一度デコードエラーが起きた Decoder インスタンスは使用不能にし、以降のデコードを行わないようにする
+  - 従来はエラー発生後にもデコードを継続することはできたが、同一事象のエラーが二重に通知されたり、ユーザーデータの対応が壊れる経路があった
+  - この仕様を変更して、エラー後にフレームのデコードを試みた場合は、常にエラーがコールバックに通知されるようにする
+  - 終端状態に遷移した時点で出力待ちだったフレームにはコールバックを呼び出さず、破棄する
+  - 終端状態では `flush()` は未完了フレームの出力を待たずに戻る
+  - エラー発生後の Decoder インスタンスが復旧することはないので、必要なら利用側で Decoder インスタンスを作り直すこと
+  - @sile
+- [CHANGE] `DecoderConfig` に `reconfigure_enabled` フィールドを追加する
+  - `false` (推奨値) はシーケンス変更ごとに decoder を再作成する
+  - `true` は現在の decoder session の上限以内の解像度変化を `cuvidReconfigureDecoder` で再構成する
+  - `true` でも、上限を超える拡大やコーデック情報の変化は decoder を再作成して処理する
+  - `true` のとき、`cuvidReconfigureDecoder` が失敗した場合は decoder を破棄して再作成し、デコードを継続する (失敗回数は `DecoderStats::total_reconfigure_failure_count` で確認できる)
+  - `true` は `max_display_delay > 0` と組み合わせられない (組み合わせた場合は `Decoder::new` が設定エラーを返す)
+  - @sile
+- [ADD] Decoder::stats() / Encoder::stats() で内部状態 (counter / gauge) を取得できるようにする
+  - 通算値を表す `Counter` 型と、時点値を表す `Gauge` 型を追加する
+  - `DecoderStats::in_flight_frames()` で入力済みでまだ出力されていないフレーム数を取得できる
+  - @sile
+- [FIX] Decoder の display area と DecodedFrame の画素領域が一致しない問題を修正する
+  - display area の left / top が非ゼロの場合、公開する寸法は表示領域の寸法 (crop 後) なのに、画素データは mapped output surface の左上を起点にコピーされていた
+  - コピー元を表示領域の左上に合わせることで、`width()` / `height()` と Y / UV データを表示領域に一致させた
+  - display area の left / top が奇数の入力を、デコード不可の入力として Decoder を終端させるようになった (従来は画素が不整合のままデコードされていた)
+  - @sile
+- [FIX] Decoder の parser DPB と内部 decode surface の数が一致しない場合がある問題を修正する
+  - decode surface はデコード済みフレームを一時的に格納する GPU 上のバッファで、参照フレームを保持するために複数必要。その数のことをデコードサーフェス数と呼ぶ
+  - parser DPB は parser がデコード結果をどのサーフェスへ書き込むかを決めるためのサーフェスの循環リスト
+  - `min_num_decode_surfaces == 1` のとき parser の DPB 数が更新されず、parser と decoder のサーフェス数が一致しないことがあった
+  - 例えば JPEG は `min_num_decode_surfaces == 1` になり得るため、parser の DPB 数が 1 面以上に保たれたまま decoder が 1 面しか確保しないと、parser が存在しないサーフェスを指す picture index を通知し、`cuvidDecodePicture` が `CUDA_ERROR_INVALID_VALUE` で失敗する可能性があった
+  - 両者を同じ実効サーフェス数 (sequence callback の戻り値) で同期するようにした
+  - `DecoderConfig.max_num_decode_surfaces` に 0 を指定すると `Decoder::new` が設定エラーとして拒否するようになった (従来は受け付けていた)
+  - `min_num_decode_surfaces` が上限を超える場合は、`decode()` 中の sequence callback で既存 decoder を破棄する前に、エラーをコールバックに通知するようになった
+  - @sile
+- [FIX] 10bit 以上の入力をデコード不可として Decoder を終端させる
+  - 出力サーフェスは 8bit NV12 のみ対応なのに 10bit ストリーム (`bit_depth_luma_minus8 != 0`) を拒否しておらず、10bit 入力で Y / UV のバイト幅計算が崩れて不正な画素データが返っていた
+  - @sile
+
+### misc
+
+- [ADD] CI の CUDA ビルド確認に Ubuntu 26.04（CUDA 13.3.1）を追加する
+  - @voluntas
+- [UPDATE] prek の設定を shiguredo-rust 規約に合わせて整備する
+  - @voluntas
+
 ## 2026.2.0
 
 **リリース日**: 2026-06-23
